@@ -1,6 +1,8 @@
 ;;-*-Lisp-*-
 (in-package goal)
 
+(define-extern spawn-security-wall (function process vector vector float symbol handle))
+
 ;; name: traffic-engine-h.gc
 ;; name in dgo: traffic-engine-h
 ;; dgos: DESRESC, HGA, WWD, CWI, LFACTORY

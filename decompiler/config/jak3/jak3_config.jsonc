@@ -135,6 +135,9 @@
   // whether or not to dump out streamed audio files to decompiler_out/<game>/audio
   "rip_streamed_audio": false,
 
+  // art groups always available in the common FR3
+  "common_art_groups": ["bombbot-ag"],
+
   ////////////////////////////
   // PATCHING OPTIONS
   ////////////////////////////

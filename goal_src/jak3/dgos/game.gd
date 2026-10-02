@@ -503,4 +503,7 @@
   "path-editor-h.o" ;; added - path-editor-h
   "path-editor.o" ;; added - path-editor
   "mod-debug.o" ;; added
+    "tpage-1320.go"
+    "tpage-2384.go"
+    "bombbot-ag.go"
  ))

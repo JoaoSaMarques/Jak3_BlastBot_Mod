@@ -37,6 +37,10 @@
         (input-display-off)
         )
 
+      (when (and *target* (cpad-hold? 0 l1) (cpad-pressed? 0 r3))
+        (spawn-my-bombbot)
+        )
+
       (when *debug-segment*
         (orb-placer-maintenance)
         )
