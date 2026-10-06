@@ -136,7 +136,7 @@
   "rip_streamed_audio": false,
 
   // art groups always available in the common FR3
-  "common_art_groups": ["bombbot-ag"],
+  "common_art_groups": ["bombbot-ag", "shield-sphere-ag", "shield-sphere-distort-ag", "shield-sphere-explode-ag"],
 
   ////////////////////////////
   // PATCHING OPTIONS

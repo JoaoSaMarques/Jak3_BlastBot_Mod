@@ -506,4 +506,8 @@
     "tpage-1320.go"
     "tpage-2384.go"
     "bombbot-ag.go"
+    "bombbot-ag.go"
+    "shield-sphere-ag.go"
+    "shield-sphere-distort-ag.go"
+    "shield-sphere-explode-ag.go"
  ))

@@ -102,6 +102,22 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
    (thrusting        symbol)
    (crouch-depth     float)
    (ground-y         float)
+   ;; v5 additions
+   (ramp             float)            ;; board-style speed multiplier, 1.0 .. *blast-bot-ramp-max*
+   (gait-phase       float)            ;; 0..1 gait clock (runs faster as the ramp builds)
+   (hover-blend      float)            ;; 0..1, R2 hover pose
+   (hover-lift       float)            ;; how far the body is raised while hovering
+   (hover-on         symbol)           ;; hover is a toggle (R2 press)
+   (dash-until       time-frame)       ;; Square charge
+   (dash-ready       time-frame)
+   (dash-yaw         float)
+   (dash-id          uint32)            ;; one attack id per charge, so every enemy is only hit once
+   (leg-id           uint32)            ;; attack id for leg touches, refreshed every 0.4s
+   (leg-id-time      time-frame)
+   (shield-handle    handle)           ;; the mech-shield process (target-mech.gc)
+   (shield-on        symbol)
+   (shield-open-until time-frame)      ;; shield hit sphere is switched off until then so our own shots can leave it
+   (laser-end        vector       :inline)
    )
   (:state-methods
     active
@@ -132,6 +148,20 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; how much of the leg-lift tilt goes into the body the legs hang from. The head gets the rest,
 ;; so the head's total tilt is unchanged and the body tilts too (it also carries the head).
 (define *blast-bot-body-tilt-share* 0.5)
+;; board-style speed ramp: 1x -> max over ramp-time seconds of holding the stick, reset by hitting a wall
+(define *blast-bot-ramp-max* 2.5)
+(define *blast-bot-ramp-time* 5.0)
+;; R2 hover: how high (in game units, 4096 = 1m) the body floats
+(define *blast-bot-hover-height* 12288.0)
+;; Circle shield size (the stock shield's hit sphere radius is 1m x this).
+;; Raise it until the shield fully covers the legs, otherwise shots can hit the bot's own colliders first.
+(define *blast-bot-shield-size* 6.5)
+;; Square charge speed (units/sec, 196608 = 48 m/s)
+(define *blast-bot-dash-speed* 196608.0)
+;; Jak is parked in target-grab-ride, which sets the 'grabbed' focus flag. Some doors / level borders refuse to
+;; work while it is set, so it is cleared every frame. If this causes trouble: (set! *blast-bot-clear-grabbed* #f)
+(define *blast-bot-clear-grabbed* #t)
+(define *blast-bot-laser-on* #t)
 
 ;; elbow joint index + hand distance for each limb, from *bombbot-ik-limb-setup*
 (define *blast-bot-elbows* (new 'static 'boxed-array :type int32 19 13 15 17))
@@ -202,6 +232,17 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   (set! (-> this thrusting) #f)
   (set! (-> this crouch-depth) 0.0)
   (set! (-> this ground-y) (-> this root trans y))
+  (set! (-> this ramp) 1.0)
+  (set! (-> this gait-phase) 0.0)
+  (set! (-> this hover-blend) 0.0)
+  (set! (-> this hover-on) #f)
+  (set! (-> this hover-lift) 0.0)
+  (set! (-> this dash-until) 0)
+  (set! (-> this dash-ready) 0)
+  (set! (-> this leg-id-time) 0)
+  (set! (-> this shield-on) #f)
+  (set! (-> this shield-open-until) 0)
+  (set! (-> this shield-handle) (the-as handle #f))
   (none)
   )
 
@@ -273,6 +314,12 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
       (set! (-> this yaw-velocity) (deg- yaw (-> this last-yaw)))
       (set! (-> this last-yaw) yaw)
       )
+    ;; gait clock: one cycle = 0.8s, faster while the speed ramp builds
+    (+! (-> this gait-phase)
+        (* (seconds-per-frame) 1.25 (+ 1.0 (* 0.5 (- (-> this ramp) 1.0)))))
+    (when (>= (-> this gait-phase) 1.0)
+      (set! (-> this gait-phase) (- (-> this gait-phase) 1.0))
+      )
     ;; collect nearby ground triangles once, then probe per foot
     (let ((ext (new 'stack-no-clear 'vector)))
       (set-vector! ext 40960.0 24576.0 40960.0 1.0)
@@ -286,7 +333,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
           (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
     (fill-using-bounding-box *collide-cache* q)
     (dotimes (i 4)
-      (let* ((phase (+ (* 0.004166667 (the float (mod (current-time) 240))) (blast-bot-foot-phase i)))
+      (let* ((phase (+ (-> this gait-phase) (blast-bot-foot-phase i)))
              (f0 (- phase (the float (the int phase))))
              ;; while crouching / recovering from a jump every foot stays planted
              (f (if (or (= (-> this jump-mode) 1) (= (-> this jump-mode) 3)) 0.9 f0))
@@ -295,6 +342,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
              (rel (new 'stack-no-clear 'vector))
              (rest (new 'stack-no-clear 'vector))
              (diff (new 'stack-no-clear 'vector))
+             (hov (new 'stack-no-clear 'vector))
              )
         ;; rest position of this foot under the body right now
         (blast-bot-foot-local local i)
@@ -396,8 +444,38 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
               (set! (-> this foot-pos i x) (+ (-> rest x) (-> diff x)))
               (set! (-> this foot-pos i z) (+ (-> rest z) (-> diff z)))
               )
+            ;; v5: planted feet also get the same safety limits swinging feet always had. Without these,
+            ;; a sudden change of body height/heading left a planted foot too close (legs fold up
+            ;; "like tinfoil") or too far above/below the body (legs implode) until it stepped again.
+            (vector-! diff (-> this foot-pos i) (-> this root trans))
+            (set! (-> diff y) 0.0)
+            (let ((len (vector-length diff)))
+              (when (< len 9000.0)
+                (if (< 1.0 len)
+                    (vector-float*! diff diff (/ 9000.0 len))
+                    (vector-copy! diff rel)
+                    )
+                (set! (-> this foot-pos i x) (+ (-> this root trans x) (-> diff x)))
+                (set! (-> this foot-pos i z) (+ (-> this root trans z) (-> diff z)))
+                )
+              )
+            (set! (-> this foot-pos i y) (fmax (+ -24576.0 (-> this root trans y))
+                                               (fmin (+ 12288.0 (-> this root trans y)) (-> this foot-pos i y))))
             (vector-copy! cur (-> this foot-pos i))
             )
+          )
+        ;; R2 hover: blend every foot toward a pose swept back behind the body. The front pair (0, 3)
+        ;; hangs low, the back pair (1, 2) is held higher, so the legs never overlap.
+        (when (< 0.001 (-> this hover-blend))
+          (set-vector! hov
+                       (if (< i 2) 10240.0 -10240.0)
+                       (if (or (= i 0) (= i 3)) -14336.0 -8192.0)
+                       (if (or (= i 0) (= i 3)) -10240.0 -20480.0)
+                       1.0)
+          (vector-orient-by-quat! hov hov (-> this root quat))
+          (vector+! hov hov (-> this root trans))
+          (vector-! diff hov cur)
+          (vector+*! cur cur diff (-> this hover-blend))
           )
         (set! (-> cur w) 1.0)
         (enable-set! (-> this joint-ik i) #t)
@@ -413,10 +491,10 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
       ;; plus a nod forward while crouching for a jump
       (+! (-> this tilt-z) (* k (- (+ (* 0.07 tz moving) (* 0.10 crouch-frac)) (-> this tilt-z))))
       )
-    ;; body height: follow the ground under the body (and dip for a jump crouch).
+    ;; body height: follow the ground under the body (dip for a jump crouch, rise for hover).
     ;; While airborne the jump code owns it.
     (when (!= (-> this jump-mode) 2)
-      (let ((target (- (-> this ground-y) (-> this crouch-depth))))
+      (let ((target (+ (- (-> this ground-y) (-> this crouch-depth)) (-> this hover-lift))))
         (if (< (-> this root trans y) target)
             (seek! (-> this root trans y) target (* 61440.0 (seconds-per-frame)))  ;; climb fast: slopes, stairs
             (seek! (-> this root trans y) target (* 40960.0 (seconds-per-frame)))  ;; settle down gently
@@ -448,20 +526,31 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
 ;;  - swivel: left/right only, follows the CAMERA direction (or a locked enemy)
 ;;  - gun: stays level, only pitches when locked on to an enemy
 
+(defun blast-bot-tilt-quat! ((out quaternion) (tx float) (tz float))
+  "Lean the up axis toward (tx, 1, tz). Small-angle axis/angle instead of quaternion-from-two-vectors!,
+which takes an acos and can produce NaN (head/body flipping for a moment) when the vectors are nearly equal."
+  (let ((mag (sqrtf (+ (* tx tx) (* tz tz)))))
+    (if (< mag 0.0001)
+        (quaternion-copy! out *unity-quaternion*)
+        (let ((axis (new 'stack-no-clear 'vector)))
+          (set-vector! axis tz 0.0 (- tx) 1.0)
+          (vector-normalize! axis 1.0)
+          (quaternion-vector-angle! out axis (* 10430.378 mag))
+          )
+        )
+    )
+  out
+  )
+
 (defun blast-bot-body-callback ((arg0 cspace) (arg1 transformq))
   "Joint 3: the body the legs are attached to. Leans with the same tilt as the head."
   (let ((this (the-as blast-bot-player (-> arg0 param1)))
         (tilt-q (new 'stack-no-clear 'quaternion))
         (base-q (new 'stack-no-clear 'quaternion))
-        (up (new 'stack-no-clear 'vector))
         )
-    (set-vector! up
-                 (* (-> this tilt-x) *blast-bot-body-tilt-share*)
-                 1.0
-                 (* (-> this tilt-z) *blast-bot-body-tilt-share*)
-                 1.0)
-    (vector-normalize! up 1.0)
-    (quaternion-from-two-vectors! tilt-q *up-vector* up)
+    (blast-bot-tilt-quat! tilt-q
+                          (* (-> this tilt-x) *blast-bot-body-tilt-share*)
+                          (* (-> this tilt-z) *blast-bot-body-tilt-share*))
     (quaternion-copy! base-q (-> arg1 quat))
     (quaternion*! (-> arg1 quat) tilt-q base-q)
     (quaternion-normalize! (-> arg1 quat))
@@ -475,19 +564,14 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   (let ((this (the-as blast-bot-player (-> arg0 param1)))
         (yaw-q (new 'stack-no-clear 'quaternion))
         (tilt-q (new 'stack-no-clear 'quaternion))
-        (up (new 'stack-no-clear 'vector))
         )
     ;; The head keeps facing its own WORLD heading (set only by the stick), so it doesn't
     ;; get dragged around while the legs' body is still turning to catch up.
     (quaternion-vector-angle! yaw-q *up-vector*
                               (deg- (-> this head-yaw) (quaternion-y-angle (-> this root quat))))
-    (set-vector! up
-                 (* (-> this tilt-x) (- 1.0 *blast-bot-body-tilt-share*))
-                 1.0
-                 (* (-> this tilt-z) (- 1.0 *blast-bot-body-tilt-share*))
-                 1.0)
-    (vector-normalize! up 1.0)
-    (quaternion-from-two-vectors! tilt-q *up-vector* up)
+    (blast-bot-tilt-quat! tilt-q
+                          (* (-> this tilt-x) (- 1.0 *blast-bot-body-tilt-share*))
+                          (* (-> this tilt-z) (- 1.0 *blast-bot-body-tilt-share*)))
     (quaternion*! (-> this top-quat) tilt-q yaw-q)
     (quaternion-normalize! (-> this top-quat))
     (quaternion-copy! (-> arg1 quat) (-> this top-quat))
@@ -546,12 +630,37 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   (none)
   )
 
+(defun blast-bot-los? ((this blast-bot-player) (dest vector))
+  "#t when nothing solid is between the gun muzzle and dest."
+  (let ((q (new 'stack-no-clear 'collide-query))
+        (start (new 'stack-no-clear 'vector))
+        (dir (new 'stack-no-clear 'vector))
+        )
+    (matrix->trans (-> this node-list data 6 bone transform) start)
+    (vector-! dir dest start)
+    (vector-copy! (-> q start-pos) start)
+    (vector-copy! (-> q move-dist) dir)
+    (set! (-> q radius) 40.96)
+    (set! (-> q collide-with) (collide-spec backgnd))
+    (set! (-> q ignore-process0) this)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat)
+          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q action-mask) (collide-action solid))
+    (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+      (or (< hit 0.0) (>= hit 0.97))
+      )
+    )
+  )
+
 (defun blast-bot-lock-ok? ((this blast-bot-player) (p process-focusable))
   "A lock target is only kept while it's valid AND on screen."
   (and p
        (blast-bot-valid-target? this p)
        (-> p draw)
        (logtest? (-> p draw status) (draw-control-status on-screen))
+       ;; v5: the turret only tracks things it can actually see
+       (blast-bot-los? this (get-trans p 3))
        )
   )
 
@@ -693,7 +802,7 @@ Returns the fraction of the intended distance that was actually moved."
                      )
                 )
             (cond
-              ((and (>= hit 0.0) (< (-> q best-other-tri normal y) 0.7))
+              ((and (>= hit 0.0) (< (fabs (-> q best-other-tri normal y)) 0.7))
                ;; a wall: walk up to it...
                (let ((frac0 (fmax 0.0 (- hit 0.03))))
                  (+! (-> this root trans x) (* (-> move x) frac0))
@@ -702,7 +811,10 @@ Returns the fraction of the intended distance that was actually moved."
                ;; ...and keep only the part of the leftover movement that runs along the wall
                (vector-copy! n (-> q best-other-tri normal))
                (set! (-> n y) 0.0)
-               (vector-normalize! n 1.0)
+               (if (< 0.01 (vector-length n))
+                   (vector-normalize! n 1.0)
+                   (set-vector! n 0.0 0.0 0.0 1.0)
+                   )
                (vector-float*! move move (- 1.0 hit))
                (let ((d (vector-dot move n)))
                  (when (< d 0.0)
@@ -792,7 +904,7 @@ Returns the fraction of the intended distance that was actually moved."
         )
     ;; where is the ground right under the body? (probes from 5m above, so slopes and stairs are caught)
     (when (and *blast-bot-ground-follow* (!= (-> this jump-mode) 2))
-      (let ((gy (blast-bot-ground-y this 20480.0)))
+      (let ((gy (blast-bot-ground-y this 12288.0)))
         (when (< -900000000.0 gy)
           (set! (-> this ground-y) gy)
           )
@@ -802,7 +914,7 @@ Returns the fraction of the intended distance that was actually moved."
       ((0)
        (set! (-> this jump-fuel) (fmin 1.0 (+ (-> this jump-fuel) (* 0.4 dt))))
        (cond
-         ((< (-> this ground-y) (- (-> this root trans y) 20480.0))
+         ((< (-> this ground-y) (- (- (-> this root trans y) (-> this hover-lift)) 20480.0))
           ;; walked off a ledge (more than 5m drop): fall, thruster works like after a jump
           (set! (-> this jump-mode) 2)
           (set! (-> this jump-timer) (current-time))
@@ -932,8 +1044,253 @@ Returns the fraction of the intended distance that was actually moved."
   (none)
   )
 
+(defun blast-bot-dash-attack ((this blast-bot-player))
+  "While charging: hurt every valid enemy in front of the bot (once per charge, the attack id is shared)."
+  (let ((fwd (new 'stack-no-clear 'vector))
+        (center (new 'stack-no-clear 'vector))
+        (hits (new 'stack-no-clear 'array 'collide-shape 64))
+        )
+    (set-vector! fwd (sin (-> this dash-yaw)) 0.0 (cos (-> this dash-yaw)) 1.0)
+    (vector+*! center (-> this root trans) fwd 16384.0)
+    (+! (-> center y) 8192.0)
+    (set! (-> center w) 28672.0)
+    (countdown (i (fill-actor-list-for-box *actor-hash* center hits 64))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (and p
+                       (blast-bot-valid-target? this p)
+                       (< (vector-vector-distance (-> p root trans) center) 28672.0))
+              (send-event p 'attack #f
+                          (static-attack-info ((id (-> this dash-id)) (damage 6.0) (mode 'explode))))
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-touch ((this blast-bot-player))
+  "Generates 'touched events for the leg/body prims (same call bombbot.gc makes in enemy-common-post)."
+  (let ((params (new 'stack-no-clear 'overlaps-others-params)))
+    (set! (-> params options) (overlaps-others-options))
+    (set! (-> params collide-with-filter) (the-as collide-spec #xffffffff))
+    (set! (-> params tlist) *touching-list*)
+    (find-overlapping-shapes (-> this root) params)
+    ;; the shield never scans for overlaps itself, so do it for it while it is up: this is what makes people
+    ;; bump into it ('touch events reach shield-touch-handler)
+    (when (-> this shield-on)
+      (let ((sh (as-type (handle->process (-> this shield-handle)) shield-sphere)))
+        (when sh
+          (find-overlapping-shapes (-> sh root) params)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-draw-laser ((this blast-bot-player))
+  "Laser pointer: from the muzzle along the barrel until it hits something, with a dot at the end."
+  (when (and *blast-bot-laser-on* *debug-segment*)
+    (let ((q (new 'stack-no-clear 'collide-query))
+          (start (new 'stack-no-clear 'vector))
+          (dir (new 'stack-no-clear 'vector))
+          (dist 409600.0)
+          )
+      (matrix->trans (-> this node-list data 6 bone transform) start)
+      (vector-normalize-copy! dir (-> this node-list data 6 bone transform fvec) 1.0)
+      (vector+*! start start dir 8192.0)
+      (vector-copy! (-> q start-pos) start)
+      (vector-float*! (-> q move-dist) dir dist)
+      (set! (-> q radius) 40.96)
+      (set! (-> q collide-with) (collide-spec backgnd))
+      (set! (-> q ignore-process0) this)
+      (set! (-> q ignore-process1) #f)
+      (set! (-> q ignore-pat)
+            (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+      (set! (-> q action-mask) (collide-action solid))
+      (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+        (if (>= hit 0.0)
+            (set! dist (* dist hit))
+            )
+        )
+      (vector+*! (-> this laser-end) start dir dist)
+      (add-debug-vector #t (bucket-id debug-no-zbuf1) start dir dist
+                        (the-as rgba (new 'static 'rgba :r #xff :a #x60)))
+      (add-debug-sphere #t (bucket-id debug) (-> this laser-end) (meters 0.3)
+                        (static-rgba #xff 0 0 #x80))
+      )
+    )
+  (none)
+  )
+
+;; The shield uses the stock shield-sphere process (shield-sphere.gc, already in GAME).
+
+(defun blast-bot-spawn-shield-real ((this blast-bot-player))
+  "Does the actual spawn. Only call when skel-shield-sphere is loaded."
+  (format 0 "Blast Bot: spawning shield~%")
+  (let ((params (new 'stack-no-clear 'shield-sphere-spawn-params)))
+    (set! (-> params owner) (process->handle this))
+    (set! (-> params sphere-size) *blast-bot-shield-size*)
+    (set! (-> params track-joint) 3)
+    (set! (-> params enable-time) (seconds 0.1))
+    (set! (-> params disable-time) (seconds 0.1))
+    (set! (-> params shield-strength) 8)
+    (set! (-> params shield-type) (shield-type shield-type-0))
+    (vector-copy! (-> params offset-vec) (new 'static 'vector :z -4096.0 :w 1.0))
+    (let ((shield (the-as process #f)))
+      (let* ((s2 (get-process *default-dead-pool* shield-sphere #x4000 1))
+             (v1 (when s2
+                   (let ((t9 (method-of-type process activate)))
+                     (t9 s2 this "process" (the-as pointer #x70004000))
+                     )
+                   (run-now-in-process s2 shield-sphere-init-by-other params)
+                   (-> s2 ppointer)
+                   )
+                 )
+             )
+        (if v1
+            (set! shield (-> v1 0))
+            )
+        )
+      (when shield
+        (set! (-> this shield-handle) (process->handle shield))
+        ;; The stock shield-sphere only collides with `jak player-list` (it is made to stop the PLAYER's shots).
+        ;; The bot is the target here, so the hit sphere has to be seen as `jak` by enemy shots and has to
+        ;; collide with everything the bot's own body collides with.
+        (set! (-> (the-as shield-sphere shield) root backup-collide-as)
+              (collide-spec jak obstacle impenetrable-obj shield))
+        (set! (-> (the-as shield-sphere shield) root backup-collide-with)
+              (the-as collide-spec #xffffffff))
+        ;; projectiles only send 'attack to things whose penetrated-by matches their attack type; the stock shield
+        ;; accepts none (mech shots are handled elsewhere), so accept everything here.
+        (set! (-> (the-as shield-sphere shield) root penetrated-by) (the-as penetrate -1))
+        (send-event shield 'disabled)
+        (format 0 "Blast Bot: shield spawned~%")
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-spawn-shield ((this blast-bot-player))
+  "Spawns the mech's own shield sphere (target-mech.gc) on the bot's body joint, switched off.
+Hold Circle to switch it on. Needs the skel-shield-sphere art to be loaded."
+  (if (not (art-group-get-by-name *level* "skel-shield-sphere" (the-as (pointer level) #f)))
+      (format 0 "Blast Bot: skel-shield-sphere art is not loaded, shield disabled~%")
+      (blast-bot-spawn-shield-real this)
+      )
+  (none)
+  )
+
+;; DEBUG: logs every message the shield receives (same body as shield-sphere.gc, plus a log line).
+;; Remove this whole block once the shield behaves. It overrides the method for all shield-spheres.
+(define *blast-bot-shield-debug* #t)
+
+(defmethod shield-event-handler ((this shield-sphere) (arg0 process) (arg1 int) (arg2 symbol) (arg3 event-message-block))
+  (if *blast-bot-shield-debug*
+      (format 0 "Shield msg: ~A from ~A~%" arg2 (if arg0 (-> arg0 type) #f))
+      )
+  (case arg2
+    (('shield-detach)
+     (go (method-of-object this die))
+     #t
+     )
+    (('active)
+     #t
+     )
+    (('heat-ratio)
+     (-> this heat-info current-heat-value)
+     )
+    (('notice)
+     (case (-> arg3 param 0)
+       (('die)
+        (go (method-of-object this die))
+        #t
+        )
+       (else
+         #f
+         )
+       )
+     )
+    (('enabled)
+     (go (method-of-object this shield-enabled))
+     )
+    (('disabled)
+     (go (method-of-object this shield-disabled))
+     )
+    (('touch)
+     (shield-touch-handler this (the-as process-focusable arg0) arg3)
+     )
+    (('attack)
+     (shield-attack-handler this (the-as process-focusable arg0) arg3)
+     )
+    (('impact-impulse)
+     (let ((v1-12 (the-as object (-> arg3 param 0))))
+       (when (< 40960.0 (* (-> (the-as rigid-body-impact v1-12) impulse) (get-inv-mass this)))
+         (logior! (-> this root penetrated-by) (penetrate vehicle))
+         (go (method-of-object this explode))
+         #t
+         )
+       )
+     )
+    )
+  )
+
+(defun blast-bot-add-leg-sphere ((root collide-shape) (id int) (joint int) (y float))
+  "One touch sphere on a leg bone (same layout as bombbot.gc: 4 spheres per bone, 8 per leg)."
+  (let ((p (new 'process 'collide-shape-prim-sphere root (the-as uint id))))
+    (set! (-> p prim-core collide-as) (collide-spec jak))
+    (set! (-> p prim-core collide-with) (the-as collide-spec #xffffffff))
+    (set! (-> p prim-core action) (collide-action solid no-standon))
+    (set! (-> p transform-index) joint)
+    (set-vector! (-> p local-sphere) 0.0 y 0.0 2867.2)
+    )
+  0
+  )
+
 (defstate active (blast-bot-player)
   :virtual #t
+  :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
+    (case message
+      (('touched)
+       ;; A leg/body sphere overlapped something. Hurt enemies and break crates (we forward the touching
+       ;; entry exactly like bombbot.gc does, which is what breakables want). One attack id per 0.4s.
+       (when (and proc
+                  (!= proc self)
+                  (!= proc *target*)
+                  (!= proc (handle->process (-> self shield-handle)))
+                  (logtest? (process-mask enemy guard metalhead kg-robot crate) (-> proc mask))
+                  (not (logtest? (process-mask civilian) (-> proc mask)))
+                  )
+         (when (>= (current-time) (-> self leg-id-time))
+           (set! (-> self leg-id-time) (+ (current-time) (seconds 0.4)))
+           (set! (-> self leg-id) (new-attack-id))
+           )
+         (send-event proc 'attack (-> block param 0)
+                     (static-attack-info ((id (-> self leg-id))
+                                          (damage 2.0)
+                                          (mode 'explode)
+                                          (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
+                                          )))
+         )
+       #t
+       )
+      (('get-pickup)
+       ;; orbs/cells are collected by touching them; Jak is the one who actually owns the inventory
+       (if *target*
+           (send-event *target* 'get-pickup (-> block param 0) (-> block param 1))
+           #f
+           )
+       )
+      (else
+        #f
+        )
+      )
+    )
   :enter (behavior ()
     (format 0 "Blast Bot: active enter~%")
     (when *camera*
@@ -955,7 +1312,10 @@ Returns the fraction of the intended distance that was actually moved."
     )
   :trans (behavior ()
     (blast-bot-jump-update self)
-    (let ((speed (-> *cpad-list* cpads 0 stick0-speed)))
+    (let ((speed (-> *cpad-list* cpads 0 stick0-speed))
+          (dt (seconds-per-frame))
+          (dashing (< (current-time) (-> self dash-until)))
+          )
       (set! (-> self input-active) #f)
       (when (< 0.05 speed)
         (let ((move (new 'stack-no-clear 'vector)))
@@ -966,12 +1326,77 @@ Returns the fraction of the intended distance that was actually moved."
           (set! (-> self input-yaw) (vector-y-angle move))
           (set! (-> self input-active) #t)
           ;; only the ground mode walks; while crouching / airborne / recovering the stick just aims the head
-          (when (= (-> self jump-mode) 0)
-            (let ((amount (* 49152.0 speed (seconds-per-frame))))
-              (blast-bot-move-xz self (* (-> move x) amount) (* (-> move z) amount))
+          (when (and (= (-> self jump-mode) 0) (not dashing))
+            (let* ((amount (* 49152.0 speed (-> self ramp) dt))
+                   (frac (blast-bot-move-xz self (* (-> move x) amount) (* (-> move z) amount)))
+                   )
+              ;; board rule: slam into a wall and the speed is gone
+              (if (< frac 0.5)
+                  (set! (-> self ramp) 1.0)
+                  )
               )
             )
           )
+        )
+      ;; speed ramp: builds while the stick is held on the ground, bleeds off when it is released
+      ;; speed ramp is Hover-only: builds while R2-hover is active and the stick is held, otherwise bleeds off
+      (if (and (-> self input-active) (-> self hover-on) (!= (-> self jump-mode) 1))
+          (seek! (-> self ramp) *blast-bot-ramp-max*
+                 (* dt (/ (- *blast-bot-ramp-max* 1.0) *blast-bot-ramp-time*)))
+          (seek! (-> self ramp) 1.0 (* dt 2.0))
+          )
+      ;; Square: charge forward in the stick direction (or where the head already points)
+      (when (and (cpad-pressed? 0 square)
+                 (= (-> self jump-mode) 0)
+                 (not dashing)
+                 (>= (current-time) (-> self dash-ready))
+                 )
+        (set! (-> self dash-yaw) (if (-> self input-active) (-> self input-yaw) (-> self head-yaw)))
+        (set! (-> self head-yaw) (-> self dash-yaw))
+        (set! (-> self dash-until) (+ (current-time) (seconds 0.35)))
+        (set! (-> self dash-ready) (+ (current-time) (seconds 1.0)))
+        (set! (-> self dash-id) (new-attack-id))
+        (set! dashing #t)
+        (activate! *camera-smush-control* 768.0 37 60 1.0 0.99 (-> self clock))
+        )
+      (when dashing
+        (let* ((amount (* *blast-bot-dash-speed* dt))
+               (frac (blast-bot-move-xz self
+                                        (* (sin (-> self dash-yaw)) amount)
+                                        (* (cos (-> self dash-yaw)) amount)))
+               )
+          (blast-bot-dash-attack self)
+          (when (< frac 0.5)
+            ;; hit a wall: the charge ends with a bang
+            (set! (-> self dash-until) 0)
+            (set! (-> self ramp) 1.0)
+            (activate! *camera-smush-control* 1024.0 37 90 1.0 0.99 (-> self clock))
+            )
+          )
+        )
+      ;; R2 (held): hover. Legs sweep back and the body floats up.
+      ;; R2 (press): toggle hover on/off. Only switchable from the ground or while airborne.
+      (when (and (cpad-pressed? 0 r2) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2)))
+        (set! (-> self hover-on) (not (-> self hover-on)))
+        )
+      (seek! (-> self hover-blend)
+             (if (and (-> self hover-on) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2))) 1.0 0.0)
+             (* 4.0 dt))
+      (set! (-> self hover-lift) (* (-> self hover-blend) *blast-bot-hover-height*))
+      ;; Circle (held): the mech's shield. Movement is not touched.
+      (let ((want (cpad-hold? 0 circle)))
+        (when (!= want (-> self shield-on))
+          (set! (-> self shield-on) want)
+          (format 0 "Blast Bot: shield ~A (handle ok: ~A)~%" (if want 'on 'off) (if (handle->process (-> self shield-handle)) #t #f))
+          (if want
+              (send-event (handle->process (-> self shield-handle)) 'enabled)
+              (send-event (handle->process (-> self shield-handle)) 'disabled)
+              )
+          )
+        )
+      ;; keep Jak (parked in grab-ride) from blocking doors / level borders
+      (when (and *target* *blast-bot-clear-grabbed*)
+        (logclear! (-> *target* focus-status) (focus-status grabbed))
         )
       ;; the head swings to the stick direction and stays there; the body then turns to follow the HEAD
       (when (-> self input-active)
@@ -981,12 +1406,33 @@ Returns the fraction of the intended distance that was actually moved."
                                 (deg-seek (quaternion-y-angle (-> self root quat))
                                           (-> self head-yaw)
                                           (* *blast-bot-body-turn-rate* (seconds-per-frame))))
-      (set! (-> self speed) (if (= (-> self jump-mode) 0) speed 0.0))
+      (set! (-> self speed) (cond
+                              (dashing 1.0)
+                              ((= (-> self jump-mode) 0) speed)
+                              (else 0.0)
+                              ))
       )
     (when (and (cpad-pressed? 0 r1)
                (>= (+ (current-time) (seconds -0.02)) (-> self next-shot)))
       (set! (-> self next-shot) (+ (current-time) (seconds 0.2)))
       (blast-bot-fire-shot self)
+      (set! (-> self shield-open-until) (+ (current-time) (seconds 0.15)))
+      )
+    ;; our own shots start inside the shield: its hit sphere is off for a moment after each shot so they fly out
+    (let ((sh (as-type (handle->process (-> self shield-handle)) shield-sphere)))
+      (when sh
+        (cond
+          ((< (current-time) (-> self shield-open-until))
+           (set! (-> sh root root-prim prim-core collide-as) (collide-spec))
+           )
+          ((nonzero? (-> self shield-open-until))
+           (set! (-> self shield-open-until) 0)
+           (if (-> self shield-on)
+               (set! (-> sh root root-prim prim-core collide-as) (-> sh root backup-collide-as))
+               )
+           )
+          )
+        )
       )
     )
   :code (behavior ()
@@ -1009,51 +1455,53 @@ Returns the fraction of the intended distance that was actually moved."
           (enable-set! (-> self joint-ik i) #f)
           )
         )
-    (let ((was-uninited (logtest? (-> self draw status) (draw-control-status uninited))))
-      (ja-post)
-      (when was-uninited
-        (format 0 "Blast Bot: first draw post flags #x~X~%" (-> self draw status))
-        )
-      )
+    (ja-post)
     (update-transforms (-> self root))
+    (blast-bot-touch self)
+    (blast-bot-draw-laser self)
     (+! (-> self debug-frame-count) 1)
-    (when (= (-> self debug-frame-count) 60)
-          (let ((camera (camera-pos)))
-      (format 0 "Blast Bot: renderer status #x~X on-screen ~A layer ~d current-level ~A~%"
-        (-> self draw status)
-        (if (logtest? (-> self draw status) (draw-control-status on-screen)) "yes" "no")
-        (-> self draw level-index)
-        (-> *level* draw-level (-> self draw level-index) display?))
-      (format 0 "Blast Bot: texture-page ~d mesh ~A max LOD ~d~%"
-        (-> self draw default-texture-page)
-        (if (-> self draw mgeo) "present" "missing")
-        (-> self draw max-lod))
-      (format 0 "Blast Bot: root (~f, ~f, ~f) camera (~f, ~f, ~f)~%"
-        (-> self root trans x)
-        (-> self root trans y)
-        (-> self root trans z)
-        (-> camera x)
-        (-> camera y)
-        (-> camera z))
-      )
-      )
     )
   )
 
 (defbehavior blast-bot-player-init-by-other blast-bot-player ()
   (format 0 "Blast Bot: init begin~%")
   (let ((root (new 'process 'collide-shape self (collide-list-enum usually-hit-by-player))))
+    ;; 1 group + 34 children (same count as bombbot.gc): walls sphere, body touch sphere, 8 spheres per leg
+    (let ((group (new 'process 'collide-shape-prim-group root (the-as uint 34) 0)))
+      (set! (-> root total-prims) (the-as uint 35))
+      (set! (-> group prim-core collide-as) (collide-spec jak))
+      (set! (-> group prim-core collide-with) (the-as collide-spec #xffffffff))
+      (set! (-> group prim-core action) (collide-action solid no-standon))
+      (set-vector! (-> group local-sphere) 0.0 12288.0 0.0 40960.0)
+      (set! (-> root root-prim) group)
+      (set! (-> root nav-radius) 32768.0)
+      (set! (-> root backup-collide-as) (-> group prim-core collide-as))
+      (set! (-> root backup-collide-with) (-> group prim-core collide-with))
+      )
     (let ((sphere (new 'process 'collide-shape-prim-sphere root (the-as uint 0))))
       (set! (-> sphere prim-core collide-as) (collide-spec obstacle))
       (set! (-> sphere prim-core collide-with) (collide-spec backgnd))
       (set! (-> sphere prim-core action) (collide-action solid))
       (set! (-> sphere transform-index) 3)
-      (set-vector! (-> sphere local-sphere) 0.0 8192.0 0.0 32768.0)
-      (set! (-> root total-prims) (the-as uint 1))
-      (set! (-> root root-prim) sphere)
-      (set! (-> root nav-radius) 32768.0)
-      (set! (-> root backup-collide-as) (-> sphere prim-core collide-as))
-      (set! (-> root backup-collide-with) (-> sphere prim-core collide-with))
+      (set-vector! (-> sphere local-sphere) 0.0 8192.0 0.0 16384.0)
+      )
+    (let ((body (new 'process 'collide-shape-prim-sphere root (the-as uint 0))))
+      (set! (-> body prim-core collide-as) (collide-spec jak))
+      (set! (-> body prim-core collide-with) (the-as collide-spec #xffffffff))
+      (set! (-> body prim-core action) (collide-action solid no-standon))
+      (set! (-> body transform-index) 3)
+      (set-vector! (-> body local-sphere) 0.0 1638.4 0.0 8192.0)
+      )
+    ;; legs: elbow joint + the joint below it, signs match *blast-bot-hand-dist*
+    (dotimes (limb 4)
+      (let ((elbow (-> *blast-bot-elbows* limb))
+            (sign (if (or (= limb 0) (= limb 2)) 1.0 -1.0))
+            )
+        (dotimes (k 4)
+          (blast-bot-add-leg-sphere root (+ limb 1) elbow (* sign 4096.0 (the float k)))
+          (blast-bot-add-leg-sphere root (+ limb 1) (+ elbow -1) (* sign 4096.0 (the float k)))
+          )
+        )
       )
     (set! (-> self root) root)
     )
@@ -1065,20 +1513,9 @@ Returns the fraction of the intended distance that was actually moved."
   (vector-identity! (-> self root scale))
   (initialize-skeleton self skel-blast-bot (the-as pair 0))
   (format 0 "Blast Bot: skeleton ready~%")
-    (if (-> self draw)
-        (begin
-    (format 0 "Blast Bot: draw-control present, level ~A, flags #x~X~%"
-      (-> self level name)
-      (-> self draw status))
-    (format 0 "Blast Bot: art-group ~A, LOD0 mesh ~A, max LOD ~d~%"
-      (if (-> self draw art-group) (-> self draw art-group name) "missing")
-      (if (-> self draw lod-set lod 0 geo) "present" "missing")
-      (-> self draw max-lod))
-        )
-        (format 0 "Blast Bot: draw-control missing~%")
-        )
   (blast-bot-init-legs self)
   (blast-bot-init-aim self)
+  (blast-bot-spawn-shield self)
   (format 0 "Blast Bot: transitioning to active~%")
   (go-virtual active)
   )
