@@ -127,9 +127,18 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
    (cam-zoom-set     float)            ;; factor the camera settings were last set to
    (ride-retry       time-frame)       ;; next time we may try to put Jak back into the bot
    (ext-pos          vector       :inline) ;; root position at the end of our own last update; any difference later = moved by a platform (rider pull)
+   ;; v7 additions: health + hud
+   (health           float)            ;; 0 .. max-health, the bot is destroyed at 0
+   (max-health       float)
+   (hit-until        time-frame)       ;; short invulnerability window after every hit
+   (last-hit-id      uint32)           ;; attack id of the last hit that landed (the same id is never counted twice)
+   (hit-flash        float)            ;; 1.0 right after a hit, fades out; makes the health bar flash
+   (hud-handle       handle)           ;; the blast-bot-hud process (health bar + fuel bar)
+   (hud-retry        time-frame)       ;; next time we may try to (re)spawn the hud
    )
   (:state-methods
     active
+    die
     )
   )
 
@@ -150,6 +159,25 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; on-screen platform / rider debug text (top-left console); set to #f from the REPL to hide it
 (define *blast-bot-debug-ride* #t)
 (define *blast-bot-ride-seen* (the-as string #f))
+
+;; #t = everything the bot kills counts as Jak's kill (mission kill counters). Side effect: enemies see Jak as their
+;; attacker. #f = the bot is its own attacker, which is the old behaviour where enemies fought back at the bot.
+(define *blast-bot-credit-jak* #t)
+;; #t = the bot's guard-shot is also credited to Jak. Kept separate because crediting shots made the NPCs' own guard
+;; shots stop hitting the bot. Irrelevant once the morphgun is used (Jak's own shots always count).
+(define *blast-bot-credit-shots* #f)
+;; #t = the turret fires Jak's red morphgun shot (gun-red-1) instead of the guard shot. #f = old guard shot.
+(define *blast-bot-use-morphgun* #f)
+
+(defun blast-bot-credit-jak! ((info attack-info))
+  ;; Name Jak as the attacker. Mission kill counters (e.g. the marauder arena fights) only count a kill when the
+  ;; last attacker is a process of type target; the bot is its own process type, so without this nothing it kills counts.
+  (when (and *target* *blast-bot-credit-jak*)
+    (set! (-> info attacker) (process->handle *target*))
+    (logior! (-> info mask) (attack-mask attacker))
+    )
+  info
+  )
 ;; seconds between the two legs of a diagonal pair (front leg first, then the back one)
 (define *blast-bot-leg-delay* 0.1)
 ;; how fast the body turns toward the stick direction (rotation units/sec, 21845 = 120 deg/s)
@@ -161,7 +189,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; so the head's total tilt is unchanged and the body tilts too (it also carries the head).
 (define *blast-bot-body-tilt-share* 0.5)
 ;; board-style speed ramp: 1x -> max over ramp-time seconds of holding the stick, reset by hitting a wall
-(define *blast-bot-ramp-max* 4.0)
+(define *blast-bot-ramp-max* 3.0)
 (define *blast-bot-ramp-time* 4.0)
 ;; R2 hover: how high (in game units, 4096 = 1m) the body floats
 (define *blast-bot-hover-height* 12288.0)
@@ -185,14 +213,29 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-laser-width-rand* 819.2)
 ;; shield: seconds until a completely broken shield is rebuilt
 (define *blast-bot-shield-recharge* 10.0)
+;; health: the bot has max-health points. An attack that would cost Jak 1.0 damage costs the bot damage-scale points
+;; (2.0 damage = 16 points with the defaults, so about 7 normal hits). Hits are ignored for invuln-time seconds after
+;; each one, and while the Circle shield is up. God mode: (set! *blast-bot-god-mode* #t)
+(define *blast-bot-max-health* 100.0)
+(define *blast-bot-damage-scale* 8.0)
+(define *blast-bot-invuln-time* 0.3)
+(define *blast-bot-god-mode* #f)
+;; prints every attack event that reaches the bot and what was done with it
+(define *blast-bot-attack-debug* #t)
+;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
+;; #f = he just walks away from the wreck
+(define *blast-bot-death-kills-jak* #t)
+;; the big explosion when the bot is destroyed. Off by default: the game crashed in the death sequence and this is the
+;; most likely culprit (it needs group-kg-huge-explosion to be loaded). Turn it on once death works without it.
+(define *blast-bot-death-explosion* #t)
 
 ;; elbow joint index + hand distance for each limb, from *bombbot-ik-limb-setup*
 (define *blast-bot-elbows* (new 'static 'boxed-array :type int32 19 13 15 17))
 (define *blast-bot-hand-dist* (new 'static 'boxed-array :type float 14880.768 -14880.768 14880.768 -14880.768))
 
 (defun blast-bot-foot-phase ((i int))
-  "Where in the 0.8s gait cycle foot i steps. Feet 0/2 and 3/1 are diagonal pairs,
-the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay* later."
+  ;; Where in the 0.8s gait cycle foot i steps. Feet 0/2 and 3/1 are diagonal pairs,
+  ;; the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay* later.
   (let ((d (/ *blast-bot-leg-delay* 0.8)))
     (case i
       ((0) 0.0)
@@ -204,7 +247,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   )
 
 (defun blast-bot-foot-local ((out vector) (i int))
-  "Rest position of foot i, relative to the body."
+  ;; Rest position of foot i, relative to the body.
   (set-vector! out
                (if (< i 2) 11878.4 -11878.4)
                0.0
@@ -214,7 +257,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   )
 
 (defun blast-bot-init-legs ((this blast-bot-player))
-  "Call once, right after initialize-skeleton."
+  ;; Call once, right after initialize-skeleton."
   (dotimes (i 4)
     (set! (-> this joint-ik i)
           (new 'process 'joint-mod-ik this (-> *blast-bot-elbows* i) (-> *blast-bot-hand-dist* i)))
@@ -280,7 +323,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
 ;; ---- targets, stomps, camera shake ----
 
 (defun blast-bot-valid-target? ((this blast-bot-player) (p process-focusable))
-  "Things the bot may stomp / lock on to."
+  ;; Things the bot may stomp / lock on to.
   (and p
        (!= this p)
        (not (focus-test? p inactive))
@@ -293,7 +336,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   )
 
 (defun blast-bot-foot-attack ((this blast-bot-player) (pos vector) (radius float))
-  "Foot collider: hurts every valid enemy within radius of pos."
+  ;; Foot collider: hurts every valid enemy within radius of pos.
   (let ((box (new 'stack-no-clear 'vector))
         (hits (new 'stack-no-clear 'array 'collide-shape 64))
         )
@@ -307,7 +350,8 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
                        (blast-bot-valid-target? this p)
                        (< (vector-vector-distance (-> p root trans) pos) radius))
               (send-event p 'attack #f
-                          (static-attack-info ((id (new-attack-id)) (damage 2.0) (mode 'explode))))
+                          (blast-bot-credit-jak!
+                            (static-attack-info ((id (new-attack-id)) (damage 2.0) (mode 'explode)))))
               )
             )
           )
@@ -318,7 +362,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   )
 
 (defun blast-bot-foot-landed ((this blast-bot-player) (i int))
-  "A foot just planted: footstep camera shake (only while walking) + stomp."
+  ;; A foot just planted: footstep camera shake (only while walking) + stomp.
   (when (< 0.2 (-> this speed))
     (activate! *camera-smush-control* (* 256.0 (-> this speed)) 37 45 1.0 0.95 (-> this clock))
     )
@@ -330,7 +374,7 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
   )
 
 (defun blast-bot-update-legs ((this blast-bot-player))
-  "Call every frame from :post BEFORE ja-post."
+  ;; Call every frame from :post BEFORE ja-post.
   (let ((q (new 'stack-no-clear 'collide-query))
         (fps (/ 1.0 (seconds-per-frame)))
         (swing 0.4)
@@ -558,8 +602,8 @@ the front foot (0, 3) goes first and the back foot follows *blast-bot-leg-delay*
 ;;  - gun: stays level, only pitches when locked on to an enemy
 
 (defun blast-bot-tilt-quat! ((out quaternion) (tx float) (tz float))
-  "Lean the up axis toward (tx, 1, tz). Small-angle axis/angle instead of quaternion-from-two-vectors!,
-which takes an acos and can produce NaN (head/body flipping for a moment) when the vectors are nearly equal."
+  ;; Lean the up axis toward (tx, 1, tz). Small-angle axis/angle instead of quaternion-from-two-vectors!,
+  ;; which takes an acos and can produce NaN (head/body flipping for a moment) when the vectors are nearly equal.
   (let ((mag (sqrtf (+ (* tx tx) (* tz tz)))))
     (if (< mag 0.0001)
         (quaternion-copy! out *unity-quaternion*)
@@ -574,7 +618,7 @@ which takes an acos and can produce NaN (head/body flipping for a moment) when t
   )
 
 (defun blast-bot-body-callback ((arg0 cspace) (arg1 transformq))
-  "Joint 3: the body the legs are attached to. Leans with the same tilt as the head."
+  ;; Joint 3: the body the legs are attached to. Leans with the same tilt as the head.
   (let ((this (the-as blast-bot-player (-> arg0 param1)))
         (tilt-q (new 'stack-no-clear 'quaternion))
         (base-q (new 'stack-no-clear 'quaternion))
@@ -662,7 +706,7 @@ which takes an acos and can produce NaN (head/body flipping for a moment) when t
   )
 
 (defun blast-bot-los? ((this blast-bot-player) (dest vector))
-  "#t when nothing solid is between the gun muzzle and dest."
+  ;; #t when nothing solid is between the gun muzzle and dest.
   (let ((q (new 'stack-no-clear 'collide-query))
         (start (new 'stack-no-clear 'vector))
         (dir (new 'stack-no-clear 'vector))
@@ -685,7 +729,7 @@ which takes an acos and can produce NaN (head/body flipping for a moment) when t
   )
 
 (defun blast-bot-lock-ok? ((this blast-bot-player) (p process-focusable))
-  "A lock target is only kept while it's valid AND on screen."
+  ;; A lock target is only kept while it's valid AND on screen.
   (and p
        (blast-bot-valid-target? this p)
        (-> p draw)
@@ -696,7 +740,7 @@ which takes an acos and can produce NaN (head/body flipping for a moment) when t
   )
 
 (defun blast-bot-find-lock ((this blast-bot-player))
-  "Nearest valid on-screen enemy within 50m, or #f."
+  ;; Nearest valid on-screen enemy within 50m, or #f.
   (let ((best (the-as process-focusable #f))
         (best-dist 0.0)
         (box (new 'stack-no-clear 'vector))
@@ -725,7 +769,7 @@ which takes an acos and can produce NaN (head/body flipping for a moment) when t
   )
 
 (defun blast-bot-init-aim ((this blast-bot-player))
-  "Call once after initialize-skeleton."
+  ;; Call once after initialize-skeleton.
   (quaternion-copy! (-> this top-quat) *unity-quaternion*)
   (set! (-> this angle-turret) 0.0)
   (set! (-> this angle-gun) 0.0)
@@ -755,7 +799,7 @@ which takes an acos and can produce NaN (head/body flipping for a moment) when t
   )
 
 (defun blast-bot-update-aim ((this blast-bot-player))
-  "Call every frame from :post. Locks on to the nearest visible enemy, otherwise follows the camera's left/right."
+  ;; Call every frame from :post. Locks on to the nearest visible enemy, otherwise follows the camera's left/right.
   (let ((p (as-type (handle->process (-> this lock-handle)) process-focusable)))
     ;; drop a bad lock right away, and re-pick the nearest enemy every 20 frames
     (when (or (not (blast-bot-lock-ok? this p))
@@ -793,9 +837,9 @@ which takes an acos and can produce NaN (head/body flipping for a moment) when t
 ;; Fuel recharges while standing.
 
 (defun blast-bot-move-xz ((this blast-bot-player) (dx float) (dz float))
-  "Move the bot horizontally by (dx, dz). Steep surfaces (walls, and pusher actors such as platforms, elevators and
-doors) stop it and it slides along them.
-Returns the fraction of the intended distance that was actually moved."
+  ;; Move the bot horizontally by (dx, dz). Steep surfaces (walls, and pusher actors such as platforms, elevators and
+  ;; doors) stop it and it slides along them.
+  ;; Returns the fraction of the intended distance that was actually moved."
   (let* ((q (new 'stack-no-clear 'collide-query))
          (move (new 'stack-no-clear 'vector))
          (n (new 'stack-no-clear 'vector))
@@ -878,7 +922,7 @@ Returns the fraction of the intended distance that was actually moved."
   )
 
 (defun blast-bot-ground-y ((this blast-bot-player) (up float))
-  "Height of the ground under the bot (probing down from 'up' units above it), or -1e9 if none found."
+  ;; Height of the ground under the bot (probing down from 'up' units above it), or -1e9 if none found.
   (let ((q (new 'stack-no-clear 'collide-query)))
     (vector+*! (-> q start-pos) (-> this root trans) *y-vector* up)
     (vector-float*! (-> q move-dist) *y-vector* -163840.0)
@@ -899,7 +943,7 @@ Returns the fraction of the intended distance that was actually moved."
   )
 
 (defun blast-bot-land ((this blast-bot-player) (gy float))
-  "Touch down at height gy: slam, shake, re-plant the feet."
+  ;; Touch down at height gy: slam, shake, re-plant the feet.
   (set! (-> this root trans y) gy)
   (set! (-> this ground-y) gy)
   (set! (-> this jump-fuel) 1.0)
@@ -930,7 +974,7 @@ Returns the fraction of the intended distance that was actually moved."
   )
 
 (defun blast-bot-jump-update ((this blast-bot-player))
-  "Call every frame from :trans, before the walking code."
+  ;; Call every frame from :trans, before the walking code.
   (let ((dt (seconds-per-frame))
         (g 163840.0)
         )
@@ -1044,11 +1088,120 @@ Returns the fraction of the intended distance that was actually moved."
   (none)
   )
 
-(defun blast-bot-draw-fuel ((this blast-bot-player))
-  "Text fuel meter (top-left debug console) while jumping or recharging."
-  (when (or (!= (-> this jump-mode) 0) (< (-> this jump-fuel) 0.999))
-    (let ((n (the int (* 20.0 (-> this jump-fuel)))))
-      (format *stdcon* "THRUSTER [")
+;; ---- HUD: health bar (bottom centre, horizontal) + thruster fuel bar (right side, vertical) ----
+;; Same pattern as bombbot-hud in bombbot.gc, but only plain white rectangles from the common texture page so it works
+;; in every level. Coordinates are hud pixels (512 wide, 416 high); a hud rectangle is the white texture (4x4 pixels)
+;; stretched by scale-x / scale-y, positioned by its top-left corner.
+(define *blast-bot-hud-health* 1.0)   ;; 0..1, written by the bot every frame
+(define *blast-bot-hud-fuel* 1.0)     ;; 0..1
+(define *blast-bot-hud-fuel-show* #f) ;; the fuel bar is only shown while jumping / recharging, like the old text meter
+(define *blast-bot-hud-flash* 0.0)    ;; 0..1, health bar flashes white after a hit
+;; set to #f to run the bot without the hud process (health still works) if the hud ever crashes the game
+(define *blast-bot-hud-on* #f) ;; the hud process crashed the game on spawn (see blast-bot-update-hud); text meters are used while this is #f
+;; layout (hud pixels): health bar, bottom centre
+(define *blast-bot-hp-x* 176)
+(define *blast-bot-hp-y* 382)
+(define *blast-bot-hp-w* 160)
+(define *blast-bot-hp-h* 12)
+;; layout: fuel bar, right side, grows upwards from fuel-bottom
+(define *blast-bot-fuel-x* 468)
+(define *blast-bot-fuel-bottom* 280)
+(define *blast-bot-fuel-w* 12)
+(define *blast-bot-fuel-h* 160)
+
+(deftype blast-bot-hud (hud)
+  ()
+  )
+
+(defmacro blast-bot-hud-rect! (spr px py pw ph cr cg cb)
+  ;; one coloured rectangle: top-left (px, py), size pw x ph hud pixels, colour cr/cg/cb in 0..255.
+  ;; The hud draws sprites with the usual PS2 modulate (128 = texture colour), so the colour is halved.
+  `(let ((rect-s ,spr))
+     (set-hud-piece-position! rect-s ,px ,py)
+     (set! (-> rect-s pos z) #xfffff0)
+     (set! (-> rect-s scale-x) (/ ,pw 4.0))
+     (set! (-> rect-s scale-y) (/ ,ph 4.0))
+     (set! (-> rect-s color x) (/ ,cr 2))
+     (set! (-> rect-s color y) (/ ,cg 2))
+     (set! (-> rect-s color z) (/ ,cb 2))
+     0
+     )
+  )
+
+(defmethod draw ((this blast-bot-hud))
+  ;; sprites 0-2: health (border, background, fill)   sprites 3-5: fuel (border, background, fill)
+  (let* ((hp (fmax 0.0 (fmin 1.0 *blast-bot-hud-health*)))
+         (hpw (the float *blast-bot-hp-w*))
+         (hph (the float *blast-bot-hp-h*))
+         (flash (the int (* 200.0 *blast-bot-hud-flash*)))
+         ;; green -> yellow -> red as the health drops, washed out towards white by the hit flash
+         (r (if (< hp 0.5) 255 (the int (* 510.0 (- 1.0 hp)))))
+         (g (if (< hp 0.5) (the int (* 510.0 hp)) 220))
+         )
+    (blast-bot-hud-rect! (-> this sprites 0) (+ *blast-bot-hp-x* -2) (+ *blast-bot-hp-y* -2) (+ hpw 4.0) (+ hph 4.0) 0 0 0)
+    (blast-bot-hud-rect! (-> this sprites 1) *blast-bot-hp-x* *blast-bot-hp-y* hpw hph 70 20 20)
+    (blast-bot-hud-rect! (-> this sprites 2) *blast-bot-hp-x* *blast-bot-hp-y* (* hpw hp) hph
+                         (min 255 (+ r flash)) (min 255 (+ g flash)) (min 255 flash))
+    )
+  (let* ((fuel (fmax 0.0 (fmin 1.0 *blast-bot-hud-fuel*)))
+         (show (if *blast-bot-hud-fuel-show* 1.0 0.0))
+         (fw (the float *blast-bot-fuel-w*))
+         (fh (the float *blast-bot-fuel-h*))
+         (fill (* fh fuel))
+         (low (< fuel 0.25))
+         )
+    (blast-bot-hud-rect! (-> this sprites 3)
+                         (+ *blast-bot-fuel-x* -2) (+ (- *blast-bot-fuel-bottom* *blast-bot-fuel-h*) -2)
+                         (* show (+ fw 4.0)) (* show (+ fh 4.0)) 0 0 0)
+    (blast-bot-hud-rect! (-> this sprites 4)
+                         *blast-bot-fuel-x* (- *blast-bot-fuel-bottom* *blast-bot-fuel-h*)
+                         (* show fw) (* show fh) 15 30 45)
+    (blast-bot-hud-rect! (-> this sprites 5)
+                         *blast-bot-fuel-x* (the int (- (the float *blast-bot-fuel-bottom*) (* show fill)))
+                         (* show fw) (* show fill)
+                         (if low 255 0) (if low 120 200) (if low 0 255))
+    )
+  ((method-of-type hud draw) this)
+  0
+  (none)
+  )
+
+(defmethod update-values! ((this blast-bot-hud))
+  (set! (-> this values 0 target) (the int (* 100.0 *blast-bot-hud-health*)))
+  (logclear! (-> this flags) (hud-flags disable))
+  ((method-of-type hud update-values!) this)
+  0
+  (none)
+  )
+
+(defmethod init-callback ((this blast-bot-hud))
+  ;; bombbot-hud sets this too; the hud code uses it, so it must not stay empty
+  (set! (-> this level) (level-get-target-inside *level*))
+  (set! (-> this gui-id)
+        (add-process *gui-control* this (gui-channel hud-upper-center-2) (gui-action hidden) (-> this name) 81920.0 0)
+        )
+  (logior! (-> this flags) (hud-flags show))
+  (dotimes (i 6)
+    (set! (-> this sprites i tid) (the-as texture-id (get-texture common-white common)))
+    (set! (-> this sprites i flags) (hud-sprite-flags))
+    (set! (-> this sprites i scale-x) 0.0)
+    (set! (-> this sprites i scale-y) 0.0)
+    )
+  0
+  (none)
+  )
+
+(defun blast-bot-update-hud ((this blast-bot-player))
+  ;; Call every frame: feeds the hud its numbers and (re)spawns the hud process when it is gone
+  ;; (e.g. after a level change took the old one with it).
+  (set! *blast-bot-hud-health* (/ (-> this health) (-> this max-health)))
+  (set! *blast-bot-hud-fuel* (-> this jump-fuel))
+  (set! *blast-bot-hud-fuel-show* (or (!= (-> this jump-mode) 0) (< (-> this jump-fuel) 0.999)))
+  (set! *blast-bot-hud-flash* (-> this hit-flash))
+  (when (not *blast-bot-hud-on*)
+    ;; fallback while the hud process is off: text meters in the top-left console
+    (let ((n (the int (+ 0.999 (* 20.0 (fmax 0.0 (fmin 1.0 *blast-bot-hud-health*)))))))
+      (format *stdcon* "HEALTH [")
       (dotimes (i 20)
         (if (< i n)
             (format *stdcon* "#")
@@ -1057,11 +1210,54 @@ Returns the fraction of the intended distance that was actually moved."
         )
       (format *stdcon* "]~%")
       )
+    (when *blast-bot-hud-fuel-show*
+      (let ((n (the int (* 20.0 (fmax 0.0 (fmin 1.0 *blast-bot-hud-fuel*))))))
+        (format *stdcon* "FUEL   [")
+        (dotimes (i 20)
+          (if (< i n)
+              (format *stdcon* "#")
+              (format *stdcon* "-")
+              )
+          )
+        (format *stdcon* "]~%")
+        )
+      )
+    )
+  (when (and *blast-bot-hud-on*
+             (not (handle->process (-> this hud-handle)))
+             (>= (current-time) (-> this hud-retry))
+             )
+    (set! (-> this hud-retry) (+ (current-time) (seconds 1)))
+    (set! (-> this hud-handle)
+          (ppointer->handle (process-spawn blast-bot-hud :init hud-init-by-other :name "blast-bot-hud" :to this))
+          )
     )
   (none)
   )
 
-(defun blast-bot-fire-shot ((this blast-bot-player))
+(defun blast-bot-fire-morphgun ((this blast-bot-player))
+  ;; Spawns Jak's red morphgun shot (gun-red-1, see gun-fire-red-1 in gun-red-shot.gc) straight from the bot's muzzle.
+  ;; Jak's gun is not involved (it cannot be initialised while he is in grab-ride). The shot attacks with Jak as the
+  ;; attacker (so arena kill counters count it) and ignores its parent process, which is the bot here.
+  (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
+                                     (-> this node-list data 6 bone transform)))
+         (start (matrix->trans muzzle-matrix (new 'stack-no-clear 'vector)))
+         (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> muzzle-matrix fvec) 1.0))
+         )
+    (vector+*! start start dir 8192.0)
+    ;; the muzzle burst gun-fire-red-1 launches (part 216); its rotate-y is set to the facing first
+    (let ((spec (get-field-spec-by-id (-> *part-id-table* 216) (sp-field-id spt-rotate-y))))
+      (if spec
+          (set! (-> spec initial-valuef) (quaternion-y-angle (-> this root quat)))
+          )
+      )
+    (launch-particles (-> *part-id-table* 216) start)
+    (process-spawn gun-red-shot start dir :name "gun-red-shot" :to this)
+    )
+  (none)
+  )
+
+(defun blast-bot-fire-guard-shot ((this blast-bot-player))
   (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
                                      (-> this node-list data 6 bone transform)))
          (start (matrix->trans muzzle-matrix (new 'stack-no-clear 'vector)))
@@ -1071,13 +1267,27 @@ Returns the fraction of the intended distance that was actually moved."
          (end (vector+! (new 'stack-no-clear 'vector) start direction)))
     (vector+*! start start (-> muzzle-matrix fvec) 8192.0)
     (vector+! end start direction)
-    (spawn-guard-projectile this start end 819200.0 (the-as vector #f))
+    (let ((shot (spawn-guard-projectile this start end 819200.0 (the-as vector #f))))
+      ;; spawn-guard-projectile leaves owner-handle empty, so the shot's damage is attributed to the shot itself.
+      ;; Mission kill counters only credit a target attacker, so make Jak the owner (ignore-handle stays the bot).
+      (when (and shot *target* *blast-bot-credit-shots*)
+        (set! (-> (the-as guard-shot (ppointer->process shot)) owner-handle) (process->handle *target*))
+        )
+      )
     )
   (none)
   )
 
+(defun blast-bot-fire-shot ((this blast-bot-player))
+  (if (and *blast-bot-use-morphgun* *target*)
+      (blast-bot-fire-morphgun this)
+      (blast-bot-fire-guard-shot this)
+      )
+  (none)
+  )
+
 (defun blast-bot-dash-attack ((this blast-bot-player))
-  "While charging: hurt every valid enemy in front of the bot (once per charge, the attack id is shared)."
+  ;; While charging: hurt every valid enemy in front of the bot (once per charge, the attack id is shared).
   (let ((fwd (new 'stack-no-clear 'vector))
         (center (new 'stack-no-clear 'vector))
         (hits (new 'stack-no-clear 'array 'collide-shape 64))
@@ -1094,7 +1304,8 @@ Returns the fraction of the intended distance that was actually moved."
                        (blast-bot-valid-target? this p)
                        (< (vector-vector-distance (-> p root trans) center) 28672.0))
               (send-event p 'attack #f
-                          (static-attack-info ((id (-> this dash-id)) (damage 6.0) (mode 'explode))))
+                          (blast-bot-credit-jak!
+                            (static-attack-info ((id (-> this dash-id)) (damage 6.0) (mode 'explode)))))
               )
             )
           )
@@ -1105,7 +1316,7 @@ Returns the fraction of the intended distance that was actually moved."
   )
 
 (defun blast-bot-touch ((this blast-bot-player))
-  "Generates 'touched events for the leg/body prims (same call bombbot.gc makes in enemy-common-post)."
+  ;; Generates 'touched events for the leg/body prims (same call bombbot.gc makes in enemy-common-post).
   (let ((params (new 'stack-no-clear 'overlaps-others-params)))
     (set! (-> params options) (overlaps-others-options))
     (set! (-> params collide-with-filter) (the-as collide-spec #xffffffff))
@@ -1238,7 +1449,7 @@ Returns the fraction of the intended distance that was actually moved."
   )
 
 (defun blast-bot-draw-laser ((this blast-bot-player))
-  "Laser pointer: from the muzzle along the barrel until it hits the level or an actor."
+  ;; Laser pointer: from the muzzle along the barrel until it hits the level or an actor.
   (when *blast-bot-laser-on*
     (let ((q (new 'stack-no-clear 'collide-query))
           (start (new 'stack-no-clear 'vector))
@@ -1302,7 +1513,7 @@ Returns the fraction of the intended distance that was actually moved."
 ;; The shield uses the stock shield-sphere process (shield-sphere.gc, already in GAME).
 
 (defun blast-bot-spawn-shield-real ((this blast-bot-player))
-  "Does the actual spawn. Only call when skel-shield-sphere is loaded."
+  ;; Does the actual spawn. Only call when skel-shield-sphere is loaded.
   (format 0 "Blast Bot: spawning shield~%")
   (let ((params (new 'stack-no-clear 'shield-sphere-spawn-params)))
     (set! (-> params owner) (process->handle this))
@@ -1350,8 +1561,8 @@ Returns the fraction of the intended distance that was actually moved."
   )
 
 (defun blast-bot-spawn-shield ((this blast-bot-player))
-  "Spawns the mech's own shield sphere (target-mech.gc) on the bot's body joint, switched off.
-Hold Circle to switch it on. Needs the skel-shield-sphere art to be loaded."
+  ;; Spawns the mech's own shield sphere (target-mech.gc) on the bot's body joint, switched off.
+  ;; Hold Circle to switch it on. Needs the skel-shield-sphere art to be loaded."
   (if (not (art-group-get-by-name *level* "skel-shield-sphere" (the-as (pointer level) #f)))
       (format 0 "Blast Bot: skel-shield-sphere art is not loaded, shield disabled~%")
       (blast-bot-spawn-shield-real this)
@@ -1414,8 +1625,8 @@ Hold Circle to switch it on. Needs the skel-shield-sphere art to be loaded."
   )
 
 (defun blast-bot-update-shield-break ((this blast-bot-player))
-  "Shield recharge: when the shield breaks completely (its process explodes / dies) it stays gone for
-*blast-bot-shield-recharge* seconds, then a fresh one is spawned. Normal regeneration is untouched."
+  ;; Shield recharge: when the shield breaks completely (its process explodes / dies) it stays gone for
+  ;; *blast-bot-shield-recharge* seconds, then a fresh one is spawned. Normal regeneration is untouched.
   (cond
     ((zero? (-> this shield-broken-until))
      (when (-> this shield-live)
@@ -1447,7 +1658,7 @@ Hold Circle to switch it on. Needs the skel-shield-sphere art to be loaded."
   )
 
 (defun blast-bot-draw-shield-status ((this blast-bot-player))
-  "Text meter while the shield is broken."
+  ;; Text meter while the shield is broken.
   (when (nonzero? (-> this shield-broken-until))
     (let* ((total (* *blast-bot-shield-recharge* (the float (seconds 1))))
            (left (the float (- (-> this shield-broken-until) (current-time))))
@@ -1467,10 +1678,10 @@ Hold Circle to switch it on. Needs the skel-shield-sphere art to be loaded."
   )
 
 (defun blast-bot-absorb-push ((this blast-bot-player))
-  "Platforms carry riders through the engine (detect-riders! / pull-riders! in collide-shape-rider.gc), which moves our
-root behind our back with move-by-vector!. Our feet, ground height and speed estimate live in world space, so shift
-them by the same amount or the legs drag and the ground probe lags. Anything that changed root trans since
-ext-pos (written at the end of our own movement) was done by someone else."
+  ;; Platforms carry riders through the engine (detect-riders! / pull-riders! in collide-shape-rider.gc), which moves our
+  ;; root behind our back with move-by-vector!. Our feet, ground height and speed estimate live in world space, so shift
+  ;; them by the same amount or the legs drag and the ground probe lags. Anything that changed root trans since
+  ;; ext-pos (written at the end of our own movement) was done by someone else.
   (let ((delta (new 'stack-no-clear 'vector)))
     (vector-! delta (-> this root trans) (-> this ext-pos))
     (when (and (< 1.0 (vector-length delta)) (< (vector-length delta) 81920.0))
@@ -1490,9 +1701,9 @@ ext-pos (written at the end of our own movement) was done by someone else."
   )
 
 (defun blast-bot-ride-update ((this blast-bot-player))
-  "Elevators / platforms learn that someone stands on them from a 'ridden event with a rider of type target
-(elevator.gc), so look for a platform under the feet and send it 'ridden ourselves with Jak as the rider.
-The actual carrying is done by the engine (the ride sphere + can-ride in the collision setup)."
+  ;; Elevators / platforms learn that someone stands on them from a 'ridden event with a rider of type target
+  ;; (elevator.gc), so look for a platform under the feet and send it 'ridden ourselves with Jak as the rider.
+  ;; The actual carrying is done by the engine (the ride sphere + can-ride in the collision setup).
   (set! *blast-bot-ride-seen* (the-as string #f))
   (when (and *target* (!= (-> this jump-mode) 2))
     (let ((q (new 'stack-no-clear 'collide-query)))
@@ -1541,9 +1752,9 @@ The actual carrying is done by the engine (the ride sphere + can-ride in the col
   )
 
 (defun blast-bot-regrab ((this blast-bot-player))
-  "Cutscenes (and elevators with the grab flag) send Jak a 'grab, which kicks him out of target-grab-ride, and when
-they end he is released into stance far away from the bot. While he is in a plain controllable state, bring him back
-into the bot. Grab / clone-anim states are left alone so the cutscene itself is not fought."
+  ;; Cutscenes (and elevators with the grab flag) send Jak a 'grab, which kicks him out of target-grab-ride, and when
+  ;; they end he is released into stance far away from the bot. While he is in a plain controllable state, bring him back
+  ;; into the bot. Grab / clone-anim states are left alone so the cutscene itself is not fought.
   (when (and *target* (>= (current-time) (-> this ride-retry)))
     (let ((st (if (-> *target* next-state) (-> *target* next-state name) #f)))
       (when (or (= st 'target-stance) (= st 'target-walk) (= st 'target-run) (= st 'target-falling))
@@ -1561,7 +1772,7 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
   )
 
 (defun blast-bot-add-leg-sphere ((root collide-shape) (id int) (joint int) (y float))
-  "One touch sphere on a leg bone (same layout as bombbot.gc: 4 spheres per bone, 8 per leg)."
+  ;; One touch sphere on a leg bone (same layout as bombbot.gc: 4 spheres per bone, 8 per leg).
   (let ((p (new 'process 'collide-shape-prim-sphere root (the-as uint id))))
     (set! (-> p prim-core collide-as) (collide-spec jak))
     (set! (-> p prim-core collide-with) (the-as collide-spec #xffffffff))
@@ -1573,6 +1784,106 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
     (set-vector! (-> p local-sphere) 0.0 y 0.0 2867.2)
     )
   0
+  )
+
+(defun blast-bot-attack-result ((this blast-bot-player) (proc process) (block event-message-block))
+  ;; Decides what an incoming 'attack does to the bot. Returns
+  ;;   0 = not for us (Jak's own hits / the bot's own shots), ignored
+  ;;   1 = absorbed (shield up, still invulnerable from the last hit, or god mode)
+  ;;   2 = hurt
+  ;;   3 = destroyed (the caller switches to the die state)
+  (let ((info (the-as attack-info (-> block param 1)))
+        (amount 1.0)
+        (id (the-as uint 0))
+        (friendly #f)
+        )
+    (when (and (-> block param 1) (logtest? (-> info mask) (attack-mask damage)))
+      (set! amount (-> info damage))
+      )
+    (when (and (-> block param 1) (logtest? (-> info mask) (attack-mask id)))
+      (set! id (-> info id))
+      )
+    (when (or (= proc this) (and *target* (= proc *target*)))
+      (set! friendly #t)
+      )
+    ;; hits credited to Jak (the bot's own attacks and splash)
+    (when (and (-> block param 1) *target* (logtest? (-> info mask) (attack-mask attacker))
+               (= (handle->process (-> info attacker)) *target*))
+      (set! friendly #t)
+      )
+    ;; the bot's own shots: ignore-handle is the bot (blast-bot-fire-shot), and the owner is Jak when credit-jak is on.
+    ;; Enemy guard shots have neither.
+    (let ((gs (as-type proc guard-shot)))
+      (when gs
+        (when (= (handle->process (-> gs ignore-handle)) this)
+          (set! friendly #t)
+          )
+        (when (and *target* (= (handle->process (-> gs owner-handle)) *target*))
+          (set! friendly #t)
+          )
+        )
+      )
+    (if *blast-bot-attack-debug*
+        (format 0 "Blast Bot: attack from ~A dmg ~f friendly ~A shield ~A~%"
+                (if proc (-> proc type) #f) amount friendly (-> this shield-on))
+        )
+    (cond
+      (friendly 0)
+      ((or *blast-bot-god-mode*
+           (and (-> this shield-on) (handle->process (-> this shield-handle)))
+           (< (current-time) (-> this hit-until))
+           (and (nonzero? id) (= id (-> this last-hit-id)))
+           )
+       1
+       )
+      (else
+        (set! (-> this last-hit-id) id)
+        (set! (-> this hit-until)
+              (+ (current-time) (the int (* *blast-bot-invuln-time* (the float (seconds 1)))))
+              )
+        (set! (-> this hit-flash) 1.0)
+        (set! (-> this health) (fmax 0.0 (- (-> this health) (* amount *blast-bot-damage-scale*))))
+        (activate! *camera-smush-control* 768.0 37 60 1.0 0.99 (-> this clock))
+        (cpad-set-buzz! (-> *cpad-list* cpads 0) 1 200 (seconds 0.2))
+        (format 0 "Blast Bot: hit for ~f, health ~f / ~f~%" amount (-> this health) (-> this max-health))
+        (if (<= (-> this health) 0.0)
+            3
+            2
+            )
+        )
+      )
+    )
+  )
+
+;; Jak is killed where he sits (still in grab-ride), no ejection: 'instant-death skips the death animation, and
+;; target-hit sends him to target-death (mission fail / checkpoint reload). NOTE: target-attacked / target-hit only
+;; do that when (-> *game-info* mode) is 'play; in 'debug mode the hit just drains his health.
+;; name of the state Jak is in (or about to enter), #f if unknown
+(defun blast-bot-jak-state ()
+  (if (and *target* (-> *target* next-state))
+      (-> *target* next-state name)
+      #f
+      )
+  )
+
+;; #t while Jak is alive and has NOT started dying
+(defun blast-bot-jak-alive? ()
+  (and *target*
+       (not (focus-test? *target* dead))
+       (let ((st (blast-bot-jak-state)))
+         (not (or (= st 'target-hit) (= st 'target-death)))
+         )
+       )
+  )
+
+(defun blast-bot-kill-jak ()
+  (when *target*
+    (logclear! (-> *target* focus-status) (focus-status hit))
+    (logclear! (-> *target* target-flags) (target-flags disable-attacks))
+    (send-event *target* 'attack-invinc #f
+                (static-attack-info ((id (new-attack-id)) (damage 1000.0) (mode 'instant-death))))
+    )
+  (none)
   )
 
 (defstate active (blast-bot-player)
@@ -1596,14 +1907,23 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
            (set! (-> self leg-id) (new-attack-id))
            )
          (send-event proc 'attack (-> block param 0)
-                     (static-attack-info :mask (penetrate-using)
-                                         ((id (-> self leg-id))
-                                          (damage 2.0)
-                                          (mode 'explode)
-                                          (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
-                                          )))
+                     (blast-bot-credit-jak!
+                       (static-attack-info :mask (penetrate-using)
+                                           ((id (-> self leg-id))
+                                            (damage 2.0)
+                                            (mode 'explode)
+                                            (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
+                                            ))))
          )
        #t
+       )
+      (('attack 'attack-invinc)
+       ;; enemy shots / explosions / touch attacks: health instead of a one-hit-nothing. Own hits are ignored.
+       ;; at 0 health the bot's own :trans switches to the die state (going there from inside this handler would
+       ;; run the enter code on the shooter's process instead of ours)
+       (let ((r (blast-bot-attack-result self proc block)))
+         (!= r 0)
+         )
        )
       (('get-pickup)
        ;; orbs/cells are collected by touching them; Jak is the one who actually owns the inventory
@@ -1637,6 +1957,9 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
       )
     )
   :trans (behavior ()
+    (when (<= (-> self health) 0.0)
+      (go-virtual die)
+      )
     (blast-bot-absorb-push self)
     (blast-bot-jump-update self)
     (let ((speed (-> *cpad-list* cpads 0 stick0-speed))
@@ -1644,6 +1967,7 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
           (dashing (< (current-time) (-> self dash-until)))
           )
       (set! (-> self input-active) #f)
+      (seek! (-> self hit-flash) 0.0 (* dt 3.0))
       (when (< 0.05 speed)
         (let ((move (new 'stack-no-clear 'vector)))
           (vector-copy! move (-> *math-camera* inv-camera-rot fvec))
@@ -1839,7 +2163,7 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
   :post (behavior ()
     (blast-bot-absorb-push self)
     (blast-bot-update-aim self)
-    (blast-bot-draw-fuel self)
+    (blast-bot-update-hud self)
     (blast-bot-draw-shield-status self)
     (if *blast-bot-legs-on*
         (blast-bot-update-legs self)
@@ -1853,6 +2177,112 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
     (blast-bot-draw-laser self)
     (vector-copy! (-> self ext-pos) (-> self root trans))
     (+! (-> self debug-frame-count) 1)
+    )
+  )
+
+;; One step of the "kill Jak" sequence, called every frame from the die state (no suspend in here, the bot process only
+;; has a tiny stack so the die :code has to stay small). target-grab-ride / target-grab never handle 'attack, so if
+;; the first hit is swallowed, Jak is released ('change-mode 'grab -> target-grab, 'end-mode 'grab -> target-stance)
+;; and hit again.
+(defun blast-bot-kill-step ((i int))
+  (case i
+    ((0)
+     (blast-bot-kill-jak)
+     )
+    ((2)
+     (when (blast-bot-jak-alive?)
+       (format 0 "Blast Bot: Jak ignored the hit (~A), releasing him~%" (blast-bot-jak-state))
+       (send-event *target* 'change-mode 'grab #t)
+       )
+     )
+    ((4)
+     (when (blast-bot-jak-alive?)
+       (format 0 "Blast Bot: after grab: ~A~%" (blast-bot-jak-state))
+       (send-event *target* 'end-mode 'grab)
+       )
+     )
+    ((6)
+     (when (blast-bot-jak-alive?)
+       (format 0 "Blast Bot: after end-mode: ~A~%" (blast-bot-jak-state))
+       (blast-bot-kill-jak)
+       )
+     )
+    )
+  (none)
+  )
+
+(defstate die (blast-bot-player)
+  :virtual #t
+  :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
+    #f
+    )
+  :enter (behavior ()
+    (format 0 "Blast Bot: destroyed~%")
+    (set! *blast-bot-hud-health* 0.0)
+    (format 0 "Blast Bot: die 1 - hud~%")
+    (when *blast-bot-hud-on*
+      (let ((hud (handle->process (-> self hud-handle))))
+        (if hud
+            (send-event hud 'hide-and-die)
+            )
+        )
+      )
+    (format 0 "Blast Bot: die 2 - shield~%")
+    (let ((sh (handle->process (-> self shield-handle))))
+      (if sh
+          (send-event sh 'shield-detach)
+          )
+      )
+    (set! (-> self shield-on) #f)
+    (format 0 "Blast Bot: die 3 - collision~%")
+    ;; nothing can hit the wreck, and it is not drawn any more (no :post in this state)
+    (let ((prim (-> self root root-prim)))
+      (set! (-> prim prim-core collide-as) (collide-spec))
+      (set! (-> prim prim-core collide-with) (collide-spec))
+      )
+    (logior! (-> self draw status) (draw-control-status no-draw))
+    (format 0 "Blast Bot: die 4 - camera / explosion~%")
+    (activate! *camera-smush-control* 1024.0 37 210 1.0 0.995 (-> self clock))
+    ;; big visual-only explosion (the group comes from the krimson guard / bombbot code; skipped when it is not loaded)
+    (when (and *blast-bot-death-explosion* group-kg-huge-explosion (nonzero? group-kg-huge-explosion))
+      (let ((gp (new 'stack-no-clear 'explosion-init-params)))
+        (vector-copy! (-> gp spawn-point) (-> self root trans))
+        (+! (-> gp spawn-point y) 12288.0)
+        (quaternion-identity! (-> gp spawn-quat))
+        (set! (-> gp radius) 61440.0)
+        (set! (-> gp scale) 1.0)
+        (set! (-> gp group) group-kg-huge-explosion)
+        (set! (-> gp collide-with) (collide-spec))
+        (set! (-> gp damage) 0.0)
+        (set! (-> gp damage-scale) 1.0)
+        (set! (-> gp vehicle-damage-factor) 1.0)
+        (set! (-> gp vehicle-impulse-factor) 1.0)
+        (set! (-> gp ignore-proc) (process->handle #f))
+        (explosion-spawn gp self)
+        )
+      )
+    )
+  :code (behavior ()
+    (let ((t0 (current-time)))
+      (format 0 "Blast Bot: die 5 - killing Jak in place~%")
+      (when *blast-bot-death-kills-jak*
+        (dotimes (i 8)
+          (blast-bot-kill-step i)
+          (suspend)
+          )
+        (format 0 "Blast Bot: Jak state ~A~%" (blast-bot-jak-state))
+        )
+      (format 0 "Blast Bot: die 7 - waiting for children~%")
+      ;; the explosion is our child process: wait for it (max 5 s) before the bot goes away
+      (until (or (not (-> self child)) (>= (current-time) (+ t0 (seconds 5))))
+        (suspend)
+        )
+      )
+    (when (and *camera* *target*)
+      (send-event *camera* 'change-target *target*)
+      )
+    (format 0 "Blast Bot: die 8 - gone~%")
+    (deactivate self)
     )
   )
 
@@ -1924,13 +2354,18 @@ into the bot. Grab / clone-anim states are left alone so the cutscene itself is 
   (blast-bot-init-legs self)
   (blast-bot-init-aim self)
   (blast-bot-spawn-shield self)
+  (set! (-> self max-health) *blast-bot-max-health*)
+  (set! (-> self health) (-> self max-health))
+  (set! (-> self hit-flash) 0.0)
+  (set! (-> self hud-handle) (the-as handle #f))
+  (set! *blast-bot-hud-health* 1.0)
   (format 0 "Blast Bot: transitioning to active~%")
   (go-virtual active)
   )
 
 (defun blast-bot-kill-others ((keep process))
-  "Removes every blast-bot-player except `keep`. Walks the entity pool: process-by-ename looks at ENTITY names and
-the bot has no entity, so it never finds it."
+  ;; Removes every blast-bot-player except `keep`. Walks the entity pool: process-by-ename looks at ENTITY names and
+  ;; the bot has no entity, so it never finds it.
   (let ((p (-> *entity-pool* child)))
     (while p
       (let ((next (-> p 0 brother))
@@ -1948,7 +2383,7 @@ the bot has no entity, so it never finds it."
   )
 
 (defun blast-bot-find ()
-  "The first blast-bot-player in the entity pool, or #f."
+  ;; The first blast-bot-player in the entity pool, or #f.
   (let ((p (-> *entity-pool* child))
         (found (the-as process #f))
         )
@@ -1963,7 +2398,7 @@ the bot has no entity, so it never finds it."
   )
 
 (defun spawn-my-bombbot ()
-  "Spawns a new bot, then removes every previous one. Jak is released from the old bot first so the new bot can take him over."
+  ;; Spawns a new bot, then removes every previous one. Jak is released from the old bot first so the new bot can take him over.
   (when *target*
     (format 0 "Blast Bot: spawn requested~%")
     (if (blast-bot-find)
@@ -1972,6 +2407,7 @@ the bot has no entity, so it never finds it."
     (let ((new (process-spawn blast-bot-player
                               :from *default-dead-pool*
                               :to *entity-pool*
+                              :stack-size #x4000
                               :name "blast-bot-player")))
       (if new
           (blast-bot-kill-others (ppointer->process new))
@@ -1982,7 +2418,7 @@ the bot has no entity, so it never finds it."
   )
 
 (defun blast-bot-pad-check ()
-  "L1 + R3: call every frame from your mod code (or call spawn-my-bombbot from your own binding)."
+  ;; L1 + R3: call every frame from your mod code (or call spawn-my-bombbot from your own binding).
   (when (and (cpad-hold? 0 l1) (cpad-pressed? 0 r3))
     (spawn-my-bombbot)
     )
@@ -1990,7 +2426,7 @@ the bot has no entity, so it never finds it."
   )
 
 (defun blast-bot-whats-near ()
-  "REPL helper: prints the type and process-mask of every actor within 15m of the bot."
+  ;; REPL helper: prints the type and process-mask of every actor within 15m of the bot.
   (let ((bot (the-as blast-bot-player (blast-bot-find))))
     (when bot
       (let ((box (new 'stack-no-clear 'vector))
