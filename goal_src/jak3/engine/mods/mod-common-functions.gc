@@ -217,7 +217,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; (2.0 damage = 16 points with the defaults, so about 7 normal hits). Hits are ignored for invuln-time seconds after
 ;; each one, and while the Circle shield is up. God mode: (set! *blast-bot-god-mode* #t)
 (define *blast-bot-max-health* 100.0)
-(define *blast-bot-damage-scale* 8.0)
+(define *blast-bot-damage-scale* 1.0)
 (define *blast-bot-invuln-time* 0.3)
 (define *blast-bot-god-mode* #f)
 ;; prints every attack event that reaches the bot and what was done with it
@@ -329,7 +329,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
        (not (focus-test? p inactive))
        (not (focus-test? p disable))
        (not (focus-test? p dead))
-       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+       (or (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+         (logtest? (process-mask vehicle) (-> p mask)))
        (not (logtest? (process-mask crate civilian) (-> p mask)))
        (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
        )
@@ -1097,16 +1098,22 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-hud-fuel-show* #f) ;; the fuel bar is only shown while jumping / recharging, like the old text meter
 (define *blast-bot-hud-flash* 0.0)    ;; 0..1, health bar flashes white after a hit
 ;; set to #f to run the bot without the hud process (health still works) if the hud ever crashes the game
-(define *blast-bot-hud-on* #f) ;; the hud process crashed the game on spawn (see blast-bot-update-hud); text meters are used while this is #f
+(define *blast-bot-hud-on* #t) ;; the hud process crashed the game on spawn (see blast-bot-update-hud); text meters are used while this is #f. DEBUG: turned on again with log lines ("Blast Bot HUD: ..."), set to #f if it still crashes
+(define *blast-bot-hud-drawn* #f) ;; debug: one-shot flag for the first-draw log line
+;; health bar look: #t = bombbot's own frame texture (tpage #x950) with a black cover that hides the emptied part, like
+;; bombbot-hud. Falls back to the plain coloured rectangles (green -> red) when the texture is not loaded. #f = always rectangles.
+(define *blast-bot-hud-frame-on* #f) ;; #f for now: in game the renderer shows a black/white checkerboard, the frame texture is not in the common FR3
+(define *blast-bot-hud-frame-ok* #f) ;; set by init-callback: #t when the frame texture was found
+
 ;; layout (hud pixels): health bar, bottom centre
 (define *blast-bot-hp-x* 176)
 (define *blast-bot-hp-y* 382)
 (define *blast-bot-hp-w* 160)
 (define *blast-bot-hp-h* 12)
-;; layout: fuel bar, right side, grows upwards from fuel-bottom
-(define *blast-bot-fuel-x* 468)
+;; layout: fuel bar, left side, grows upwards from fuel-bottom
+(define *blast-bot-fuel-x* 28)
 (define *blast-bot-fuel-bottom* 280)
-(define *blast-bot-fuel-w* 12)
+(define *blast-bot-fuel-w* 8)
 (define *blast-bot-fuel-h* 160)
 
 (deftype blast-bot-hud (hud)
@@ -1129,7 +1136,31 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   )
 
 (defmethod draw ((this blast-bot-hud))
+  (when (not *blast-bot-hud-drawn*)
+    (set! *blast-bot-hud-drawn* #t)
+    (format 0 "Blast Bot HUD: first draw~%")
+    )
   ;; sprites 0-2: health (border, background, fill)   sprites 3-5: fuel (border, background, fill)
+  (if *blast-bot-hud-frame-ok*
+      ;; bombbot-hud layout: sprite 0 = frame texture, sprite 1 = black cover growing from the right end of the bar
+      (let* ((hp (fmax 0.0 (fmin 1.0 *blast-bot-hud-health*)))
+             (bright (+ 128 (the int (* 127.0 *blast-bot-hud-flash*))))
+             )
+        (set-hud-piece-position! (-> this sprites 0) 256 (+ (the int (* 50.0 (-> this offset))) 376))
+        (set! (-> this sprites 0 pos z) #xfffff0)
+        (set! (-> this sprites 0 color x) bright)
+        (set! (-> this sprites 0 color y) bright)
+        (set! (-> this sprites 0 color z) bright)
+        (set-as-offset-from! (-> this sprites 1) (-> this sprites 0 pos) 62 -9)
+        (set! (-> this sprites 1 pos z) #xfffff0)
+        (set! (-> this sprites 1 color x) 0)
+        (set! (-> this sprites 1 color y) 0)
+        (set! (-> this sprites 1 color z) 0)
+        (set! (-> this sprites 1 scale-x) (* -30.5 (- 1.0 hp)))
+        (set! (-> this sprites 1 scale-y) 4.8)
+        (set! (-> this sprites 2 scale-x) 0.0)
+        (set! (-> this sprites 2 scale-y) 0.0)
+        )
   (let* ((hp (fmax 0.0 (fmin 1.0 *blast-bot-hud-health*)))
          (hpw (the float *blast-bot-hp-w*))
          (hph (the float *blast-bot-hp-h*))
@@ -1143,6 +1174,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     (blast-bot-hud-rect! (-> this sprites 2) *blast-bot-hp-x* *blast-bot-hp-y* (* hpw hp) hph
                          (min 255 (+ r flash)) (min 255 (+ g flash)) (min 255 flash))
     )
+  )
   (let* ((fuel (fmax 0.0 (fmin 1.0 *blast-bot-hud-fuel*)))
          (show (if *blast-bot-hud-fuel-show* 1.0 0.0))
          (fw (the float *blast-bot-fuel-w*))
@@ -1176,16 +1208,32 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 
 (defmethod init-callback ((this blast-bot-hud))
   ;; bombbot-hud sets this too; the hud code uses it, so it must not stay empty
+  (format 0 "Blast Bot HUD: init-callback begin~%")
   (set! (-> this level) (level-get-target-inside *level*))
+  (format 0 "Blast Bot HUD: init-callback level ~A~%" (-> this level))
   (set! (-> this gui-id)
         (add-process *gui-control* this (gui-channel hud-upper-center-2) (gui-action hidden) (-> this name) 81920.0 0)
         )
+  (format 0 "Blast Bot HUD: gui registered~%")
   (logior! (-> this flags) (hud-flags show))
   (dotimes (i 6)
     (set! (-> this sprites i tid) (the-as texture-id (get-texture common-white common)))
     (set! (-> this sprites i flags) (hud-sprite-flags))
     (set! (-> this sprites i scale-x) 0.0)
     (set! (-> this sprites i scale-y) 0.0)
+    )
+  (let ((frame (and *blast-bot-hud-frame-on*
+                    (lookup-texture-by-id-fast (new 'static 'texture-id :page #x950)))))
+    (set! *blast-bot-hud-frame-ok* (if frame #t #f))
+    (format 0 "Blast Bot HUD: bombbot frame texture ~A~%" frame)
+    (when frame
+      (set! (-> this sprites 0 tid) (the-as texture-id frame))
+      (set! (-> this sprites 0 flags) (hud-sprite-flags hsf3))
+      (set! (-> this sprites 0 scale-x) 1.2)
+      (set! (-> this sprites 0 scale-y) 1.2)
+      (set! (-> this sprites 1 scale-x) 0.0)
+      (set! (-> this sprites 1 scale-y) 5.0)
+      )
     )
   0
   (none)
@@ -1228,9 +1276,11 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
              (>= (current-time) (-> this hud-retry))
              )
     (set! (-> this hud-retry) (+ (current-time) (seconds 1)))
+    (format 0 "Blast Bot HUD: spawning~%")
     (set! (-> this hud-handle)
           (ppointer->handle (process-spawn blast-bot-hud :init hud-init-by-other :name "blast-bot-hud" :to this))
           )
+    (format 0 "Blast Bot HUD: spawn returned ~A~%" (handle->process (-> this hud-handle)))
     )
   (none)
   )
