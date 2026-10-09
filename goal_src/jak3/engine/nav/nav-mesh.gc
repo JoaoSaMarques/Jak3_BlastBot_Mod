@@ -801,8 +801,9 @@
       (set! (-> this poly-hash work) *grid-hash-work*)
       )
   (let ((s5-0 (new 'stack-no-clear 'nav-stack-type2)))
+    ;; mod: x4 nav-control slots per mesh (clamped to 255, count fields are uint8), sized for the largest squad multiplier
     (set! (-> s5-0 word00)
-          (res-lump-value arg0 'nav-max-users int :default (the-as uint128 64) :time -1000000000.0)
+          (min 255 (* 4 (the-as int (res-lump-value arg0 'nav-max-users int :default (the-as uint128 64) :time -1000000000.0))))
           )
     (set! (-> this user-list) (new 'loading-level 'engine 'nav-engine (-> s5-0 word00) connection))
     (set! (-> this nav-control-array)

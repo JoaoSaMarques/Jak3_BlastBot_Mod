@@ -7,6 +7,10 @@
 
 ;; DECOMP BEGINS
 
+;; mod: scale the metalhead squad (same idea as was-squad-control)
+(defconstant MH-MAX-UNITS 127)
+(defconstant MH-ENEMY-MULT 4)
+
 (define *default-mh-squad-member-settings*
   (new 'static 'inline-array kg-squad-member-settings 3
     (new 'static 'kg-squad-member-settings
@@ -126,7 +130,7 @@
           )
         (set! (-> this traffic object-type-info-array 0 target-counts (+ v1-0 (* (-> a3-2 grunt-settings object-type) 32)))
               (max
-                (min (-> a3-2 grunt-settings target-count) (-> a3-2 grunt-settings max-target-count))
+                (min (min MH-MAX-UNITS (* MH-ENEMY-MULT (-> a3-2 grunt-settings target-count))) (-> a3-2 grunt-settings max-target-count))
                 (-> a3-2 grunt-settings min-target-count)
                 )
               )

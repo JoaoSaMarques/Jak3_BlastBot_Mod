@@ -163,11 +163,12 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; #t = everything the bot kills counts as Jak's kill (mission kill counters). Side effect: enemies see Jak as their
 ;; attacker. #f = the bot is its own attacker, which is the old behaviour where enemies fought back at the bot.
 (define *blast-bot-credit-jak* #t)
-;; #t = the bot's guard-shot is also credited to Jak. Kept separate because crediting shots made the NPCs' own guard
-;; shots stop hitting the bot. Irrelevant once the morphgun is used (Jak's own shots always count).
+;; #t = the bot's guard-shot is also credited to Jak. Kept separate because crediting shots made the NPCs' own guard shots stop firing.
+;; not crediting morphgun for kills in arena
+;; when this is #t and blast-bot-use-morphgun is #f, npcs stop firing. If both are #t, npcs are able to fire again but morphgun still doesn't give credit
 (define *blast-bot-credit-shots* #f)
 ;; #t = the turret fires Jak's red morphgun shot (gun-red-1) instead of the guard shot. #f = old guard shot.
-(define *blast-bot-use-morphgun* #f)
+(define *blast-bot-use-morphgun* #t)
 
 (defun blast-bot-credit-jak! ((info attack-info))
   ;; Name Jak as the attacker. Mission kill counters (e.g. the marauder arena fights) only count a kill when the
@@ -1287,8 +1288,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 
 (defun blast-bot-fire-morphgun ((this blast-bot-player))
   ;; Spawns Jak's red morphgun shot (gun-red-1, see gun-fire-red-1 in gun-red-shot.gc) straight from the bot's muzzle.
-  ;; Jak's gun is not involved (it cannot be initialised while he is in grab-ride). The shot attacks with Jak as the
-  ;; attacker (so arena kill counters count it) and ignores its parent process, which is the bot here.
+  ;; Jak's gun is not involved (it cannot be initialised while he is in grab-ride). The shot ignores its parent
+  ;; process (the bot). Who it names as attacker is decided by blast-bot-morphgun-attacker below.
   (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
                                      (-> this node-list data 6 bone transform)))
          (start (matrix->trans muzzle-matrix (new 'stack-no-clear 'vector)))
@@ -1303,6 +1304,81 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       )
     (launch-particles (-> *part-id-table* 216) start)
     (process-spawn gun-red-shot start dir :name "gun-red-shot" :to this)
+    )
+  (none)
+  )
+
+;; ---- Morphgun shots fired by the bot ----
+;; gun-red-shot hardcodes Jak as the attacker. Peaceful wasteland citizens turn on whoever hit them, so they went
+;; after Jak (parked in grab-ride, not a usable target) and never fired at the bot. For shots the bot fired, name
+;; the bot as the attacker instead. Set *blast-bot-morphgun-credit-jak* to #t to get Jak back (kill counters count,
+;; NPCs stop shooting). This replaces the method for every gun-red-shot; shots from Jak's real gun are unchanged.
+(define *blast-bot-morphgun-credit-jak* #f)
+
+(defun blast-bot-morphgun-attacker ((shot gun-red-shot))
+  (let ((bot (as-type (ppointer->process (-> shot parent)) blast-bot-player)))
+    (if (and bot (not *blast-bot-morphgun-credit-jak*))
+        (process->handle bot)
+        (process->handle *target*)
+        )
+    )
+  )
+
+(defmethod send-attack! ((this gun-red-shot) (arg0 process-drawable) (arg1 touching-shapes-entry))
+  (let ((v1-0 (as-type arg0 process-drawable)))
+    (when v1-0
+      (let* ((s5-2 (vector-! (new 'stack-no-clear 'vector) (-> v1-0 root trans) (-> this start-pos)))
+             (f30-0 (* (if (< (vector-length s5-2) 24576.0)
+                           3.0
+                           2.0
+                           )
+                       (if (logtest? (game-feature feature22) (-> *game-info* features))
+                           2.0
+                           1.0
+                           )
+                       )
+                    )
+             )
+        (if (and (logtest? (process-mask guard) (-> arg0 mask))
+                 (not (-> *setting-control* user-current gun-target-guards?))
+                 )
+            (set! f30-0 0.0)
+            )
+        (let ((s2-0 (new 'stack-no-clear 'vector)))
+          (rot-zxy-from-vector! s2-0 s5-2)
+          (let ((f28-0 (deg- (-> s2-0 x) (-> this start-rot x)))
+                (f0-6 (deg- (-> s2-0 y) (-> this start-rot y)))
+                )
+            (when (or (< 2730.6667 (fabs f28-0)) (< 8192.0 (fabs f0-6)))
+              (let ((f1-5 (fmax -2730.6667 (fmin 2730.6667 f28-0)))
+                    (f0-8 (fmax -8192.0 (fmin 8192.0 f0-6)))
+                    )
+                (set! (-> s2-0 x) (+ (-> this start-rot x) f1-5))
+                (set! (-> s2-0 y) (+ (-> this start-rot y) f0-8))
+                )
+              (set-vector! s5-2 0.0 0.0 1.0 1.0)
+              (vector-rotate-around-x! s5-2 s5-2 (-> s2-0 x))
+              (vector-rotate-around-y! s5-2 s5-2 (-> s2-0 y))
+              )
+            )
+          )
+        (+! (-> *game-info* shots-hit 1) 1.0)
+        (send-event
+          arg0
+          'attack
+          arg1
+          (static-attack-info :mask (vehicle-impulse-factor) ((id (-> this attack-id))
+                                                              (damage f30-0)
+                                                              (vehicle-damage-factor 1.0)
+                                                              (vehicle-impulse-factor 1.0)
+                                                              (mode 'eco-red)
+                                                              (attacker-velocity s5-2)
+                                                              (attacker (blast-bot-morphgun-attacker this))
+                                                              )
+                              )
+          )
+        )
+      )
     )
   (none)
   )
@@ -1328,9 +1404,100 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   (none)
   )
 
+;; ---- Morphgun type switching (D-pad) ----
+;; 0 = red (gun-red-1), 1 = yellow (gun-yellow-1), 2 = blue (gun-blue-1). Dark is not supported: gun-dark-shot's
+;; startup state dissipates the shot unless Jak is in gun mode, and it reads node 13 of its parent.
+;; D-pad: up = red, right = yellow, down = blue. Edit blast-bot-gun-select below to remap.
+(define *blast-bot-gun-mode* 0)
+
+(defun blast-bot-gun-select ()
+  (let ((old *blast-bot-gun-mode*))
+    (cond
+      ((cpad-pressed? 0 up) (set! *blast-bot-gun-mode* 0))
+      ((cpad-pressed? 0 right) (set! *blast-bot-gun-mode* 1))
+      ((cpad-pressed? 0 down) (set! *blast-bot-gun-mode* 2))
+      )
+    (if (!= old *blast-bot-gun-mode*)
+        (format 0 "Blast Bot: gun ~A~%" (case *blast-bot-gun-mode* ((0) 'red) ((1) 'yellow) (else 'blue)))
+        )
+    )
+  (none)
+  )
+
+;; Fills the projectile params the way gun-fire-yellow-1 / gun-fire-blue-1 do, but for the bot: the bot is the
+;; ignored process and (like the red shot) the named attacker, so citizens turn on the bot, not Jak.
+(defun blast-bot-projectile-params ((this blast-bot-player) (start vector))
+  (let ((params (new 'stack-no-clear 'projectile-init-by-other-params)))
+    (set! (-> params ent) (-> this entity))
+    (set! (-> params charge) 1.0)
+    (set! (-> params options) (projectile-options po17))
+    (logclear! (-> params options) (projectile-options po14 po15 po16))
+    (vector-copy! (-> params pos) start)
+    (set! (-> params notify-handle) (the-as handle #f))
+    (set! (-> params owner-handle)
+          (if (and *target* *blast-bot-morphgun-credit-jak*)
+              (process->handle *target*)
+              (process->handle this)
+              )
+          )
+    (set! (-> params target-handle) (the-as handle #f))
+    (set! (-> params target-pos quad) (the-as uint128 0))
+    (set! (-> params ignore-handle) (process->handle this))
+    (let* ((v1 *game-info*)
+           (id (+ (-> v1 attack-id) 1))
+           )
+      (set! (-> v1 attack-id) id)
+      (set! (-> params attack-id) id)
+      )
+    (set! (-> params timeout) (seconds 4))
+    params
+    )
+  )
+
+(defun blast-bot-fire-yellow ((this blast-bot-player))
+  (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
+                                     (-> this node-list data 6 bone transform)))
+         (start (matrix->trans muzzle-matrix (new 'stack-no-clear 'vector)))
+         (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> muzzle-matrix fvec) 1.0))
+         )
+    (vector+*! start start dir 8192.0)
+    (let ((params (blast-bot-projectile-params this start)))
+      (vector-float*! (-> params vel) dir 819200.0)
+      (spawn-projectile gun-yellow-shot params this *default-dead-pool*)
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-fire-blue ((this blast-bot-player))
+  (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
+                                     (-> this node-list data 6 bone transform)))
+         (start (matrix->trans muzzle-matrix (new 'stack-no-clear 'vector)))
+         (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> muzzle-matrix fvec) 1.0))
+         (spread (new 'stack-no-clear 'vector))
+         )
+    (vector+*! start start dir 8192.0)
+    ;; the same random cone gun-fire-blue-1 uses
+    (let ((q (new 'stack-no-clear 'quaternion)))
+      (quaternion-vector-angle! q dir (* 182.04445 (rand-vu-float-range 0.0 360.0)))
+      (vector-rotate-y! spread dir (* 182.04445 (rand-vu-float-range 0.0 1.1)))
+      (vector-orient-by-quat! spread spread q)
+      )
+    (let ((params (blast-bot-projectile-params this start)))
+      (vector-copy! (-> params vel) spread)
+      (spawn-projectile gun-blue-shot params this *default-dead-pool*)
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-shot ((this blast-bot-player))
   (if (and *blast-bot-use-morphgun* *target*)
-      (blast-bot-fire-morphgun this)
+      (case *blast-bot-gun-mode*
+        ((1) (blast-bot-fire-yellow this))
+        ((2) (blast-bot-fire-blue this))
+        (else (blast-bot-fire-morphgun this))
+        )
       (blast-bot-fire-guard-shot this)
       )
   (none)
@@ -1863,6 +2030,23 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       )
     ;; the bot's own shots: ignore-handle is the bot (blast-bot-fire-shot), and the owner is Jak when credit-jak is on.
     ;; Enemy guard shots have neither.
+    ;; morphgun shots the bot fired (gun-red-shot parented to the bot, or naming the bot as attacker, see
+    ;; blast-bot-morphgun-attacker): their direct hit / splash must not hurt the bot
+    (when (and (-> block param 1) (logtest? (-> info mask) (attack-mask attacker))
+               (= (handle->process (-> info attacker)) this))
+      (set! friendly #t)
+      )
+    (let ((rs (as-type proc gun-red-shot)))
+      (when (and rs (= (ppointer->process (-> rs parent)) this))
+        (set! friendly #t)
+        )
+      )
+    (let ((pj (as-type proc projectile)))
+      (when (and pj (or (= (handle->process (-> pj ignore-handle)) this)
+                        (= (handle->process (-> pj owner-handle)) this)))
+        (set! friendly #t)
+        )
+      )
     (let ((gs (as-type proc guard-shot)))
       (when gs
         (when (= (handle->process (-> gs ignore-handle)) this)
@@ -2131,6 +2315,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
             )
           )
         )
+      ;; D-pad: morphgun type
+      (blast-bot-gun-select)
       ;; R2 (held): hover. Legs sweep back and the body floats up.
       ;; R2 (press): toggle hover on/off. Only switchable from the ground or while airborne.
       (when (and (cpad-pressed? 0 r2) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2)))
