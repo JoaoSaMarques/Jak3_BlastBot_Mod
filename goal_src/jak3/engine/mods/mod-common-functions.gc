@@ -2346,7 +2346,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (blast-bot-regrab self)
       ;; keep Jak (parked in grab-ride) from blocking doors / level borders
       (when (and *target* *blast-bot-clear-grabbed*)
-        (logclear! (-> *target* focus-status) (focus-status grabbed))
+        (logclear! (-> *target* focus-status) (focus-status grabbed ignore))
         )
       ;; the head swings to the stick direction and stays there; the body then turns to follow the HEAD
       (when (-> self input-active)
