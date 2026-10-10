@@ -135,6 +135,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
    (hit-flash        float)            ;; 1.0 right after a hit, fades out; makes the health bar flash
    (hud-handle       handle)           ;; the blast-bot-hud process (health bar + fuel bar)
    (hud-retry        time-frame)       ;; next time we may try to (re)spawn the hud
+   (aggro-shape      collide-shape-moving) ;; second collider in the player list so enemies find the bot
    )
   (:state-methods
     active
@@ -168,7 +169,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; when this is #t and blast-bot-use-morphgun is #f, npcs stop firing. If both are #t, npcs are able to fire again but morphgun still doesn't give credit
 (define *blast-bot-credit-shots* #f)
 ;; #t = the turret fires Jak's red morphgun shot (gun-red-1) instead of the guard shot. #f = old guard shot.
-(define *blast-bot-use-morphgun* #t)
+(define *blast-bot-use-morphgun* #f)
 
 (defun blast-bot-credit-jak! ((info attack-info))
   ;; Name Jak as the attacker. Mission kill counters (e.g. the marauder arena fights) only count a kill when the
@@ -592,6 +593,9 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
         (&+! (-> this joint-ik v1-0) offset)
         )
     )
+  (if (nonzero? (-> this aggro-shape))
+      (&+! (-> this aggro-shape) offset)
+      )
   (call-parent-method this offset)
   )
 
@@ -2398,6 +2402,12 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     )
   :post (behavior ()
     (blast-bot-absorb-push self)
+    (let ((a (-> self aggro-shape)))
+      (when (nonzero? a)
+        (vector-copy! (-> a trans) (-> self root trans))
+        (update-transforms a)
+        )
+      )
     (blast-bot-update-aim self)
     (blast-bot-update-hud self)
     (blast-bot-draw-shield-status self)
@@ -2476,6 +2486,11 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (set! (-> prim prim-core collide-as) (collide-spec))
       (set! (-> prim prim-core collide-with) (collide-spec))
       )
+    (let ((a (-> self aggro-shape)))
+      (if (nonzero? a)
+          (set! (-> a root-prim prim-core collide-as) (collide-spec))
+          )
+      )
     (logior! (-> self draw status) (draw-control-status no-draw))
     (format 0 "Blast Bot: die 4 - camera / explosion~%")
     (activate! *camera-smush-control* 1024.0 37 210 1.0 0.995 (-> self clock))
@@ -2521,7 +2536,6 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     (deactivate self)
     )
   )
-
 (defbehavior blast-bot-player-init-by-other blast-bot-player ()
   (format 0 "Blast Bot: init begin~%")
   (let ((root (new 'process 'collide-shape self (collide-list-enum player))))
@@ -2580,11 +2594,34 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     (set! (-> self root) root)
     )
   (format 0 "Blast Bot: collision root ready~%")
+  ;; second collider: registered in *collide-player-list* so enemies find the bot. Not the root, no can-ride, collides
+  ;; with nothing; its process is the bot, so enemy shots / attacks go straight to the bot's own handlers.
+  (let ((aggro (new 'process 'collide-shape-moving self (collide-list-enum hit-by-others))))
+    (let ((prim (new 'process 'collide-shape-prim-sphere aggro (the-as uint 0))))
+      (set! (-> prim prim-core collide-as) (collide-spec jak))
+      (set! (-> prim prim-core collide-with) (collide-spec))
+      (set! (-> prim prim-core action) (collide-action solid dont-push-away))
+      (set-vector! (-> prim local-sphere) 0.0 12288.0 0.0 24576.0)
+      (set! (-> aggro root-prim) prim)
+      )
+    (set! (-> aggro total-prims) (the-as uint 1))
+    ;; this shape is never the root, so nothing else sets up its dynamics: without them any engine code that moves it
+    ;; (integrate-and-collide!) reads a null pointer
+    (set! (-> aggro dynam) (copy *standard-dynamics* 'process))
+    (set! (-> aggro nav-radius) 16384.0)
+    (set! (-> aggro penetrated-by) (the-as penetrate -1))
+    (set! (-> aggro backup-collide-as) (-> aggro root-prim prim-core collide-as))
+    (set! (-> aggro backup-collide-with) (-> aggro root-prim prim-core collide-with))
+    (set! (-> self aggro-shape) aggro)
+    )
+  (format 0 "Blast Bot: aggro shape ready~%")
   (when *target*
     (vector-copy! (-> self root trans) (target-pos 0))
     (quaternion-copy! (-> self root quat) (-> *target* root quat))
     )
   (vector-identity! (-> self root scale))
+  (vector-copy! (-> self aggro-shape trans) (-> self root trans))
+  (update-transforms (-> self aggro-shape))
   (initialize-skeleton self skel-blast-bot (the-as pair 0))
   (format 0 "Blast Bot: skeleton ready~%")
   (blast-bot-init-legs self)
