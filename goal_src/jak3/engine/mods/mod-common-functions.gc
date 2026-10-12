@@ -2041,15 +2041,49 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   (none)
   )
 
+(define *blast-bot-last-jak-state* #f)
+;; Jak stuck in target-grab (cutscene never sent 'end-mode): after this long with no cutscene stream playing,
+;; the bot ends the grab itself so the regrab below can put him back. (set! *blast-bot-grab-timeout* 0) to disable.
+(define *blast-bot-grab-since* 0)
+(define *blast-bot-grab-timeout* (seconds 2.0))
+
+(defun blast-bot-jak-busy? ((st object))
+  ;; states we must NOT fight: cutscene grabs, death/respawn, and the bot's own ride state
+  (or (= st 'target-grab-ride) (= st 'target-grab) (= st 'target-clone-anim)
+      (= st 'target-hit) (= st 'target-death) (= st 'target-continue))
+  )
+
 (defun blast-bot-regrab ((this blast-bot-player))
   ;; Cutscenes (and elevators with the grab flag) send Jak a 'grab, which kicks him out of target-grab-ride, and when
-  ;; they end he is released into stance far away from the bot. While he is in a plain controllable state, bring him back
-  ;; into the bot. Grab / clone-anim states are left alone so the cutscene itself is not fought.
-  (when (and *target* (>= (current-time) (-> this ride-retry)))
+  ;; they end he is released far away from the bot. Any state that is not in blast-bot-jak-busy? gets him put back
+  ;; into the bot (blacklist instead of a list of allowed states, so unexpected post-cutscene states work too).
+  (when *target*
     (let ((st (if (-> *target* next-state) (-> *target* next-state name) #f)))
-      (when (or (= st 'target-stance) (= st 'target-walk) (= st 'target-run) (= st 'target-falling))
+      ;; log every change so we can see which state Jak lands in after a cutscene
+      (when (!= st *blast-bot-last-jak-state*)
+        (format 0 "Blast Bot: Jak state ~A -> ~A~%" *blast-bot-last-jak-state* st)
+        (set! *blast-bot-last-jak-state* st)
+        )
+      ;; stuck in target-grab with no cutscene stream playing -> end the grab ourselves after the timeout
+      (if (and (= st 'target-grab) (not (-> *art-control* active-stream)))
+          (when (zero? *blast-bot-grab-since*)
+            (set! *blast-bot-grab-since* (current-time))
+            )
+          (set! *blast-bot-grab-since* 0)
+          )
+      (when (and (nonzero? *blast-bot-grab-timeout*)
+                 (nonzero? *blast-bot-grab-since*)
+                 (> (- (current-time) *blast-bot-grab-since*) *blast-bot-grab-timeout*))
+        (format 0 "Blast Bot: Jak stuck in target-grab, ending the grab~%")
+        (set! *blast-bot-grab-since* 0)
+        (send-event *target* 'end-mode 'grab)
+        )
+      (when (and st
+                 (>= (current-time) (-> this ride-retry))
+                 (not (blast-bot-jak-busy? st))
+                 (not (-> *art-control* active-stream))) ;; no cutscene stream playing
         (format 0 "Blast Bot: Jak left the bot (~A), putting him back~%" st)
-        (set! (-> this ride-retry) (+ (current-time) (seconds 1)))
+        (set! (-> this ride-retry) (+ (current-time) (seconds 0.25)))
         (move-to-point! (-> *target* control) (-> this root trans))
         (send-event *target* 'change-mode 'grab-ride #t)
         (if *camera*
@@ -2455,7 +2489,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (blast-bot-ride-update self)
       (blast-bot-regrab self)
       ;; keep Jak (parked in grab-ride) from blocking doors / level borders
-      (when (and *target* *blast-bot-clear-grabbed*)
+      (when (and *target* *blast-bot-clear-grabbed* (= (blast-bot-jak-state) 'target-grab-ride))
         (logclear! (-> *target* focus-status) (focus-status grabbed ignore))
         )
       ;; the head swings to the stick direction and stays there; the body then turns to follow the HEAD
