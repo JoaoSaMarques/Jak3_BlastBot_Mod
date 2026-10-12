@@ -41,6 +41,12 @@
         (spawn-my-bombbot)
         )
 
+      ;; L1 + Triangle: remove the bot and put Jak back to normal (blast-bot-despawn-update finishes it over a few frames)
+      (when (and *target* (cpad-hold? 0 l1) (cpad-pressed? 0 triangle))
+        (despawn-my-bombbot)
+        )
+      (blast-bot-despawn-update)
+
       (when *debug-segment*
         (orb-placer-maintenance)
         )

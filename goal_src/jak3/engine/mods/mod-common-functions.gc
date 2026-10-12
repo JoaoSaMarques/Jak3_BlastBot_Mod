@@ -2042,6 +2042,9 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   )
 
 (define *blast-bot-last-jak-state* #f)
+;; despawn (L1 + Triangle): 0 = idle, 1..3 = releasing Jak / removing the bot. The regrab below stays off while > 0.
+(define *blast-bot-despawn-step* 0)
+(define *blast-bot-despawn-time* 0)
 ;; Jak stuck in target-grab (cutscene never sent 'end-mode): after this long with no cutscene stream playing,
 ;; the bot ends the grab itself so the regrab below can put him back. (set! *blast-bot-grab-timeout* 0) to disable.
 (define *blast-bot-grab-since* 0)
@@ -2081,6 +2084,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (when (and st
                  (>= (current-time) (-> this ride-retry))
                  (not (blast-bot-jak-busy? st))
+                 (zero? *blast-bot-despawn-step*)           ;; not while the bot is being removed
                  (not (-> *art-control* active-stream))) ;; no cutscene stream playing
         (format 0 "Blast Bot: Jak left the bot (~A), putting him back~%" st)
         (set! (-> this ride-retry) (+ (current-time) (seconds 0.25)))
@@ -2093,6 +2097,34 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       )
     )
   (none)
+  )
+
+(defun blast-bot-deadly-touch? ((ent touching-shapes-entry) (proc process))
+  ;; Same question as touching-shapes-entry::prims-touching-action? (is one of proc's touching prims deadly?), but it
+  ;; takes proc's shape straight from the touch entry instead of assuming it is proc's root. The engine method prints
+  ;; "Bogus cshape value!" and returns #f whenever the shape it is given is not one of the entry's two shapes (enemies
+  ;; with an extra attack shape, etc.); this stays quiet and just checks whichever shape belongs to proc.
+  (let ((c1 (-> ent cshape1))
+        (c2 (-> ent cshape2))
+        )
+    (cond
+      ((and c1 (= (the-as process (-> c1 process)) proc))
+       (if ((method-of-type touching-shapes-entry prims-touching-action?) ent c1 (collide-action deadly) (collide-action))
+           #t
+           #f
+           )
+       )
+      ((and c2 (= (the-as process (-> c2 process)) proc))
+       (if ((method-of-type touching-shapes-entry prims-touching-action?) ent c2 (collide-action deadly) (collide-action))
+           #t
+           #f
+           )
+       )
+      (else
+        #f
+        )
+      )
+    )
   )
 
 (defun blast-bot-add-leg-sphere ((root collide-shape) (id int) (joint int) (y float))
@@ -2279,12 +2311,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
                   )
               (when (and (let ((en (as-type proc enemy)))
                           (and en (logtest? (-> en focus-status) (focus-status dangerous))))
-                        ((method-of-type touching-shapes-entry prims-touching-action?)
-                          (the-as touching-shapes-entry (-> block param 0))
-                          (the-as collide-shape (-> pd root))
-                          (collide-action deadly)
-                          (collide-action)
-                          ))
+                        (blast-bot-deadly-touch? (the-as touching-shapes-entry (-> block param 0)) proc))
                (let* ((b (new 'stack-no-clear 'event-message-block))
                       (e (as-type proc enemy))
                       (swing-id (if e (-> e attack-id) (the-as uint 0)))
@@ -2871,6 +2898,78 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (if new
           (blast-bot-kill-others (ppointer->process new))
           )
+      )
+    )
+  (none)
+  )
+
+(defun despawn-my-bombbot ()
+  ;; L1 + Triangle: puts Jak back to normal and removes the bot. The release takes a few frames (grab, then end-grab,
+  ;; same two events the die state uses), so this only starts it; blast-bot-despawn-update (call it every frame)
+  ;; finishes the job and then deactivates the bot.
+  (when (and *target* (zero? *blast-bot-despawn-step*))
+    (let ((bot (the-as blast-bot-player (blast-bot-find))))
+      (when bot
+        (format 0 "Blast Bot: despawn requested (Jak ~A)~%" (blast-bot-jak-state))
+        (set! *blast-bot-despawn-time* (current-time))
+        ;; drop the shield first, like the die state does
+        (let ((sh (handle->process (-> bot shield-handle))))
+          (if sh
+              (send-event sh 'shield-detach)
+              )
+          )
+        (set! (-> bot shield-on) #f)
+        (cond
+          ((= (blast-bot-jak-state) 'target-grab-ride)
+           (send-event *target* 'change-mode 'grab #t)
+           (set! *blast-bot-despawn-step* 1)
+           )
+          (else
+            ;; Jak is not riding (cutscene / already free): nothing to release, just remove the bot
+            (set! *blast-bot-despawn-step* 3)
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-despawn-update ()
+  ;; Call every frame. Steps: 1 = Jak was sent into target-grab, 2 = end-grab sent (wait for him to leave target-grab),
+  ;; 3 = remove the bot and give the camera back to Jak.
+  (when (nonzero? *blast-bot-despawn-step*)
+    (let ((bot (blast-bot-find)))
+      (cond
+        ((not bot)
+         (set! *blast-bot-despawn-step* 0)
+         )
+        ((= *blast-bot-despawn-step* 1)
+         (when (>= (current-time) (+ *blast-bot-despawn-time* (seconds 0.1)))
+           (if *target*
+               (send-event *target* 'end-mode 'grab)
+               )
+           (set! *blast-bot-despawn-time* (current-time))
+           (set! *blast-bot-despawn-step* 2)
+           )
+         )
+        ((= *blast-bot-despawn-step* 2)
+         (when (or (not *target*)
+                   (!= (blast-bot-jak-state) 'target-grab)
+                   (>= (current-time) (+ *blast-bot-despawn-time* (seconds 1.0)))
+                   )
+           (set! *blast-bot-despawn-step* 3)
+           )
+         )
+        (else
+          (format 0 "Blast Bot: despawning (Jak ~A)~%" (blast-bot-jak-state))
+          (deactivate bot)
+          (when (and *camera* *target*)
+            (send-event *camera* 'change-target *target*)
+            )
+          (set! *blast-bot-despawn-step* 0)
+          )
+        )
       )
     )
   (none)
