@@ -8,7 +8,7 @@
 ;; DECOMP BEGINS
 
 ;; mod: scale the metalhead squad (same idea as was-squad-control)
-(defconstant MH-MAX-UNITS 127)
+(defconstant MH-MAX-UNITS 50)
 (defconstant MH-ENEMY-MULT 4)
 
 (define *default-mh-squad-member-settings*

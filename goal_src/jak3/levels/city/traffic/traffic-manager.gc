@@ -1232,6 +1232,14 @@
     )
   )
 
+;; Pool size cap PER TRAFFIC TYPE. spawn-all keeps creating enemies until active+inactive reaches this, and parked (suspended) ones
+;; still hold a nav-mesh slot. A mesh only has 255 slots, so the budget is the SUM over the types, not each value:
+;;   guard-a x1 + (roboguard, spydroid, flying-turret) x3 + (metalhead-grunt, -flitter, -predator) x3
+;; 50 + 3*20 + 3*25 = 185, which leaves ~70 slots for citizens and everything else on the mesh.
+(defconstant TM-POOL-GUARD 50)
+(defconstant TM-POOL-ROBOT 20)
+(defconstant TM-POOL-MH 10)
+
 ;; WARN: Function (method 22 traffic-manager) has a return type of none, but the expression builder found a return statement.
 (defmethod traffic-manager-method-22 ((this traffic-manager))
   (if (not *cty-faction-manager*)
@@ -1258,18 +1266,18 @@
                         (want-t (-> a0-9 bindings a1-7 obj-type))
                         )
                     (cond
-                      ((= want-t (traffic-type guard-a)) (min 127 (* 2 want-n)))
+                      ((= want-t (traffic-type guard-a)) (min TM-POOL-GUARD (* 2 want-n)))
                       ((or (= want-t (traffic-type roboguard))
                            (= want-t (traffic-type spydroid))
                            (= want-t (traffic-type flying-turret))
                            )
-                       (min 127 (* 3 want-n))
+                       (min TM-POOL-ROBOT (* 3 want-n))
                        )
                       ((or (= want-t (traffic-type metalhead-grunt))
                            (= want-t (traffic-type metalhead-flitter))
                            (= want-t (traffic-type metalhead-predator))
                            )
-                       (min 127 (* 4 want-n))
+                       (min TM-POOL-MH (* 4 want-n))
                        )
                       (else want-n)
                       )

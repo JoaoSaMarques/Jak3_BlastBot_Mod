@@ -227,13 +227,13 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
 ;; #f = he just walks away from the wreck
 (define *blast-bot-death-kills-jak* #t)
-;; the big explosion when the bot is destroyed. Off by default: the game crashed in the death sequence and this is the
-;; most likely culprit (it needs group-kg-huge-explosion to be loaded). Turn it on once death works without it.
 (define *blast-bot-death-explosion* #t)
 
 ;; elbow joint index + hand distance for each limb, from *bombbot-ik-limb-setup*
 (define *blast-bot-elbows* (new 'static 'boxed-array :type int32 19 13 15 17))
 (define *blast-bot-hand-dist* (new 'static 'boxed-array :type float 14880.768 -14880.768 14880.768 -14880.768))
+
+(define *blast-bot-hatred* 5.0)
 
 (defun blast-bot-foot-phase ((i int))
   ;; Where in the 0.8s gait cycle foot i steps. Feet 0/2 and 3/1 are diagonal pairs,
@@ -2135,8 +2135,12 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (set! friendly #t)
       )
     (if *blast-bot-attack-debug*
-        (format 0 "Blast Bot: attack from ~A dmg ~f friendly ~A shield ~A~%"
-                (if proc (-> proc type) #f) amount friendly (-> this shield-on))
+        (let ((en (as-type proc enemy)))
+          (format 0 "Blast Bot: attack from ~A dmg ~f friendly ~A shield ~A state ~A dangerous ~A~%"
+                  (if proc (-> proc type) #f) amount friendly (-> this shield-on)
+                  (if (and en (-> en next-state)) (-> en next-state name) #f)
+                  (and en (logtest? (-> en focus-status) (focus-status dangerous))))
+          )
         )
     (cond
       (friendly 0)
@@ -2207,11 +2211,14 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
        ;; things whose process-mask was enemy/guard/crate, so any destructible with a different mask was skipped.
        ;; Pickups answer 'attack by sending 'get-pickup back, which the handler below forwards to Jak.
        ;; One attack id per 0.4s.
-       (when (and proc
+        (when (and proc
                   (!= proc self)
                   (!= proc *target*)
                   (!= proc (handle->process (-> self shield-handle)))
                   (not (logtest? (process-mask civilian) (-> proc mask)))
+                  ;; let an attacker finish its swing/lunge: its hit lands first, the legs get it afterwards
+                  (not (let ((en (as-type proc enemy)))
+                         (and en (logtest? (-> en focus-status) (focus-status dangerous)))))
                   )
          (when (>= (current-time) (-> self leg-id-time))
            (set! (-> self leg-id-time) (+ (current-time) (seconds 0.4)))
@@ -2236,12 +2243,14 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
                   (logtest? (process-mask enemy) (-> pd mask))
                   (type? (-> pd root) collide-shape)
                   )
-             (when ((method-of-type touching-shapes-entry prims-touching-action?)
-                    (the-as touching-shapes-entry (-> block param 0))
-                    (the-as collide-shape (-> pd root))
-                    (collide-action deadly)
-                    (collide-action)
-                    )
+              (when (and (let ((en (as-type proc enemy)))
+                          (and en (logtest? (-> en focus-status) (focus-status dangerous))))
+                        ((method-of-type touching-shapes-entry prims-touching-action?)
+                          (the-as touching-shapes-entry (-> block param 0))
+                          (the-as collide-shape (-> pd root))
+                          (collide-action deadly)
+                          (collide-action)
+                          ))
                (let* ((b (new 'stack-no-clear 'event-message-block))
                       (e (as-type proc enemy))
                       (swing-id (if e (-> e attack-id) (the-as uint 0)))
@@ -2654,19 +2663,16 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
           (let* ((e (-> (the-as process-drawable pp) root trans))
                  (dx (- (-> e x) (-> base x)))
                  (dz (- (-> e z) (-> base z)))
-                 (dist (sqrtf (+ (* dx dx) (* dz dz))))
+                 (dist (fmax 1.0 (sqrtf (+ (* dx dx) (* dz dz)))))
+                 (s (/ *blast-bot-reach-radius* dist))
                  (out *blast-bot-reach-pos*)
                  )
             (set! (-> out quad) (-> base quad))
-            (if (> dist *blast-bot-reach-radius*)
-                (let ((s (/ *blast-bot-reach-radius* dist)))
-                  (+! (-> out x) (* dx s))
-                  (+! (-> out z) (* dz s))
-                  )
-                (begin
-                  (set! (-> out x) (-> e x))
-                  (set! (-> out z) (-> e z))
-                  )
+            (+! (-> out x) (* dx s))
+            (+! (-> out z) (* dz s))
+            ;; aim points (modes 2+, roboguards use 5) at body height, never lower than what the base gave
+            (if (>= arg0 2)
+                (set! (-> out y) (fmax (-> out y) (+ (-> this root trans y) 12288.0)))
                 )
             out
             )
@@ -2732,6 +2738,9 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     (set! (-> root event-self) 'touched)
     (set! (-> root event-other) 'touch)
     (set! (-> self root) root)
+    ;; process-focusable.water is zeroed memory, which GOAL treats as truthy. Saberfish reads (-> water flags)
+    ;; off its target when it notices it, so make the field a real #f.
+    (set! (-> self water) (the-as water-control #f))
     )
   (format 0 "Blast Bot: collision root ready~%")
   ;; second collider: registered in *collide-player-list* so enemies find the bot. Not the root, no can-ride, collides
@@ -2753,6 +2762,9 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     (set! (-> aggro backup-collide-as) (-> aggro root-prim prim-core collide-as))
     (set! (-> aggro backup-collide-with) (-> aggro root-prim prim-core collide-with))
     (set! (-> self aggro-shape) aggro)
+    ;; enemies' find-best-focus only scans *collide-player-list* (hit-by-others only if their focus mask asks for it),
+    ;; so register the aggro shape there too. Keep the hit-by-others registration: enemy shots still use it.
+    (add-connection *collide-player-list* self #f aggro #f #f)
     )
   (format 0 "Blast Bot: aggro shape ready~%")
   (when *target*

@@ -8,7 +8,7 @@
 ;; DECOMP BEGINS
 
 ;; mod: scale the kg squad (same idea as was-squad-control)
-(defconstant KG-MAX-UNITS 127)
+(defconstant KG-MAX-UNITS 40)
 (defconstant KG-ENEMY-MULT 3)
 
 (define *default-kg-squad-member-settings* (new 'static 'inline-array kg-squad-member-settings 4

@@ -87,6 +87,9 @@
     ((= (-> arg0 type) target)
      0.3
      )
+    ((= (-> arg0 type symbol) 'blast-bot-player)
+     *blast-bot-hatred*
+     )
     ((logtest? (process-mask civilian) (-> arg0 mask))
      0.02
      )

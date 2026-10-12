@@ -20,7 +20,7 @@
 ;; DECOMP BEGINS
 
 ;; mod: scale the guard squad (same idea as was-squad-control)
-(defconstant FF-MAX-UNITS 127)
+(defconstant FF-MAX-UNITS 10)
 (defconstant FF-ENEMY-MULT 2)
 
 (define *alert-level-settings* (new 'static 'squad-alert-state-settings
@@ -167,8 +167,8 @@
 
 (defmethod ff-squad-control-method-56 ((this ff-squad-control) (arg0 int) (arg1 int) (arg2 int))
   (let ((v1-3 (-> this guard-type-info-array (the-as uint arg0))))
-    (set! (-> v1-3 guard-info-normal min-target-count) (max 0 (min 127 arg1)))
-    (set! (-> v1-3 guard-info-normal max-target-count) (max 0 (min 127 arg2)))
+    (set! (-> v1-3 guard-info-normal min-target-count) (max 0 (min FF-MAX-UNITS arg1)))
+    (set! (-> v1-3 guard-info-normal max-target-count) (max 0 (min FF-MAX-UNITS arg2)))
     )
   0
   (none)
