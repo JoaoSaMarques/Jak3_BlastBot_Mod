@@ -221,6 +221,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-max-health* 100.0)
 (define *blast-bot-damage-scale* 1.0)
 (define *blast-bot-invuln-time* 0.3)
+;; damage per lava tick; ticks are paced by *blast-bot-invuln-time*
+(define *blast-bot-lava-damage* 2.0)
 (define *blast-bot-god-mode* #f)
 ;; prints every attack event that reaches the bot and what was done with it
 (define *blast-bot-attack-debug* #t)
@@ -2236,6 +2238,113 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     )
   )
 
+(defun blast-bot-floor-probe ((this blast-bot-player) (print? symbol))
+  ;; What is the surface under the bot's feet? Returns its pat event number, or -1 when there is no floor within about
+  ;; 1.5 m of the feet (so a bot hovering high above lava is not burned). With print? it also prints the pat (mode /
+  ;; material / event) and the actor the hit triangle belongs to (if any).
+  ;; Lava floors are not water regions: the engine flags them through the pat event and applies it in react-to-pat!,
+  ;; a hook the bot's own collision never goes through, so the bot has to read the event itself.
+  (let ((q (new 'stack-no-clear 'collide-query))
+        (ev -1)
+        )
+    (vector-copy! (-> q start-pos) (-> this root trans))
+    (+! (-> q start-pos y) 16384.0)
+    (set-vector! (-> q move-dist) 0.0 -163840.0 0.0 1.0)
+    (set! (-> q radius) 40.96)
+    (set! (-> q collide-with) (collide-spec backgnd obstacle hit-by-others-list))
+    (set! (-> q ignore-process0) this)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat) (new 'static 'pat-surface))
+    (set! (-> q action-mask) (collide-action solid))
+    (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+      (cond
+        ((>= hit 0.0)
+         (let* ((pat (-> q best-other-tri pat))
+                (prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim))
+                (floor-y (+ (-> q start-pos y) (* hit (-> q move-dist y))))
+                )
+           (if print?
+               (format 0 "Blast Bot floor: y ~M mode ~D material ~D event ~D actor ~A~%"
+                       floor-y
+                       (the-as int (-> pat mode))
+                       (the-as int (-> pat material))
+                       (the-as int (-> pat event))
+                       (if prim (-> prim cshape process type) #f)
+                       )
+               )
+           (if (< (- (-> this root trans y) floor-y) 6144.0)
+               (set! ev (the-as int (-> pat event)))
+               )
+           )
+         )
+        (else
+          (if print?
+              (format 0 "Blast Bot floor: nothing below~%")
+              )
+          )
+        )
+      )
+    ev
+    )
+  )
+
+(define *blast-bot-hazard-debug* #t) ;; prints what the lava check sees about once a second; set to #f when it works
+
+(defun blast-bot-hazard-check ((this blast-bot-player))
+  ;; Lava (water.gc): Jak's own lava damage comes from his water-control, which only runs for `target` and only while
+  ;; his own collision is in the lava. He rides the bot far above it, so ask the water system about the bot's feet.
+  ;; Two ways of asking, either one triggers the damage (and the debug print shows which one sees the lava):
+  ;;   A: through the bot's own collision prims (what water-control does)
+  ;;   B: through two small spheres sitting on the bot's root (the feet), independent of the prim layout
+  ;;   C: the pat event of the floor under the feet (how the arena and volcano lava are actually flagged)
+  (let ((wa (new 'stack-no-clear 'water-info))
+        (wb (new 'stack-no-clear 'water-info))
+        (sp (new 'static 'inline-array water-sphere 2 (new 'static 'water-sphere) (new 'static 'water-sphere)))
+        )
+    (water-info-init! (-> this root) wa (collide-action solid semi-solid))
+    (dotimes (i 2)
+      (set! (-> sp i sphere quad) (-> this root trans quad))
+      (set! (-> sp i sphere r) 4096.0)
+      (set! (-> sp i flags) (water-flag))
+      )
+    (find-water-with-spheres sp 2 wb)
+    (let ((lava-a (and (logtest? (-> wa flags) (water-flag lava))
+                       (< (-> this root trans y) (+ -204.8 (-> wa base-height)))
+                       )
+                  )
+          (lava-b (and (logtest? (-> wb flags) (water-flag lava))
+                       (< (-> this root trans y) (+ -204.8 (-> wb base-height)))
+                       )
+                  )
+          ;; C: the floor itself. Measured: arena lava = pat event 18, volcano lava = pat event 6
+          (lava-c (let ((ev (blast-bot-floor-probe this (and *blast-bot-hazard-debug* (zero? (logand (current-time) 63))))))
+                    (or (= ev 18) (= ev 6))
+                    )
+                  )
+          )
+      (when (and *blast-bot-hazard-debug* (zero? (logand (current-time) 63)))
+        (format 0 "Blast Bot hazard: root y ~M | A flags #x~x base ~M lava ~A~%"
+                (-> this root trans y)
+                (the-as int (-> wa flags)) (-> wa base-height) lava-a
+                )
+        (format 0 "Blast Bot hazard: B flags #x~x base ~M lava ~A~%"
+                (the-as int (-> wb flags)) (-> wb base-height) lava-b
+                )
+        )
+      (when (or lava-a lava-b lava-c)
+        (let ((b (new 'stack-no-clear 'event-message-block)))
+          ;; no attack id: every tick must count (the invulnerability window paces them), and no sender,
+          ;; because blast-bot-attack-result treats a sender of `this` as friendly fire
+          (set! (-> b param 1)
+                (the-as uint (static-attack-info ((damage *blast-bot-lava-damage*) (mode 'melt)))))
+          (blast-bot-attack-result this (the-as process #f) b)
+          )
+        )
+      )
+    )
+  0
+  )
+
 ;; Jak is killed where he sits (still in grab-ride), no ejection: 'instant-death skips the death animation, and
 ;; target-hit sends him to target-death (mission fail / checkpoint reload). NOTE: target-attacked / target-hit only
 ;; do that when (-> *game-info* mode) is 'play; in 'debug mode the hit just drains his health.
@@ -2371,6 +2480,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       )
     (blast-bot-absorb-push self)
     (blast-bot-jump-update self)
+    (blast-bot-hazard-check self)
     (let ((speed (-> *cpad-list* cpads 0 stick0-speed))
           (dt (seconds-per-frame))
           (dashing (< (current-time) (-> self dash-until)))
