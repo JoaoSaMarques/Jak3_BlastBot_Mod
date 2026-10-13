@@ -2316,9 +2316,9 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
                        (< (-> this root trans y) (+ -204.8 (-> wb base-height)))
                        )
                   )
-          ;; C: the floor itself. Measured: arena lava = pat event 18, volcano lava = pat event 6
+          ;; C: the floor itself. Measured: metalhead valley = pat event 19,arena lava = pat event 18, volcano lava = pat event 6
           (lava-c (let ((ev (blast-bot-floor-probe this (and *blast-bot-hazard-debug* (zero? (logand (current-time) 63))))))
-                    (or (= ev 18) (= ev 6))
+                    (or (= ev 19) (= ev 18) (= ev 6)) 
                     )
                   )
           )
