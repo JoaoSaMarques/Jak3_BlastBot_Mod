@@ -158,7 +158,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-legs-on* #t)
 (define *blast-bot-ground-follow* #t)
 ;; on-screen platform / rider debug text (top-left console); set to #f from the REPL to hide it
-(define *blast-bot-debug-ride* #t)
+(define *blast-bot-debug-ride* #f)
 (define *blast-bot-ride-seen* (the-as string #f))
 
 ;; #t = everything the bot kills counts as Jak's kill (mission kill counters). Side effect: enemies see Jak as their
@@ -169,7 +169,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; when this is #t and blast-bot-use-morphgun is #f, npcs stop firing. If both are #t, npcs are able to fire again but morphgun still doesn't give credit
 (define *blast-bot-credit-shots* #f)
 ;; #t = the turret fires Jak's red morphgun shot (gun-red-1) instead of the guard shot. #f = old guard shot.
-(define *blast-bot-use-morphgun* #f)
+(define *blast-bot-use-morphgun* #t)
 
 (defun blast-bot-credit-jak! ((info attack-info))
   ;; Name Jak as the attacker. Mission kill counters (e.g. the marauder arena fights) only count a kill when the
@@ -225,7 +225,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-lava-damage* 2.0)
 (define *blast-bot-god-mode* #f)
 ;; prints every attack event that reaches the bot and what was done with it
-(define *blast-bot-attack-debug* #t)
+(define *blast-bot-attack-debug* #f)
 ;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
 ;; #f = he just walks away from the wreck
 (define *blast-bot-death-kills-jak* #t)
@@ -1469,15 +1469,341 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; D-pad: up = red, right = yellow, down = blue. Edit blast-bot-gun-select below to remap.
 (define *blast-bot-gun-mode* 0)
 
-(defun blast-bot-gun-select ()
-  (let ((old *blast-bot-gun-mode*))
-    (cond
-      ((cpad-pressed? 0 up) (set! *blast-bot-gun-mode* 0))
-      ((cpad-pressed? 0 right) (set! *blast-bot-gun-mode* 1))
-      ((cpad-pressed? 0 down) (set! *blast-bot-gun-mode* 2))
+;; ---- ownership (same test as want-to-gun? in target-gun.gc) ----
+
+(defun blast-bot-gun-feature ((color int) (level int))
+  ;; color: 0 red, 1 yellow, 2 blue.  level: 1..3
+  (case color
+    ((0)
+     (case level
+       ((1) (game-feature gun-red-1))
+       ((2) (game-feature gun-red-2))
+       (else (game-feature gun-red-3))
+       )
+     )
+    ((1)
+     (case level
+       ((1) (game-feature gun-yellow-1))
+       ((2) (game-feature gun-yellow-2))
+       (else (game-feature gun-yellow-3))
+       )
+     )
+    (else
+      (case level
+        ((1) (game-feature gun-blue-1))
+        ((2) (game-feature gun-blue-2))
+        (else (game-feature gun-blue-3))
+        )
       )
+    )
+  )
+
+(defun blast-bot-gun-level-owned? ((color int) (level int))
+  (and *target*
+       (nonzero? (-> *target* gun))
+       (logtest? (-> *target* game features) (game-feature gun))
+       (logtest? (logand (blast-bot-gun-feature color level) (-> *setting-control* user-current features))
+                 (-> *target* game features)
+                 )
+       )
+  )
+
+(defun blast-bot-gun-owned? ((color int))
+  ;; any level of that colour
+  (or (blast-bot-gun-level-owned? color 1)
+      (blast-bot-gun-level-owned? color 2)
+      (blast-bot-gun-level-owned? color 3)
+      )
+  )
+
+;; ---- heat system (shared by every weapon) ----
+;; Each weapon says how many shots it allows from a cold start ("uses"). One shot adds 1/uses of heat.
+;; At full heat the weapons lock until the meter has cooled down to *blast-bot-heat-resume*.
+
+(define *blast-bot-heat* 0.0)             ;; 0..1
+(define *blast-bot-overheated* #f)
+(define *blast-bot-heat-capacity* 1.0)    ;; 2.0 = "increased ammo capacity" upgrade (heat meter doubled)
+(define *blast-bot-heat-cool-rate* 0.2)   ;; meter units per second (0.2 = 5 s from full to empty)
+(define *blast-bot-heat-resume* 0.25)     ;; an overheated weapon unlocks below this
+(define *blast-bot-unlimited-ammo* #f)    ;; cheat from the doc: weapons never overheat
+
+(defun blast-bot-heat-update ((dt float))
+  (seek! *blast-bot-heat* 0.0 (* *blast-bot-heat-cool-rate* dt))
+  (when (and *blast-bot-overheated* (<= *blast-bot-heat* *blast-bot-heat-resume*))
+    (set! *blast-bot-overheated* #f)
+    (format 0 "Blast Bot: weapons cooled down~%")
+    )
+  (when *blast-bot-unlimited-ammo*
+    (set! *blast-bot-heat* 0.0)
+    (set! *blast-bot-overheated* #f)
+    )
+  (none)
+  )
+
+(defun blast-bot-heat-try-use ((uses float))
+  ;; #t = the shot may fire (and its heat has been added). #f = overheated, no shot.
+  (cond
+    (*blast-bot-unlimited-ammo* #t)
+    (*blast-bot-overheated*
+      (format 0 "Blast Bot: overheated~%")
+      #f
+      )
+    (else
+      (+! *blast-bot-heat* (/ 1.0 (* uses *blast-bot-heat-capacity*)))
+      (when (>= *blast-bot-heat* 0.999)
+        (set! *blast-bot-heat* 1.0)
+        (set! *blast-bot-overheated* #t)
+        (format 0 "Blast Bot: OVERHEAT~%")
+        )
+      #t
+      )
+    )
+  )
+
+(defun blast-bot-heat-text ()
+  ;; text meter in the top-left console, same style as the HEALTH / FUEL fallback meters
+  (let ((n (the int (* 20.0 (fmax 0.0 (fmin 1.0 *blast-bot-heat*))))))
+    (if *blast-bot-overheated*
+        (format *stdcon* "OVERHEAT [")
+        (format *stdcon* "HEAT     [")
+        )
+    (dotimes (i 20)
+      (if (< i n)
+          (format *stdcon* "#")
+          (format *stdcon* "-")
+          )
+      )
+    (format *stdcon* "]~%")
+    )
+  (none)
+  )
+
+;; ---- red arsenal ----
+
+(define *blast-bot-red-weapon* 1)         ;; 1 Scattergun, 2 Wave Concussor, 3 Plasmite RPG
+
+;; Scattergun grid. Doc: 4 wide x 2 long (8 bombs); the upgrade makes it 7 wide x 4 long.
+(define *blast-bot-scatter-cols* 4)
+(define *blast-bot-scatter-rows* 2)
+(define *blast-bot-scatter-spread* 9.0)   ;; degrees between neighbouring columns
+(define *blast-bot-scatter-speed-near* 150000.0)
+(define *blast-bot-scatter-speed-far* 250000.0)
+;; Wave Concussor: 8 grenades in a ring; the upgrade adds a second, inner ring of 8 placed between the gaps (16 total)
+(define *blast-bot-wave-inner-ring* #f)
+(define *blast-bot-wave-speed* 140000.0)
+(define *blast-bot-wave-inner-speed* 90000.0)
+
+(defun blast-bot-muzzle ((this blast-bot-player) (start vector) (dir vector))
+  ;; the same muzzle point / direction the other bot shots use (bone 6), nudged forward out of the barrel
+  (let ((m (matrix-copy! (new 'stack-no-clear 'matrix) (-> this node-list data 6 bone transform))))
+    (matrix->trans m start)
+    (vector-normalize-copy! dir (-> m fvec) 1.0)
+    (vector+*! start start dir 8192.0)
+    )
+  (none)
+  )
+
+(defun blast-bot-spawn-grenade ((this blast-bot-player) (start vector) (vel vector))
+  ;; Jak's own red level-3 grenade (gun-red-3-grenade), spawned the way gun-fire-red-3 does it, but with the bot as
+  ;; parent and ignored process. The grenade's own code decides when it explodes (proximity fuse + timeout) and how
+  ;; hard it hits; its damage, blast radius and fuse are fixed inside that type (see the notes at the bottom).
+  (let ((params (new 'stack-no-clear 'projectile-init-by-other-params)))
+    (set! (-> params ent) (-> this entity))
+    (set! (-> params charge) 1.0)
+    (set! (-> params options) (projectile-options))
+    (logclear! (-> params options) (projectile-options po14 po15 po16))
+    (vector-copy! (-> params pos) start)
+    (vector-copy! (-> params vel) vel)
+    (set! (-> params notify-handle) (the-as handle #f))
+    (set! (-> params owner-handle)
+          (if (and *target* *blast-bot-morphgun-credit-jak*)
+              (process->handle *target*)
+              (process->handle this)
+              )
+          )
+    (set! (-> params target-handle) (the-as handle #f))
+    (set! (-> params target-pos quad) (the-as uint128 0))
+    (set! (-> params ignore-handle) (process->handle this))
+    (let* ((v1 *game-info*)
+           (id (+ (-> v1 attack-id) 1))
+           )
+      (set! (-> v1 attack-id) id)
+      (set! (-> params attack-id) id)
+      )
+    (set! (-> params timeout) (seconds 4))
+    (spawn-projectile gun-red-3-grenade params this *default-dead-pool*)
+    )
+  (none)
+  )
+
+(defun blast-bot-grenade-vel ((out vector) (flat vector) (speed float))
+  ;; lobbed throw: horizontal direction plus a fixed upward loft (gun-fire-red-3 also forces y >= 0.3)
+  (vector-copy! out flat)
+  (set! (-> out y) 0.0)
+  (vector-normalize! out 1.0)
+  (set! (-> out y) 0.45)
+  (vector-normalize! out speed)
+  (none)
+  )
+
+(defun blast-bot-fire-scattergun ((this blast-bot-player))
+  ;; cols x rows grenades in a cone in front of the bot. Rows are different throw distances.
+  (let ((start (new 'stack-no-clear 'vector))
+        (dir (new 'stack-no-clear 'vector))
+        (flat (new 'stack-no-clear 'vector))
+        (vel (new 'stack-no-clear 'vector))
+        (cols *blast-bot-scatter-cols*)
+        (rows *blast-bot-scatter-rows*)
+        )
+    (blast-bot-muzzle this start dir)
+    (dotimes (r rows)
+      (let ((speed (if (< rows 2)
+                       *blast-bot-scatter-speed-far*
+                       (+ *blast-bot-scatter-speed-near*
+                          (* (/ (the float r) (the float (+ rows -1)))
+                             (- *blast-bot-scatter-speed-far* *blast-bot-scatter-speed-near*)))
+                       )
+                   )
+            )
+        (dotimes (c cols)
+          (let ((yaw (* (- (the float c) (* 0.5 (the float (+ cols -1)))) *blast-bot-scatter-spread*)))
+            (vector-rotate-y! flat dir (* 182.04445 yaw))
+            (blast-bot-grenade-vel vel flat speed)
+            (blast-bot-spawn-grenade this start vel)
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-fire-concussor ((this blast-bot-player))
+  ;; 8 grenades thrown outward in a circle around the bot (+8 in an inner ring, offset half a step, with the upgrade)
+  (let ((start (new 'stack-no-clear 'vector))
+        (flat (new 'stack-no-clear 'vector))
+        (vel (new 'stack-no-clear 'vector))
+        )
+    (vector-copy! start (-> this root trans))
+    (+! (-> start y) 12288.0)
+    (dotimes (i 8)
+      (set! (-> flat x) (sin (* 182.04445 (* 45.0 (the float i)))))
+      (set! (-> flat y) 0.0)
+      (set! (-> flat z) (cos (* 182.04445 (* 45.0 (the float i)))))
+      (blast-bot-grenade-vel vel flat *blast-bot-wave-speed*)
+      (blast-bot-spawn-grenade this start vel)
+      )
+    (when *blast-bot-wave-inner-ring*
+      (dotimes (i 8)
+        (set! (-> flat x) (sin (* 182.04445 (+ 22.5 (* 45.0 (the float i))))))
+        (set! (-> flat y) 0.0)
+        (set! (-> flat z) (cos (* 182.04445 (+ 22.5 (* 45.0 (the float i))))))
+        (blast-bot-grenade-vel vel flat *blast-bot-wave-inner-speed*)
+        (blast-bot-spawn-grenade this start vel)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-fire-red-arsenal ((this blast-bot-player))
+  (case *blast-bot-red-weapon*
+    ((1)
+     (if (blast-bot-heat-try-use 2.0)        ;; two shots before overheating
+         (blast-bot-fire-scattergun this)
+         )
+     )
+    ((2)
+     (if (blast-bot-heat-try-use 1.0)        ;; one shot before overheating
+         (blast-bot-fire-concussor this)
+         )
+     )
+    (else
+      ;; Plasmite RPG (10 spy droids) needs spydroid-orig.gc to spawn them; not built yet, so it does nothing and uses no heat
+      (format 0 "Blast Bot: Plasmite RPG is not built yet~%")
+      )
+    )
+  (none)
+  )
+
+;; ---- selection ----
+
+(defun blast-bot-red-fix ()
+  ;; keep *blast-bot-red-weapon* on a level Jak actually owns
+  (when (not (blast-bot-gun-level-owned? 0 *blast-bot-red-weapon*))
+    (let ((found #f))
+      (dotimes (i 3)
+        (when (and (not found) (blast-bot-gun-level-owned? 0 (+ i 1)))
+          (set! *blast-bot-red-weapon* (+ i 1))
+          (set! found #t)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-red-cycle ()
+  ;; next owned red weapon after the current one (wraps)
+  (let ((found #f))
+    (dotimes (i 3)
+      (let ((lvl (+ 1 (mod (+ *blast-bot-red-weapon* i) 3))))
+        (when (and (not found) (blast-bot-gun-level-owned? 0 lvl))
+          (set! *blast-bot-red-weapon* lvl)
+          (set! found #t)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-red-name ((level int))
+  (case level
+    ((1) "Scattergun")
+    ((2) "Wave Concussor")
+    (else "Plasmite RPG")
+    )
+  )
+
+(defun blast-bot-gun-select ()
+  (let ((old *blast-bot-gun-mode*)
+        (old-red *blast-bot-red-weapon*)
+        (want -1)
+        )
+    (cond
+      ((cpad-pressed? 0 up) (set! want 0))
+      ((cpad-pressed? 0 right) (set! want 1))
+      ((cpad-pressed? 0 down) (set! want 2))
+      )
+    (when (>= want 0)
+      (cond
+        ((not (blast-bot-gun-owned? want))
+         (format 0 "Blast Bot: you do not own the ~A gun yet~%" (case want ((0) 'red) ((1) 'yellow) (else 'blue)))
+         )
+        ((and (= want 0) (= *blast-bot-gun-mode* 0))
+         ;; pressing red again while on red cycles through the red weapons you own
+         (blast-bot-red-cycle)
+         )
+        (else
+          (set! *blast-bot-gun-mode* want)
+          )
+        )
+      )
+    ;; the selected colour is no longer owned (first frame, or features changed): move to the first owned one
+    (when (not (blast-bot-gun-owned? *blast-bot-gun-mode*))
+      (dotimes (i 3)
+        (when (and (not (blast-bot-gun-owned? *blast-bot-gun-mode*)) (blast-bot-gun-owned? i))
+          (set! *blast-bot-gun-mode* i)
+          )
+        )
+      )
+    (blast-bot-red-fix)
     (if (!= old *blast-bot-gun-mode*)
         (format 0 "Blast Bot: gun ~A~%" (case *blast-bot-gun-mode* ((0) 'red) ((1) 'yellow) (else 'blue)))
+        )
+    (if (and (= *blast-bot-gun-mode* 0) (or (!= old *blast-bot-gun-mode*) (!= old-red *blast-bot-red-weapon*)))
+        (format 0 "Blast Bot: red weapon ~A~%" (blast-bot-red-name *blast-bot-red-weapon*))
         )
     )
   (none)
@@ -1551,11 +1877,20 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   )
 
 (defun blast-bot-fire-shot ((this blast-bot-player))
-  (if (and *blast-bot-use-morphgun* *target*)
+  ;; morphgun only when the toggle is on AND Jak owns the selected colour; otherwise the old guard shot
+  (if (and *blast-bot-use-morphgun* *target* (blast-bot-gun-owned? *blast-bot-gun-mode*))
       (case *blast-bot-gun-mode*
-        ((1) (blast-bot-fire-yellow this))
-        ((2) (blast-bot-fire-blue this))
-        (else (blast-bot-fire-morphgun this))
+        ((1)
+         (if (blast-bot-heat-try-use 20.0)     ;; Blaster: twenty shots before overheating
+             (blast-bot-fire-yellow this)
+             )
+         )
+        ((2)
+         (if (blast-bot-heat-try-use 100.0)    ;; Vulcan Fury: a hundred shots before overheating
+             (blast-bot-fire-blue this)
+             )
+         )
+        (else (blast-bot-fire-red-arsenal this))
         )
       (blast-bot-fire-guard-shot this)
       )
@@ -2288,7 +2623,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     )
   )
 
-(define *blast-bot-hazard-debug* #t) ;; prints what the lava check sees about once a second; set to #f when it works
+(define *blast-bot-hazard-debug* #f) ;; prints what the lava check sees about once a second; set to #f when it works
 
 (defun blast-bot-hazard-check ((this blast-bot-player))
   ;; Lava (water.gc): Jak's own lava damage comes from his water-control, which only runs for `target` and only while
@@ -2602,6 +2937,10 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
         )
       ;; D-pad: morphgun type
       (blast-bot-gun-select)
+      (when *blast-bot-use-morphgun*
+        (blast-bot-heat-update dt)
+        (blast-bot-heat-text)
+        )
       ;; R2 (held): hover. Legs sweep back and the body floats up.
       ;; R2 (press): toggle hover on/off. Only switchable from the ground or while airborne.
       (when (and (cpad-pressed? 0 r2) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2)))

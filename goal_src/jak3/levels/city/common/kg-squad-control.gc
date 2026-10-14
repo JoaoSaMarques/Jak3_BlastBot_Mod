@@ -7,10 +7,6 @@
 
 ;; DECOMP BEGINS
 
-;; mod: scale the kg squad (same idea as was-squad-control)
-(defconstant KG-MAX-UNITS 40)
-(defconstant KG-ENEMY-MULT 3)
-
 (define *default-kg-squad-member-settings* (new 'static 'inline-array kg-squad-member-settings 4
                                              (new 'static 'kg-squad-member-settings
                                                :object-type (traffic-type roboguard)
@@ -203,30 +199,18 @@
               )
             )
           )
-        ;; mod: x5 per entry, and the summed total for a traffic type is capped at KG-MAX-UNITS
-        (set! (-> this
-                  traffic
-                  object-type-info-array
-                  0
-                  target-counts
-                  (+ v1-3 (* (-> a2-12 roboguard-settings object-type) 32))
-                  )
-              (min KG-MAX-UNITS
-                   (+ (-> this
-                          traffic
-                          object-type-info-array
-                          0
-                          target-counts
-                          (+ v1-3 (* (-> a2-12 roboguard-settings object-type) 32))
-                          )
-                      (max
-                        (min (min KG-MAX-UNITS (* KG-ENEMY-MULT (-> a2-12 roboguard-settings target-count)))
-                             (-> a2-12 roboguard-settings max-target-count))
-                        (-> a2-12 roboguard-settings min-target-count)
-                        )
-                      )
-                   )
+        (+! (-> this
+                traffic
+                object-type-info-array
+                0
+                target-counts
+                (+ v1-3 (* (-> a2-12 roboguard-settings object-type) 32))
+                )
+            (max
+              (min (-> a2-12 roboguard-settings target-count) (-> a2-12 roboguard-settings max-target-count))
+              (-> a2-12 roboguard-settings min-target-count)
               )
+            )
         )
       )
     )
@@ -242,7 +226,7 @@
         (let ((t0-13 (the-as kg-squad-settings (+ (+ (* a3-13 16) 860 (* v1-6 64)) (the-as int this)))))
           (set! (-> a2-17 (-> t0-13 roboguard-settings enemy-type))
                 (max
-                  (min (min KG-MAX-UNITS (* KG-ENEMY-MULT (-> t0-13 roboguard-settings target-count))) (-> t0-13 roboguard-settings max-target-count))
+                  (min (-> t0-13 roboguard-settings target-count) (-> t0-13 roboguard-settings max-target-count))
                   (-> t0-13 roboguard-settings min-target-count)
                   )
                 )
