@@ -1621,8 +1621,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-scatter-speed-far* 250000.0)
 ;; Wave Concussor: 8 grenades in a ring; the upgrade adds a second, inner ring of 8 placed between the gaps (16 total)
 (define *blast-bot-wave-inner-ring* #f)
-(define *blast-bot-wave-speed* 140000.0)
-(define *blast-bot-wave-inner-speed* 90000.0)
+(define *blast-bot-wave-speed* 90000.0)
+(define *blast-bot-wave-inner-speed* 45000.0)
 
 (defun blast-bot-muzzle ((this blast-bot-player) (start vector) (dir vector))
   ;; the same muzzle point / direction the other bot shots use (bone 6), nudged forward out of the barrel
@@ -1710,17 +1710,23 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   )
 
 (defun blast-bot-fire-concussor ((this blast-bot-player))
-  ;; 8 grenades thrown outward in a circle around the bot (+8 in an inner ring, offset half a step, with the upgrade)
-  (let ((start (new 'stack-no-clear 'vector))
+  ;; Launch each grenade outside the bot's body/shield, then throw it radially outward.
+  ;; The old code spawned every grenade at the bot centre, so its proximity fuse
+  ;; could trigger immediately against the bot's own collision.
+  (let ((center (new 'stack-no-clear 'vector))
+        (start (new 'stack-no-clear 'vector))
         (flat (new 'stack-no-clear 'vector))
         (vel (new 'stack-no-clear 'vector))
         )
-    (vector-copy! start (-> this root trans))
-    (+! (-> start y) 12288.0)
+    (vector-copy! center (-> this root trans))
+    (+! (-> center y) 24576.0)
     (dotimes (i 8)
       (set! (-> flat x) (sin (* 182.04445 (* 45.0 (the float i)))))
       (set! (-> flat y) 0.0)
       (set! (-> flat z) (cos (* 182.04445 (* 45.0 (the float i)))))
+      ;; Start beyond the large circle shield and bot collision, in the same direction as travel.
+      (vector-copy! start center)
+      (vector+*! start start flat 16384.0)
       (blast-bot-grenade-vel vel flat *blast-bot-wave-speed*)
       (blast-bot-spawn-grenade this start vel)
       )
@@ -1729,6 +1735,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
         (set! (-> flat x) (sin (* 182.04445 (+ 22.5 (* 45.0 (the float i))))))
         (set! (-> flat y) 0.0)
         (set! (-> flat z) (cos (* 182.04445 (+ 22.5 (* 45.0 (the float i))))))
+        (vector-copy! start center)
+        (vector+*! start start flat 32768.0)
         (blast-bot-grenade-vel vel flat *blast-bot-wave-inner-speed*)
         (blast-bot-spawn-grenade this start vel)
         )
@@ -1740,7 +1748,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (defun blast-bot-fire-red-arsenal ((this blast-bot-player))
   (case *blast-bot-red-weapon*
     ((1)
-     (if (blast-bot-heat-try-use 2.0)        ;; two shots before overheating
+     (if (blast-bot-heat-try-use 1.0)        ;; one shot before overheating
          (blast-bot-fire-scattergun this)
          )
      )
