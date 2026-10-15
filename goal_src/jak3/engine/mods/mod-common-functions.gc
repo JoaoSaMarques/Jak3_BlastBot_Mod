@@ -225,6 +225,15 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-lava-damage* 2.0)
 (define *blast-bot-god-mode* #f)
 ;; prints every attack event that reaches the bot and what was done with it
+;; BISECT SWITCHES for the junk-format crash (both came in with ShieldUpdate). #f = old behaviour (MarauderFix).
+(define *blast-bot-touch-attack* #f)   ;; enemy melee via 'touch + prims-touching-action? (logs "Bogus cshape value!")
+(define *blast-bot-hud-shield-bar* #f)  ;; HUD sprites 6-8 + 'heat-ratio poll (came in with ShieldUpdate)
+(defglobalconstant BLAST_BOT_SHIELD_OWNER_ATTACK #f) ;; #t = send-shield-attack override below (ShieldUpdate); #f = stock method
+(define *blast-bot-aggro-on* #t)     ;; MINIMAL TEST: #f = no aggro collider (enemies will ignore the bot)
+(define *blast-bot-shield-spawn* #t) ;; MINIMAL TEST: #f = the shield process is never spawned
+(define *blast-bot-leg-limbs* 3)  ;; MINIMAL TEST  ;; BISECT: how many legs get collision spheres (0..4). Set 0 to test the crash without any leg prims.
+(define *blast-bot-reach-hack* #f)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
+
 (define *blast-bot-attack-debug* #f)
 ;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
 ;; #f = he just walks away from the wreck
@@ -598,7 +607,17 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   (if (nonzero? (-> this aggro-shape))
       (&+! (-> this aggro-shape) offset)
       )
-  (call-parent-method this offset)
+  (let ((result (call-parent-method this offset)))
+    ;; the body/head/swivel/gun joint callbacks keep a raw pointer to the bot in param1; after a move that pointer
+    ;; would still be the OLD address (stale memory that now belongs to other processes). Re-point them.
+    (when (nonzero? (-> this node-list))
+      (set! (-> this node-list data 3 param1) this)
+      (set! (-> this node-list data 4 param1) this)
+      (set! (-> this node-list data 5 param1) this)
+      (set! (-> this node-list data 6 param1) this)
+      )
+    result
+    )
   )
 
 ;; ---- Blast Bot turret ----------------------------------------------------
@@ -1207,6 +1226,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
                          (if low 255 0) (if low 120 200) (if low 0 255))
     )
   ;; sprites 6-8: shield (border, background, fill). Fill goes white (full) -> red (empty).
+  (when *blast-bot-hud-shield-bar*
   (let* ((sh (fmax 0.0 (fmin 1.0 *blast-bot-hud-shield*)))
          (show (if *blast-bot-hud-shield-show* 1.0 0.0))
          (sw (the float *blast-bot-shield-w*))
@@ -1225,6 +1245,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
                          (* show sw) (* show fill)
                          255 gb gb)
     )
+  )
   ((method-of-type hud draw) this)
   0
   (none)
@@ -1248,7 +1269,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
         )
   (format 0 "Blast Bot HUD: gui registered~%")
   (logior! (-> this flags) (hud-flags show))
-  (dotimes (i 9)
+  (dotimes (i (if *blast-bot-hud-shield-bar* 9 6))
     (set! (-> this sprites i tid) (the-as texture-id (get-texture common-white common)))
     (set! (-> this sprites i flags) (hud-sprite-flags))
     (set! (-> this sprites i scale-x) 0.0)
@@ -1271,7 +1292,16 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   (none)
   )
 
+(define *blast-bot-last-addr* 0)
+
 (defun blast-bot-update-hud ((this blast-bot-player))
+  ;; DIAG: the dead-pool heap moves processes when it compacts; log every time the bot's address changes
+  (let ((addr (the-as int this)))
+    (when (!= addr *blast-bot-last-addr*)
+      (format 0 "Blast Bot: process address #x~X (was #x~X)~%" addr *blast-bot-last-addr*)
+      (set! *blast-bot-last-addr* addr)
+      )
+    )
   ;; Call every frame: feeds the hud its numbers and (re)spawns the hud process when it is gone
   ;; (e.g. after a level change took the old one with it).
   (set! *blast-bot-hud-health* (/ (-> this health) (-> this max-health)))
@@ -1293,7 +1323,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
         (cond
           (sh
             ;; 'heat-ratio is the shield's own heat (0 = untouched, 1 = about to break), so strength left is 1 - heat
-            (let ((heat (the-as float (send-event sh 'heat-ratio))))
+            (let ((heat (if *blast-bot-hud-shield-bar* (the-as float (send-event sh 'heat-ratio)) 0.0)))
               (set! *blast-bot-hud-shield* (fmax 0.0 (fmin 1.0 (- 1.0 heat))))
               )
             (set! *blast-bot-hud-shield-show* (or (-> this shield-on) (< *blast-bot-hud-shield* 0.999)))
@@ -2174,10 +2204,12 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (defun blast-bot-spawn-shield ((this blast-bot-player))
   ;; Spawns the mech's own shield sphere (target-mech.gc) on the bot's body joint, switched off.
   ;; Hold Circle to switch it on. Needs the skel-shield-sphere art to be loaded."
+  (when *blast-bot-shield-spawn*
   (if (not (art-group-get-by-name *level* "skel-shield-sphere" (the-as (pointer level) #f)))
       (format 0 "Blast Bot: skel-shield-sphere art is not loaded, shield disabled~%")
       (blast-bot-spawn-shield-real this)
       )
+    )
   (none)
   )
 
@@ -2230,6 +2262,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 
 ;; the stock version sends the hit as the shield sphere; enemies then refocus onto the shield (a target they can't
 ;; hurt) and stop fighting the bot. Name the owner (the bot) as the attacker instead.
+(#when BLAST_BOT_SHIELD_OWNER_ATTACK
 (defmethod send-shield-attack ((this shield-sphere) (arg0 process-focusable) (arg1 touching-shapes-entry) (arg2 int))
   (let ((t0-0 0))
     (send-event
@@ -2248,6 +2281,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
                           )
       )
     )
+  )
   )
 
 (defun blast-bot-update-shield-break ((this blast-bot-player))
@@ -2747,7 +2781,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
        )
       (('touch)
        (let ((pd (as-type proc process-drawable)))
-         (if (and pd
+         (if (and *blast-bot-touch-attack*
+                  pd
                   (> (-> block num-params) 0)
                   (nonzero? (-> block param 0))
                   (logtest? (process-mask enemy) (-> pd mask))
@@ -3165,7 +3200,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (defmethod get-trans ((this blast-bot-player) (arg0 int))
   (let ((base (call-parent-method this arg0)))
     (with-pp
-      (if (and pp
+      (if (and *blast-bot-reach-hack*
+               pp
                (not (= pp this))
                (logtest? (-> pp mask) (process-mask enemy))
                (type? pp process-drawable)
@@ -3193,11 +3229,21 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   )
 
 (defbehavior blast-bot-player-init-by-other blast-bot-player ()
+  ;; same as bombbot.gc: give the unused stack back to the process heap BEFORE any (new 'process ...) allocation
+  (stack-size-set! (-> self main-thread) 512)
   (format 0 "Blast Bot: init begin~%")
-  (let ((root (new 'process 'collide-shape self (collide-list-enum player))))
+  (format 0 "Blast Bot: leg limbs with spheres: ~D~%" *blast-bot-leg-limbs*)
+  ;; same constructor + setup as bombbot.gc. The plain collide-shape + (collide-list-enum player) combo printed
+  ;; "Unsupported collide-list-enum" and left the shape half-initialised. Enemies find the bot via the aggro shape below.
+  (let ((root (new 'process 'collide-shape-moving self (collide-list-enum usually-hit-by-player))))
+    (set! (-> root dynam) (copy *standard-dynamics* 'process))
+    (set! (-> root reaction) cshape-reaction-default)
+    (set! (-> root no-reaction)
+          (the-as (function collide-shape-moving collide-query vector vector object) nothing)
+          )
     ;; 1 group + 35 children: walls sphere, body touch sphere, 8 spheres per leg, ride sphere
-    (let ((group (new 'process 'collide-shape-prim-group root (the-as uint 35) 0)))
-      (set! (-> root total-prims) (the-as uint 36))
+    (let ((group (new 'process 'collide-shape-prim-group root (the-as uint (+ 3 (* 8 *blast-bot-leg-limbs*))) 0)))
+      (set! (-> root total-prims) (the-as uint (+ 4 (* 8 *blast-bot-leg-limbs*))))
       (set! (-> group prim-core collide-as) (collide-spec jak))
       (set! (-> group prim-core collide-with) (the-as collide-spec #xffffffff))
       (set! (-> group prim-core action) (collide-action solid no-standon can-ride))
@@ -3223,7 +3269,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (set-vector! (-> body local-sphere) 0.0 1638.4 0.0 8192.0)
       )
     ;; legs: elbow joint + the joint below it, signs match *blast-bot-hand-dist*
-    (dotimes (limb 4)
+    (dotimes (limb *blast-bot-leg-limbs*)
       (let ((elbow (-> *blast-bot-elbows* limb))
             (sign (if (or (= limb 0) (= limb 2)) 1.0 -1.0))
             )
@@ -3255,6 +3301,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   (format 0 "Blast Bot: collision root ready~%")
   ;; second collider: registered in *collide-player-list* so enemies find the bot. Not the root, no can-ride, collides
   ;; with nothing; its process is the bot, so enemy shots / attacks go straight to the bot's own handlers.
+  (when *blast-bot-aggro-on*
   (let ((aggro (new 'process 'collide-shape-moving self (collide-list-enum hit-by-others))))
     (let ((prim (new 'process 'collide-shape-prim-sphere aggro (the-as uint 0))))
       (set! (-> prim prim-core collide-as) (collide-spec jak))
@@ -3276,16 +3323,20 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     ;; so register the aggro shape there too. Keep the hit-by-others registration: enemy shots still use it.
     (add-connection *collide-player-list* self #f aggro #f #f)
     )
+  )
   (format 0 "Blast Bot: aggro shape ready~%")
   (when *target*
     (vector-copy! (-> self root trans) (target-pos 0))
     (quaternion-copy! (-> self root quat) (-> *target* root quat))
     )
   (vector-identity! (-> self root scale))
-  (vector-copy! (-> self aggro-shape trans) (-> self root trans))
-  (update-transforms (-> self aggro-shape))
+  (when (nonzero? (-> self aggro-shape))
+    (vector-copy! (-> self aggro-shape trans) (-> self root trans))
+    (update-transforms (-> self aggro-shape))
+    )
   (initialize-skeleton self skel-blast-bot (the-as pair 0))
   (format 0 "Blast Bot: skeleton ready~%")
+  (format 0 "Blast Bot: ~A~%" self) ;; DIAG: shows :heap used/total
   (blast-bot-init-legs self)
   (blast-bot-init-aim self)
   (blast-bot-spawn-shield self)
@@ -3336,11 +3387,15 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   ;; Spawns a new bot, then removes every previous one. Jak is released from the old bot first so the new bot can take him over.
   (when *target*
     (format 0 "Blast Bot: spawn requested~%")
+    (format 0 "Blast Bot: 16k pool slot free: ~A~%" (if (-> *16k-dead-pool* child) #t #f))
     (if (blast-bot-find)
         (send-event *target* 'change-mode 'grab #t)
         )
     (let ((new (process-spawn blast-bot-player
-                              :from *default-dead-pool*
+                              ;; *16k-dead-pool* is a plain dead-pool (fixed slots, never compacts), so the bot is never
+                              ;; moved in memory. It has a single slot (debug builds), so fall back to the compacting
+                              ;; default pool when the slot is taken.
+                              :from (if (-> *16k-dead-pool* child) *16k-dead-pool* *default-dead-pool*)
                               :to *entity-pool*
                               :stack-size #x4000
                               :name "blast-bot-player")))
