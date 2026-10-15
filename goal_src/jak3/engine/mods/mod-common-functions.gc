@@ -231,7 +231,8 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (defglobalconstant BLAST_BOT_SHIELD_OWNER_ATTACK #f) ;; #t = send-shield-attack override below (ShieldUpdate); #f = stock method
 (define *blast-bot-aggro-on* #t)     ;; MINIMAL TEST: #f = no aggro collider (enemies will ignore the bot)
 (define *blast-bot-shield-spawn* #t) ;; MINIMAL TEST: #f = the shield process is never spawned
-(define *blast-bot-leg-limbs* 3)  ;; MINIMAL TEST  ;; BISECT: how many legs get collision spheres (0..4). Set 0 to test the crash without any leg prims.
+(define *blast-bot-leg-spheres* 3) ;; spheres per leg bone (2 bones per leg). 4 = the old layout (8 per leg, 36 prims total), which produced the junk text; 3 = 6 per leg, 28 prims total
+(define *blast-bot-leg-limbs* 4)  ;; BISECT: how many legs get collision spheres (0..4). Set 0 to test the crash without any leg prims.
 (define *blast-bot-reach-hack* #f)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
 
 (define *blast-bot-attack-debug* #f)
@@ -3241,9 +3242,9 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
     (set! (-> root no-reaction)
           (the-as (function collide-shape-moving collide-query vector vector object) nothing)
           )
-    ;; 1 group + 35 children: walls sphere, body touch sphere, 8 spheres per leg, ride sphere
-    (let ((group (new 'process 'collide-shape-prim-group root (the-as uint (+ 3 (* 8 *blast-bot-leg-limbs*))) 0)))
-      (set! (-> root total-prims) (the-as uint (+ 4 (* 8 *blast-bot-leg-limbs*))))
+    ;; 1 group + children: walls sphere, body touch sphere, (2 * *blast-bot-leg-spheres*) spheres per leg, ride sphere
+    (let ((group (new 'process 'collide-shape-prim-group root (the-as uint (+ 3 (* (* 2 *blast-bot-leg-spheres*) *blast-bot-leg-limbs*))) 0)))
+      (set! (-> root total-prims) (the-as uint (+ 4 (* (* 2 *blast-bot-leg-spheres*) *blast-bot-leg-limbs*))))
       (set! (-> group prim-core collide-as) (collide-spec jak))
       (set! (-> group prim-core collide-with) (the-as collide-spec #xffffffff))
       (set! (-> group prim-core action) (collide-action solid no-standon can-ride))
@@ -3273,9 +3274,17 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
       (let ((elbow (-> *blast-bot-elbows* limb))
             (sign (if (or (= limb 0) (= limb 2)) 1.0 -1.0))
             )
-        (dotimes (k 4)
-          (blast-bot-add-leg-sphere root (+ limb 1) elbow (* sign 4096.0 (the float k)))
-          (blast-bot-add-leg-sphere root (+ limb 1) (+ elbow -1) (* sign 4096.0 (the float k)))
+        ;; the spheres cover the same 3 m span along the bone whatever their number
+        (let ((step (if (> *blast-bot-leg-spheres* 1)
+                        (/ 12288.0 (the float (+ *blast-bot-leg-spheres* -1)))
+                        0.0
+                        )
+                    )
+              )
+          (dotimes (k *blast-bot-leg-spheres*)
+            (blast-bot-add-leg-sphere root (+ limb 1) elbow (* sign step (the float k)))
+            (blast-bot-add-leg-sphere root (+ limb 1) (+ elbow -1) (* sign step (the float k)))
+            )
           )
         )
       )
