@@ -159,11 +159,11 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-ground-follow* #t)
 ;; on-screen platform / rider debug text (top-left console); set to #f from the REPL to hide it
 (define *blast-bot-debug-ride* #f)
-(define *blast-bot-ride-seen* (the-as string #f))
+(define *blast-bot-ride-seen* (the-as string #t))
 
 ;; #t = everything the bot kills counts as Jak's kill (mission kill counters). Side effect: enemies see Jak as their
 ;; attacker. #f = the bot is its own attacker, which is the old behaviour where enemies fought back at the bot.
-(define *blast-bot-credit-jak* #t)
+(define *blast-bot-credit-jak* #t) ;; ATTACK TEST
 ;; #t = the bot's guard-shot is also credited to Jak. Kept separate because crediting shots made the NPCs' own guard shots stop firing.
 ;; not crediting morphgun for kills in arena
 ;; when this is #t and blast-bot-use-morphgun is #f, npcs stop firing. If both are #t, npcs are able to fire again but morphgun still doesn't give credit
@@ -226,14 +226,14 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-god-mode* #f)
 ;; prints every attack event that reaches the bot and what was done with it
 ;; BISECT SWITCHES for the junk-format crash (both came in with ShieldUpdate). #f = old behaviour (MarauderFix).
-(define *blast-bot-touch-attack* #f)   ;; enemy melee via 'touch + prims-touching-action? (logs "Bogus cshape value!")
-(define *blast-bot-hud-shield-bar* #f)  ;; HUD sprites 6-8 + 'heat-ratio poll (came in with ShieldUpdate)
-(defglobalconstant BLAST_BOT_SHIELD_OWNER_ATTACK #f) ;; #t = send-shield-attack override below (ShieldUpdate); #f = stock method
+(define *blast-bot-touch-attack* #t) ;; ATTACK TEST   ;; enemy melee via 'touch + prims-touching-action? (logs "Bogus cshape value!")
+(define *blast-bot-hud-shield-bar* #t)  ;; HUD sprites 6-8 + 'heat-ratio poll (came in with ShieldUpdate)
+(defglobalconstant BLAST_BOT_SHIELD_OWNER_ATTACK #t) ;; ATTACK TEST ;; #t = send-shield-attack override below (ShieldUpdate); #f = stock method
 (define *blast-bot-aggro-on* #t)     ;; MINIMAL TEST: #f = no aggro collider (enemies will ignore the bot)
 (define *blast-bot-shield-spawn* #t) ;; MINIMAL TEST: #f = the shield process is never spawned
 (define *blast-bot-leg-spheres* 3) ;; spheres per leg bone (2 bones per leg). 4 = the old layout (8 per leg, 36 prims total), which produced the junk text; 3 = 6 per leg, 28 prims total
 (define *blast-bot-leg-limbs* 4)  ;; BISECT: how many legs get collision spheres (0..4). Set 0 to test the crash without any leg prims.
-(define *blast-bot-reach-hack* #f)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
+(define *blast-bot-reach-hack* #t)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
 
 (define *blast-bot-attack-debug* #f)
 ;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
@@ -3244,12 +3244,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
   (format 0 "Blast Bot: leg limbs with spheres: ~D~%" *blast-bot-leg-limbs*)
   ;; same constructor + setup as bombbot.gc. The plain collide-shape + (collide-list-enum player) combo printed
   ;; "Unsupported collide-list-enum" and left the shape half-initialised. Enemies find the bot via the aggro shape below.
-  (let ((root (new 'process 'collide-shape-moving self (collide-list-enum usually-hit-by-player))))
-    (set! (-> root dynam) (copy *standard-dynamics* 'process))
-    (set! (-> root reaction) cshape-reaction-default)
-    (set! (-> root no-reaction)
-          (the-as (function collide-shape-moving collide-query vector vector object) nothing)
-          )
+  (let ((root (new 'process 'collide-shape self (collide-list-enum player))))
     ;; 1 group + children: walls sphere, body touch sphere, (2 * *blast-bot-leg-spheres*) spheres per leg, ride sphere
     (let ((group (new 'process 'collide-shape-prim-group root (the-as uint (+ 3 (* (* 2 *blast-bot-leg-spheres*) *blast-bot-leg-limbs*))) 0)))
       (set! (-> root total-prims) (the-as uint (+ 4 (* (* 2 *blast-bot-leg-spheres*) *blast-bot-leg-limbs*))))
