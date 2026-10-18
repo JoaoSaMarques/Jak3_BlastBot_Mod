@@ -1,0 +1,741 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: spydroid-ally.gc
+;; name in dgo: spydroid-ally
+;; dgos: GAME
+
+;; Allied spy droid for the Blast Bot's Plasmite RPG (red weapon 3).
+;;
+;; spydroid-ally is a CHILD of spydroid-orig, so everything not overridden here (models, animations, nav, chase,
+;; circling, the headbutt jump itself, the explode particles) is the stock spydroid-orig code. What it changes:
+;;   1. launch    : spydroid-ally-launch spawns a fan of them (10 by default) in front of the owner.
+;;   2. allied    : they never target Jak, the bot or each other. Every few frames they pick the nearest enemy
+;;                  themselves and hand it to the stock states as the focus.
+;;   3. headbutt  : while the stock attack state has the droid "dangerous" (the jump), enemies in reach get an
+;;                  'attack with mode 'shock, damage *spydroid-ally-damage* (2).
+;;   4. 1 hp      : they die from any hit that gets through, and on death they explode: area damage plus the
+;;                  enemy that killed them is hit directly.
+;;
+;; Needs spydroid-orig.o in the same dgo BEFORE this file (see game.gd notes), and spydroid-orig-ag in the common art.
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Knobs (set from the REPL)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *spydroid-ally-count* 10)               ;; doc: 10 spy droids per shot
+(define *spydroid-ally-max* 20)                 ;; never more than this many alive at once
+(define *spydroid-ally-damage* 2.0)             ;; headbutt shock damage (doc: 2)
+(define *spydroid-ally-boom-damage* 2.0)        ;; damage of the death explosion
+(define *spydroid-ally-boom-radius* 24576.0)    ;; 6 m
+(define *spydroid-ally-reach* 24576.0)          ;; 6 m (+ the target's radius): how close an enemy must be to eat a headbutt
+(define *spydroid-ally-scan-range* 409600.0)    ;; 100 m: how far they look for enemies (was 50 m)
+(define *spydroid-ally-life* 15.0)              ;; seconds before they blow up on their own. 0 = never
+(define *spydroid-ally-child-prims* #f)         ;; #f = leave the two child spheres alone (test), #t = full collision retune
+(define *spydroid-ally-credit-jak* #t)          ;; #t = their kills count as Jak's (mission kill counters), same idea as *blast-bot-credit-jak*
+(define *spydroid-ally-mesh-range* 61440.0)         ;; 15 m: a nav mesh must lie this close to the owner, or nothing is launched
+(define *spydroid-ally-collide-each-other* #t)    ;; #t: droids block / push each other instead of piling up (adds 'bot' to their collide-with)
+;; nav avoidance radius. Stock is 8192 (2 m). It was 12288, but a big radius makes the droids shove each other (and the
+;; target's own nav sphere) out into a ring, so they never reach melee range and circle. Spacing is now done by
+;; spydroid-ally-separate instead.
+(define *spydroid-ally-nav-radius* 8192.0)
+(define *spydroid-ally-sep-dist* 12288.0)         ;; 3 m: droids closer than this (xz) push each other apart
+(define *spydroid-ally-sep-rate* 0.12)            ;; fraction of the overlap removed per frame (0.12 = soft, 0.5 = stiff)
+(define *spydroid-ally-cull-frozen* #f)           ;; #t: a droid that stands still 7+ s is removed quietly (stop-gap, see watchdog)
+;; Types the droids must never target, as quoted names, e.g. (define *spydroid-ally-ignore-types* '(citizen-norm ff-fighter))
+;; Find the names by standing next to the unwanted NPCs and running (blast-bot-whats-near) in the REPL: it prints "NEAR <type> mask #x...".
+(define *spydroid-ally-ignore-types* '(wlander-female wlander-male crimson-guard bombbot-bomb))   ;; from the ally target: log. Add more type names here as they show up
+(define *spydroid-ally-scale* 1.0)                ;; model size multiplier (spydroid-orig is the small crab droid; the city droid is bigger). 1.0 = stock size
+(define *spydroid-ally-debug* #t)                ;; #t: print one droid's state / target every 2 s (set to #f from the REPL to silence)
+(define *spydroid-ally-debug-time* (the-as time-frame 0))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Type
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Scratch memory lives on the global heap, NOT the stack: the bot calls spydroid-ally-launch from deep inside its own
+;; state code and its log line says ":stack 0/512", so every stack struct there risks an overflow.
+(define *spydroid-ally-params* (new 'global 'enemy-init-by-other-params))
+(define *spydroid-ally-fwd* (new 'global 'vector))
+(define *spydroid-ally-pos* (new 'global 'vector))
+
+(deftype spydroid-ally (spydroid-orig)
+  ((owner-handle  handle)
+   (spawn-time    time-frame)
+   (scan-time     time-frame)
+   (hit-time      time-frame)
+   (no-blast      symbol)     ;; #t = the next explode is silent (timeout / owner gone)
+   (dbg-state     symbol)     ;; last state name printed by the state-change log
+   (wd-time       time-frame) ;; watchdog: last check
+   (wd-x          float)      ;; watchdog: position at last check
+   (wd-z          float)
+   (wd-n          int32)      ;; watchdog: consecutive seconds without moving
+   )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Helpers
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun spydroid-ally-attacker ((this spydroid-ally))
+  ;; who the enemies think hit them
+  (if (and *target* *spydroid-ally-credit-jak*)
+      (process->handle *target*)
+      (process->handle this)
+      )
+  )
+
+;; Scratch for every actor scan. The droid's own stack is ":stack 0/256" and a 64-entry collide-shape array alone is 272
+;; bytes, so the old (new 'stack-no-clear 'array 'collide-shape 64) in the droid's methods could overrun it.
+(define *spydroid-ally-find-box* (new 'global 'vector))
+(define *spydroid-ally-find-hits* (new 'global 'array 'collide-shape 128))
+(define *spydroid-ally-hb-box* (new 'global 'vector))
+(define *spydroid-ally-hb-hits* (new 'global 'array 'collide-shape 64))
+(define *spydroid-ally-blast-box* (new 'global 'vector))
+(define *spydroid-ally-blast-hits* (new 'global 'array 'collide-shape 64))
+(define *spydroid-ally-sep-box* (new 'global 'vector))
+(define *spydroid-ally-sep-hits* (new 'global 'array 'collide-shape 64))
+(define *spydroid-ally-scan-box* (new 'global 'vector))
+(define *spydroid-ally-scan-hits* (new 'global 'array 'collide-shape 64))
+(define *spydroid-ally-print-near* #t)           ;; #t: every launch prints what stands near the bot (type + process-mask), to fill *spydroid-ally-ignore-types*
+
+(defun spydroid-ally-print-near ((owner process-drawable))
+  ;; debug: one "ally near:" line per actor within 40 m of the owner. Scratch lives on the global heap (not the stack).
+  (when *spydroid-ally-print-near*
+    (vector-copy! *spydroid-ally-scan-box* (-> owner root trans))
+    (set! (-> *spydroid-ally-scan-box* w) 163840.0)
+    (format 0 "ally near: ---- start ----~%")
+    (countdown (i (fill-actor-list-for-box *actor-hash* *spydroid-ally-scan-box* *spydroid-ally-scan-hits* 64))
+      (let ((cs (as-type (-> *spydroid-ally-scan-hits* i) collide-shape)))
+        (when (and cs (!= (-> cs process) owner))
+          (format 0 "ally near: ~A mask #x~X dist ~M~%"
+                  (-> cs process type)
+                  (-> cs process mask)
+                  (vector-vector-distance (-> owner root trans) (-> cs trans))
+                  )
+          )
+        )
+      )
+    (format 0 "ally near: ---- end ----~%")
+    )
+  (none)
+  )
+
+(defun spydroid-ally-ignored-type? ((p process-focusable))
+  ;; #t if p's type name is in *spydroid-ally-ignore-types* (compared by name, so no compile-time type is needed)
+  (let ((sym (-> p type symbol))
+        (l (the-as object *spydroid-ally-ignore-types*))
+        (hit #f)
+        )
+    ;; the empty list '() is itself a pair in GOAL (its cdr is itself), so the loop must test null?, never pair?
+    (while (and (not (null? l)) (not hit))
+      (if (= (car (the-as pair l)) sym)
+          (set! hit #t)
+          )
+      (set! l (cdr (the-as pair l)))
+      )
+    hit
+    )
+  )
+
+(defun spydroid-ally-valid-target? ((this spydroid-ally) (p process-focusable))
+  ;; same idea as blast-bot-valid-target? minus vehicles, plus "not Jak / not the owner / not another ally"
+  (and p
+       (!= this p)
+       (!= p *target*)
+       (not (type? p spydroid-ally))
+       (!= (handle->process (-> this owner-handle)) p)
+       (not (focus-test? p inactive))
+       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+       (not (logtest? (process-mask crate civilian) (-> p mask)))
+       (not (spydroid-ally-ignored-type? p))
+       (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
+       )
+  )
+
+(defun spydroid-ally-find-target ((this spydroid-ally))
+  ;; nearest valid enemy within *spydroid-ally-scan-range*, or #f (same scan blast-bot-find-lock uses)
+  (let ((best (the-as process-focusable #f))
+        (best-dist 0.0)
+        (box *spydroid-ally-find-box*)
+        (hits *spydroid-ally-find-hits*)
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) *spydroid-ally-scan-range*)
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (spydroid-ally-valid-target? this p)
+              (let ((d (vector-vector-xz-distance (-> this root trans) (-> p root trans))))
+                (when (or (not best) (< d best-dist))
+                  (set! best p)
+                  (set! best-dist d)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    best
+    )
+  )
+
+(defun spydroid-ally-retarget ((this spydroid-ally))
+  ;; Overwrites the stock focus. Runs after the stock enemy-common-post, so whatever update-focus just picked
+  ;; (normally Jak) is replaced before any state sees it.
+  (let* ((old-p (handle->process (-> this focus handle)))
+         (cur (as-type old-p process-focusable))
+         )
+    (if (not (spydroid-ally-valid-target? this cur))
+        (set! cur #f)
+        )
+    ;; the stock attack state sets lock-focus: don't swap targets mid-jump
+    (when (and (not (logtest? (-> this enemy-flags) (enemy-flag lock-focus)))
+               (time-elapsed? (-> this scan-time) (seconds 0.4))
+               )
+      (set-time! (-> this scan-time))
+      (let ((best (spydroid-ally-find-target this)))
+        (cond
+          ((not cur)
+           (set! cur best)
+           )
+          ;; hysteresis: only swap if the new one is at least 1.5x closer, so they stop dithering between enemies
+          ((and best
+                (!= best cur)
+                (< (* 1.5 (vector-vector-xz-distance (-> this root trans) (-> best root trans)))
+                   (vector-vector-xz-distance (-> this root trans) (-> cur root trans))
+                   )
+                )
+           (set! cur best)
+           )
+          )
+        )
+      )
+    (cond
+      (cur
+        (when (and *spydroid-ally-debug* (!= cur old-p))
+          (format 0 "ally target: ~A mask #x~X~%" (-> cur type) (-> cur mask))
+          )
+        (set! (-> this focus handle) (process->handle cur))
+        (set! (-> this focus aware) (enemy-aware hostile))
+        )
+      (else
+        (set! (-> this focus handle) (the-as handle #f))
+        (set! (-> this focus aware) (the-as enemy-aware 0))
+        )
+      )
+    )
+  (none)
+  )
+
+(defun spydroid-ally-headbutt-update ((this spydroid-ally))
+  ;; The stock attack state marks the droid "dangerous" for the airborne part of the jump. During that window every
+  ;; enemy in reach gets a shock. attack-id is set fresh by the attack state, so an enemy ignores repeat hits of one jump.
+  (when (and (logtest? (-> this focus-status) (focus-status dangerous))
+             (time-elapsed? (-> this hit-time) (seconds 0.1))
+             )
+    (let ((box *spydroid-ally-hb-box*)
+          (hits *spydroid-ally-hb-hits*)
+          )
+      (vector-copy! box (-> this root trans))
+      (set! (-> box w) 81920.0)
+      (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+        (let ((cs (as-type (-> hits i) collide-shape)))
+          (when cs
+            (let ((p (as-type (-> cs process) process-focusable)))
+              (when (and (spydroid-ally-valid-target? this p)
+                         ;; reach is measured to the target's edge, not its centre: big enemies are wider than the reach
+                         (< (vector-vector-xz-distance (-> this root trans) (-> p root trans)) (+ *spydroid-ally-reach* (-> p root nav-radius)))
+                         (< (fabs (- (-> p root trans y) (-> this root trans y))) 16384.0)
+                         )
+                (set-time! (-> this hit-time))
+                (send-event p 'attack #f
+                            (static-attack-info :mask (vehicle-impulse-factor) ((id (-> this attack-id))
+                                                                                (damage *spydroid-ally-damage*)
+                                                                                (vehicle-damage-factor 1.0)
+                                                                                (vehicle-impulse-factor 1.0)
+                                                                                (mode 'shock)
+                                                                                (attacker (spydroid-ally-attacker this))
+                                                                                )
+                                                )
+                            )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun spydroid-ally-blast ((this spydroid-ally))
+  ;; Death explosion (the particles / joint-exploder come from the stock explode state).
+  ;; 1. everything valid within *spydroid-ally-boom-radius* takes *spydroid-ally-boom-damage*
+  ;; 2. the enemy that killed the droid is hit directly, wherever it stands
+  (when (not (-> this no-blast))
+    (let ((box *spydroid-ally-blast-box*)
+          (hits *spydroid-ally-blast-hits*)
+          (atk-id (new-attack-id))
+          (killer (as-type (handle->process (-> this incoming attacker-handle)) process-focusable))
+          )
+      (vector-copy! box (-> this root trans))
+      (set! (-> box w) *spydroid-ally-boom-radius*)
+      (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+        (let ((cs (as-type (-> hits i) collide-shape)))
+          (when cs
+            (let ((p (as-type (-> cs process) process-focusable)))
+              (when (and (spydroid-ally-valid-target? this p)
+                         (< (vector-vector-distance (-> this root trans) (-> p root trans)) *spydroid-ally-boom-radius*)
+                         )
+                (send-event p 'attack #f
+                            (static-attack-info :mask (vehicle-impulse-factor) ((id atk-id)
+                                                                                (damage *spydroid-ally-boom-damage*)
+                                                                                (vehicle-damage-factor 1.0)
+                                                                                (vehicle-impulse-factor 1.0)
+                                                                                (mode 'explode)
+                                                                                (attacker (spydroid-ally-attacker this))
+                                                                                )
+                                                )
+                            )
+                )
+              )
+            )
+          )
+        )
+      (when (spydroid-ally-valid-target? this killer)
+        (send-event killer 'attack #f
+                    (static-attack-info :mask (vehicle-impulse-factor) ((id atk-id)
+                                                                        (damage *spydroid-ally-boom-damage*)
+                                                                        (vehicle-damage-factor 1.0)
+                                                                        (vehicle-impulse-factor 1.0)
+                                                                        (mode 'explode)
+                                                                        (attacker (spydroid-ally-attacker this))
+                                                                        )
+                                        )
+                    )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun spydroid-ally-separate ((this spydroid-ally))
+  ;; Soft push-apart. Collision between droids was not enough (they still sank into each other), so every droid nudges
+  ;; itself away from any other droid closer than *spydroid-ally-sep-dist* (xz). Skipped mid-jump so the headbutt arc is untouched.
+  (when (and (not (logtest? (-> this enemy-flags) (enemy-flag lock-focus)))
+             (not (logtest? (-> this focus-status) (focus-status dangerous)))
+             )
+    (let ((box *spydroid-ally-sep-box*)
+          (hits *spydroid-ally-sep-hits*)
+          )
+      (vector-copy! box (-> this root trans))
+      (set! (-> box w) *spydroid-ally-sep-dist*)
+      (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+        (let ((cs (as-type (-> hits i) collide-shape)))
+          (when cs
+            (let ((o (as-type (-> cs process) spydroid-ally)))
+              (when (and o (!= o this))
+                (let* ((dx (- (-> this root trans x) (-> o root trans x)))
+                       (dz (- (-> this root trans z) (-> o root trans z)))
+                       (d (sqrtf (+ (* dx dx) (* dz dz))))
+                       )
+                  (when (< d *spydroid-ally-sep-dist*)
+                    (let ((shove (* *spydroid-ally-sep-rate* (- *spydroid-ally-sep-dist* d))))
+                      (if (< d 64.0)
+                          ;; exactly on top of each other: no direction, so pick one from the addresses
+                          (+! (-> this root trans x) (if (< (the-as int this) (the-as int o)) shove (- shove)))
+                          (begin
+                            (+! (-> this root trans x) (* shove (/ dx d)))
+                            (+! (-> this root trans z) (* shove (/ dz d)))
+                            )
+                          )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun spydroid-ally-describe ((this spydroid-ally))
+  ;; one droid, a few short lines (format takes at most 8 args)
+  (format 0 "ally D #x~X state ~A aware ~D~%" (the-as int this) (if (-> this state) (-> this state name) #f) (the-as int (-> this focus aware)))
+  (format 0 "ally D   target ~A pos ~M ~M ~M~%" (handle->process (-> this focus handle)) (-> this root trans x) (-> this root trans y) (-> this root trans z))
+  (format 0 "ally D   pmask #x~X fstat #x~X eflags #x~X~%" (the-as int (-> this mask)) (the-as int (-> this focus-status)) (the-as int (-> this enemy-flags)))
+  (format 0 "ally D   coll-as #x~X coll-with #x~X~%" (the-as int (-> this root root-prim prim-core collide-as)) (the-as int (-> this root root-prim prim-core collide-with)))
+  (none)
+  )
+
+(defun spydroid-ally-dump ()
+  ;; REPL: describe every live ally. Run it when you see frozen ones and compare their lines with a working one.
+  (let ((p (-> *entity-pool* child)))
+    (while p
+      (let ((proc (the-as process (-> p 0))))
+        (if (type? proc spydroid-ally)
+            (spydroid-ally-describe (the-as spydroid-ally proc))
+            )
+        )
+      (set! p (-> p 0 brother))
+      )
+    )
+  (none)
+  )
+
+(defun spydroid-ally-watchdog ((this spydroid-ally))
+  ;; once a second: has this droid moved? 4 s still = prints one describe (once); 7 s still + *spydroid-ally-cull-frozen* = removed.
+  (when (time-elapsed? (-> this wd-time) (seconds 1))
+    (set-time! (-> this wd-time))
+    (let* ((dx (- (-> this root trans x) (-> this wd-x)))
+           (dz (- (-> this root trans z) (-> this wd-z)))
+           )
+      (set! (-> this wd-x) (-> this root trans x))
+      (set! (-> this wd-z) (-> this root trans z))
+      (if (< (+ (* dx dx) (* dz dz)) 1048576.0)
+          (+! (-> this wd-n) 1)
+          (set! (-> this wd-n) 0)
+          )
+      )
+    (when (and *spydroid-ally-debug* (= (-> this wd-n) 4))
+      (format 0 "ally WATCHDOG: still for 4 s~%")
+      (spydroid-ally-describe this)
+      )
+    (when (and *spydroid-ally-cull-frozen* (< 6 (-> this wd-n)))
+      (set! (-> this no-blast) #t)
+      (cleanup-for-death this)
+      (deactivate this)
+      )
+    )
+  (none)
+  )
+
+(defun spydroid-ally-update ((this spydroid-ally))
+  ;; runs once per frame at the end of enemy-common-post
+  (cond
+    ((not (handle->process (-> this owner-handle)))
+     ;; the owner (the bot) is gone: vanish quietly, same two calls the stock explode state ends with
+     (set! (-> this no-blast) #t)
+     (cleanup-for-death this)
+     (deactivate this)
+     )
+    ((and (< 0.0 *spydroid-ally-life*)
+          (time-elapsed? (-> this spawn-time) (the int (* *spydroid-ally-life* 300.0)))
+          )
+     ;; timed out: die the normal way (explode state: particles + the area blast). The timer is restarted first so this
+     ;; does not fire again every frame while the explode state plays out.
+     (set-time! (-> this spawn-time))
+     (go-die this)
+     )
+    (else
+      (spydroid-ally-retarget this)
+      (spydroid-ally-headbutt-update this)
+      (spydroid-ally-separate this)
+      (spydroid-ally-watchdog this)
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Overridden methods
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defmethod enemy-common-post ((this spydroid-ally))
+  "Stock post (spydroid-orig), then the ally logic on top."
+  (call-parent-method this)
+  (spydroid-ally-update this)
+  (none)
+  )
+
+(defmethod update-focus ((this spydroid-ally))
+  "Stock focus update, then the ally retarget.
+The stock idle state does NOT run enemy-common-post: its post only calls update-focus and ja-post. So the retarget lives
+here, which every state's post reaches (enemy-common-post calls update-focus as well). The droid leaves idle by itself
+once its aware value is above 1, which is what the retarget sets whenever an enemy is found."
+  (let ((result (call-parent-method this)))
+    (spydroid-ally-retarget this)
+    (let ((st (if (-> this state) (-> this state name) #f)))
+      (when (and *spydroid-ally-debug* (!= st (-> this dbg-state)))
+        (format 0 "ally state: #x~X ~A -> ~A aware ~D target ~A~%"
+                (the-as int this)
+                (-> this dbg-state)
+                st
+                (the-as int (-> this focus aware))
+                (handle->process (-> this focus handle))
+                )
+        (set! (-> this dbg-state) st)
+        )
+      )
+    (when (and *spydroid-ally-debug* (time-elapsed? *spydroid-ally-debug-time* (seconds 2)))
+      (set-time! *spydroid-ally-debug-time*)
+      (format 0 "ally dbg: state ~A aware ~D focus ~A~%"
+              (if (-> this state) (-> this state name) #f)
+              (the-as int (-> this focus aware))
+              (handle->process (-> this focus handle))
+              )
+      )
+    result
+    )
+  )
+
+(defmethod init-enemy-collision! ((this spydroid-ally))
+  "Same shapes as spydroid-orig, retuned: they are 'bot' (so enemy shots can kill them), they do not collide with or
+hurt Jak / the bot, and the 'deadly' sphere is switched off (the headbutt damage is sent by spydroid-ally-headbutt-update)."
+  (call-parent-method this)
+  (let* ((cs (-> this root))
+         (grp (the-as collide-shape-prim-group (-> cs root-prim)))
+         )
+    (set! (-> grp prim-core collide-as) (collide-spec bot))
+    (set! (-> grp prim-core collide-with)
+          (if *spydroid-ally-collide-each-other*
+              (collide-spec backgnd obstacle hit-by-others-list bot)
+              (collide-spec backgnd obstacle hit-by-others-list)
+              )
+          )
+    (set! (-> grp prim-core action) (collide-action solid))
+    (when *spydroid-ally-child-prims*
+      (let ((deadly (-> grp child 0))
+            (body (-> grp child 1))
+            )
+        (set! (-> deadly prim-core collide-as) (collide-spec))
+        (set! (-> deadly prim-core collide-with) (collide-spec))
+        (set! (-> body prim-core collide-as) (collide-spec bot))
+        (set! (-> body prim-core collide-with)
+              (if *spydroid-ally-collide-each-other*
+                  (collide-spec backgnd obstacle hit-by-others-list bot)
+                  (collide-spec backgnd obstacle hit-by-others-list)
+                  )
+              )
+        )
+      )
+    (set! (-> cs nav-radius) *spydroid-ally-nav-radius*)
+    ;; the leaf spheres do the real colliding, and *spydroid-ally-child-prims* leaves them alone, so give the solid body
+    ;; sphere (child 1) the 'bot' bit on both sides: two droids then see each other and push apart.
+    ;; (side effect: enemy shots that hit 'bot' things can now hit the droids too)
+    (when *spydroid-ally-collide-each-other*
+      (let ((body (-> grp child 1)))
+        (logior! (-> body prim-core collide-as) (collide-spec bot))
+        (logior! (-> body prim-core collide-with) (collide-spec bot))
+        )
+      )
+    (set! (-> cs backup-collide-as) (-> grp prim-core collide-as))
+    (set! (-> cs backup-collide-with) (-> grp prim-core collide-with))
+    )
+  0
+  (none)
+  )
+
+(defmethod init-enemy! ((this spydroid-ally))
+  "Stock init, then: 1 hp, no notice distance, enemy shots can hurt it, and the stock target search finds nothing."
+  (format 0 "ally: init-enemy! start~%")
+  (call-parent-method this)
+  (format 0 "ally: stock init-enemy! returned~%")
+  (set-vector! (-> this root scale) *spydroid-ally-scale* *spydroid-ally-scale* *spydroid-ally-scale* 1.0)
+  (set! (-> this hit-points) 1.0)               ;; hero mode would double it, the doc says 1
+  (set! (-> this owner-handle) (the-as handle #f))
+  (set-time! (-> this spawn-time))
+  (set-time! (-> this scan-time))
+  (set-time! (-> this hit-time))
+  (set! (-> this no-blast) #f)
+  (set! (-> this dbg-state) #f)
+  (set-time! (-> this wd-time))
+  (set! (-> this wd-x) (-> this root trans x))
+  (set! (-> this wd-z) (-> this root trans z))
+  (set! (-> this wd-n) 0)
+  (logclear! (-> this enemy-flags) (enemy-flag use-notice-distance))
+  ;; setup-enemy! (run by the parent) just rebuilt penetrated-by, so add after it
+  (logior! (-> this root penetrated-by) (penetrate enemy-yellow-shot enemy-dark-shot explode))
+  ;; empty focus mask: the stock update-focus can no longer pick Jak. spydroid-ally-retarget sets the focus instead.
+  (reset-to-collide-spec (-> this focus) (the-as collide-spec 0))
+  (format 0 "ally: init-enemy! done~%")
+  0
+  (none)
+  )
+
+(defstate explode (spydroid-ally)
+  :virtual #t
+  :enter (behavior ()
+    (let ((t9-0 (-> (method-of-type spydroid-orig explode) enter)))
+      (if t9-0
+          (t9-0)
+          )
+      )
+    (spydroid-ally-blast self)
+    )
+  )
+
+(defstate active (spydroid-ally)
+  :virtual #t
+  :enter (behavior ()
+    ;; The stock 'active' state (reached when a droid loses its target: hostile/circling -> active) ends in
+    ;; process-drawable-art-error for an entity-less droid, which freezes it dead (no animation, no collision, no targeting).
+    ;; Park in idle instead: the retarget in update-focus wakes it up again as soon as an enemy shows up.
+    (go-virtual idle)
+    )
+  )
+
+(defstate hostile (spydroid-ally)
+  :virtual #t
+  :trans (behavior ()
+    (let ((t9-0 (-> (method-of-type spydroid-orig hostile) trans)))
+      (if t9-0
+          (t9-0)
+          )
+      )
+    ;; The stock hostile state only starts the headbutt when the target's CENTRE is within 4 m. A big enemy (or one whose
+    ;; nav sphere keeps the droid out) never gets that close, so the droid just walked around it. Count the target's radius.
+    (let ((p (as-type (handle->process (-> self focus handle)) process-focusable)))
+      (when (and p
+                 (time-elapsed? (-> self state-time) (-> self reaction-time))
+                 (< (vector-vector-xz-distance-squared (get-trans p 0) (-> self root trans))
+                    (square (+ 16384.0 (-> p root nav-radius)))
+                    )
+                 )
+        (go-virtual attack)
+        )
+      )
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Spawning
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun spydroid-ally-count ()
+  ;; how many are alive. They are spawned under *entity-pool*, so walk its children like blast-bot-find does.
+  (let ((n 0)
+        (p (-> *entity-pool* child))
+        )
+    (while p
+      (if (type? (-> p 0) spydroid-ally)
+          (+! n 1)
+          )
+      (set! p (-> p 0 brother))
+      )
+    n
+    )
+  )
+
+(defun spydroid-ally-prepare-mesh ((owner process-drawable))
+  ;; The stock droid asks for a nav mesh in setup-enemy! and normally finds it through its level entity. Spawned from code
+  ;; it has no entity, so it fell into process-drawable-art-error. Fix: find the mesh that covers the owner and put it
+  ;; in the droid's enemy-info, which is what setup-enemy! hands to get-nav-control. Returns #f if there is none.
+  (let ((mesh (find-nearest-nav-mesh (-> owner root trans) *spydroid-ally-mesh-range*)))
+    (cond
+      (mesh
+        (set! (-> *spydroid-orig-nav-enemy-info* nav-mesh) mesh)
+        (format 0 "ally: nav mesh found~%")
+        #t
+        )
+      (else
+        (format 0 "Spydroid ally: no nav mesh near the bot, nothing launched (range ~f m)~%" (* 0.000244140625 *spydroid-ally-mesh-range*))
+        #f
+        )
+      )
+    )
+  )
+
+(defun spydroid-ally-spawn ((owner process-drawable) (pos vector) (angle float))
+  ;; enemy-init-by-other reads every field. art-level and entity MUST be #f, otherwise it
+  ;; runs level-get / process-entity-set! on garbage. (params is a reused global, see the top of the file)
+  (let ((params *spydroid-ally-params*))
+    (vector-copy! (-> params trans) pos)
+    (quaternion-identity! (-> params quat))
+    (quaternion-rotate-y! (-> params quat) (-> params quat) angle)
+    (set! (-> params entity) (the-as entity #f))
+    (set! (-> params art-level) #f)
+    (set! (-> params directed?) #f)
+    (set! (-> params no-initial-move-to-ground?) #f)
+    (format 0 "ally: before process-spawn~%")
+    (let ((spawned (process-spawn spydroid-ally
+                                  :init enemy-init-by-other owner params
+                                  :name "spydroid-ally"
+                                  :to *entity-pool*
+                                  )
+                   )
+          )
+      (when spawned
+        (set! (-> (the-as spydroid-ally (ppointer->process spawned)) owner-handle) (process->handle owner))
+        )
+      (format 0 "ally: after process-spawn~%")
+      (format 0 "ally: spawned process = ~A~%" (if spawned (ppointer->process spawned) #f))
+      (format 0 "ally: next state = ~A~%" (if (and spawned (-> (ppointer->process spawned) next-state)) (-> (ppointer->process spawned) next-state name) #f))
+      (format 0 "ally: spawn pos (meters) ~f ~f ~f~%" (* 0.000244140625 (-> pos x)) (* 0.000244140625 (-> pos y)) (* 0.000244140625 (-> pos z)))
+      )
+    )
+  (none)
+  )
+
+(defun spydroid-ally-launch ((owner process-drawable))
+  ;; Plasmite RPG: a fan of *spydroid-ally-count* droids, 10 m out in front of the owner (alternating 10 / 12 m so
+  ;; they don't stand shoulder to shoulder), each one facing outward. Returns how many were spawned.
+  (format 0 "ally: launch start~%")
+  (spydroid-ally-print-near owner)
+  (let* ((alive (spydroid-ally-count))
+         (n (min *spydroid-ally-count* (- *spydroid-ally-max* alive)))
+         (face (quaternion-y-angle (-> owner root quat)))
+         (fwd *spydroid-ally-fwd*)
+         (pos *spydroid-ally-pos*)
+         )
+    (format 0 "ally: alive ~D, spawning ~D~%" alive n)
+    (if (and (< 0 n) (not (spydroid-ally-prepare-mesh owner)))
+        (set! n 0)
+        )
+    (when (< 0 n)
+      (dotimes (i n)
+        (let ((off (* (- (the float i) (* 0.5 (the float (- n 1)))) (degrees 12.0)))
+              (r (+ 40960.0 (* 8192.0 (the float (logand i 1)))))
+              )
+          (set-vector! fwd 0.0 0.0 r 1.0)
+          (vector-rotate-around-y! fwd fwd (+ face off))
+          (vector+! pos (-> owner root trans) fwd)
+          (format 0 "ally: spawn ~D~%" i)
+          (spydroid-ally-spawn owner pos (+ face off))
+          )
+        )
+      )
+    (format 0 "Spydroid ally: launched ~D~%" n)
+    n
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; REPL helpers
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun spydroid-ally-test ()
+  ;; launches them from Jak (or from the bot if you have your own helper that returns it)
+  (if *target*
+      (spydroid-ally-launch *target*)
+      0
+      )
+  )
+
+(defun spydroid-ally-clear ()
+  ;; removes every ally, quietly
+  (let ((p (-> *entity-pool* child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (proc (the-as process (-> p 0)))
+            )
+        (when (type? proc spydroid-ally)
+          (set! (-> (the-as spydroid-ally proc) no-blast) #t)
+          (cleanup-for-death (the-as spydroid-ally proc))
+          (deactivate proc)
+          )
+        (set! p next)
+        )
+      )
+    )
+  (none)
+  )
+
+;; load check: this line must show in the console while the game boots (before any "Blast Bot:" line)
+(format 0 "spydroid-ally.gc loaded~%")

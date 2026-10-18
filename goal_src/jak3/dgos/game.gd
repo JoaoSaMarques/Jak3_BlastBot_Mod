@@ -497,7 +497,10 @@
   "shield-sphere.o"
   "entity-debug.o" ;; added
   "mod-settings.o" ;; added ;;mod-base-change
+  "spydroid-orig.o" ;; added - stock droid code, needed by spydroid-ally (normally only in SEA / FACTORYA)
+  "spydroid-ally.o" ;; added - allied droids for the Plasmite RPG (must be after spydroid-orig.o, before mod-common-functions.o)
   "mod-common-functions.o" ;; added
+  "blastbot_guns.o" ;; added - Blast Bot weapons (must be after mod-common-functions.o, which it needs for the blast-bot-player type)
   "orb-placer.o"  ;; added
   "mod-custom-code.o" ;; added
   "path-editor-h.o" ;; added - path-editor-h
