@@ -499,6 +499,7 @@
   "mod-settings.o" ;; added ;;mod-base-change
   "spydroid-orig.o" ;; added - stock droid code, needed by spydroid-ally (normally only in SEA / FACTORYA)
   "spydroid-ally.o" ;; added - allied droids for the Plasmite RPG (must be after spydroid-orig.o, before mod-common-functions.o)
+  "sentinel-ally.o" ;; added - sentinel turrets for the Gyro Burster (must be after spydroid-ally.o, before mod-common-functions.o)
   "mod-common-functions.o" ;; added
   "blastbot_guns.o" ;; added - Blast Bot weapons (must be after mod-common-functions.o, which it needs for the blast-bot-player type)
   "orb-placer.o"  ;; added
@@ -509,8 +510,8 @@
     "tpage-1320.go"
     "tpage-2384.go"
     "bombbot-ag.go"
-    "bombbot-ag.go"
     "spydroid-orig-ag.go"
+    "kg-flying-turret-ag.go"
     "shield-sphere-ag.go"
     "shield-sphere-distort-ag.go"
     "shield-sphere-explode-ag.go"

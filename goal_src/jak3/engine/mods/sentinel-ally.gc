@@ -1,0 +1,417 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: sentinel-ally.gc
+;; name in dgo: sentinel-ally
+;; dgos: GAME
+
+;; Sentinel allies for the Gyro Burster (Blast Bot, yellow weapon 3): two flying turrets that hover beside the bot and
+;; shoot any enemy they see. They use the model of flying-turret.gc (art group kg-flying-turret) but NOT its code:
+;; flying-turret is a citizen / kg-squad-member that expects the traffic and squad systems, so this is a small
+;; self-contained process instead (same idea as the gun-dark / gun-blue helper processes in the stock game).
+;;
+;; Needs, in game.gd (before mod-common-functions.o, after spydroid-ally.o):
+;;   "sentinel-ally.o"          and, in the art group list at the end:   "kg-flying-turret-ag.go" and "tpage-1244.go"
+;; spydroid-ally.gc must come first: the target filter below reuses its ignore list (*spydroid-ally-ignore-types*).
+;;
+;; v1: the sentinels are invulnerable and vanish after *sentinel-ally-life* seconds. The doc's health (6, 8 with the
+;; upgrade) and the sentinel's own damage (3) are not in yet: the shots are Jak's gun-yellow-shot, so they deal its damage.
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Knobs (change from the REPL, no rebuild needed)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *sentinel-ally-count* 2)                 ;; how many one Gyro Burster use spawns
+(define *sentinel-ally-life* 30.0)               ;; seconds before they leave. 0 = they stay until the bot is gone
+(define *sentinel-ally-fire-gap* 0.5)            ;; seconds between shots (each sentinel)
+(define *sentinel-ally-range* 245760.0)          ;; 60 m: shoot enemies up to this far from the sentinel
+(define *sentinel-ally-scan-range* 245760.0)     ;; 60 m: how far they look for enemies, measured from the sentinel
+(define *sentinel-ally-side* 28672.0)            ;; 7 m left / right of the bot
+(define *sentinel-ally-back* 8192.0)             ;; 2 m behind the bot
+(define *sentinel-ally-height* 32768.0)          ;; 8 m above the bot's position
+(define *sentinel-ally-follow-rate* 3.0)         ;; how snappily they follow (higher = tighter)
+(define *sentinel-ally-scale* 2.0)               ;; model size, the stock turret is drawn at 2.0
+(define *sentinel-ally-credit-jak* #t)           ;; #t: their kills count as Jak's
+;; Invisible model test: the turret's textures live in a different tpage than the droids', so the model can draw as nothing.
+;; -1 = use the texture level compiled into skel-sentinel-ally below (10, the common level the bombbot and the gun models use).
+;; To test others from the REPL: (set! *sentinel-ally-texture-level* 0), launch again, and try 1, 2 ...
+(define *sentinel-ally-texture-level* -1)
+(define *sentinel-ally-debug* #t)                ;; #t: print spawn / state / target / shoot lines (set to #f once they work)
+(define *sentinel-ally-status-time* (the-as time-frame 0))
+
+;; Scratch memory is global, never on the stack: these run inside process code with a small stack.
+(define *sentinel-ally-find-box* (new 'global 'vector))
+(define *sentinel-ally-find-hits* (new 'global 'array 'collide-shape 128))
+(define *sentinel-ally-params* (new 'global 'projectile-init-by-other-params))
+(define *sentinel-ally-want* (new 'global 'vector))
+(define *sentinel-ally-aim* (new 'global 'vector))
+(define *sentinel-ally-start* (new 'global 'vector))
+(define *sentinel-ally-pos* (new 'global 'vector))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Type
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defskelgroup skel-sentinel-ally kg-flying-turret kg-flying-turret-lod0-jg kg-flying-turret-idle-ja
+              ((kg-flying-turret-lod0-mg (meters 999999)))
+              :bounds (static-spherem 0 0 0 4)
+              :texture-level 10
+              )
+
+(deftype sentinel-ally (process-drawable)
+  ((owner-handle   handle)      ;; the bot that launched it
+   (target-handle  handle)      ;; the enemy it is shooting at
+   (spawn-time     time-frame)
+   (scan-time      time-frame)
+   (fire-time      time-frame)
+   (slot           int32)       ;; 0 = left of the bot, 1 = right
+   (bob-phase      float)       ;; 0..1 hover bob, in turns
+   )
+  (:state-methods
+    active
+    die
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Targeting (same rules as spydroid-ally, minus the droid-only parts)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun sentinel-ally-valid-target? ((this sentinel-ally) (p process-focusable))
+  (and p
+       (!= p *target*)
+       (not (type? p spydroid-ally))
+       (not (type? p sentinel-ally))
+       (!= (handle->process (-> this owner-handle)) p)
+       (not (focus-test? p inactive))
+       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+       (not (logtest? (process-mask crate civilian) (-> p mask)))
+       (not (spydroid-ally-ignored-type? p))
+       (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
+       )
+  )
+
+(defun sentinel-ally-find-target ((this sentinel-ally))
+  ;; nearest valid enemy within *sentinel-ally-scan-range* of this sentinel, or #f
+  (let ((best (the-as process-focusable #f))
+        (best-dist 0.0)
+        (box *sentinel-ally-find-box*)
+        (hits *sentinel-ally-find-hits*)
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) *sentinel-ally-scan-range*)
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (sentinel-ally-valid-target? this p)
+              (let ((d (vector-vector-distance (-> this root trans) (-> p root trans))))
+                (when (or (not best) (< d best-dist))
+                  (set! best p)
+                  (set! best-dist d)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    best
+    )
+  )
+
+(defun sentinel-ally-retarget ((this sentinel-ally))
+  (let ((cur (as-type (handle->process (-> this target-handle)) process-focusable)))
+    (if (not (sentinel-ally-valid-target? this cur))
+        (set! cur #f)
+        )
+    (when (time-elapsed? (-> this scan-time) (seconds 0.4))
+      (set-time! (-> this scan-time))
+      (let ((best (sentinel-ally-find-target this)))
+        (cond
+          ((not cur)
+           (set! cur best)
+           )
+          ;; keep the current enemy unless a clearly closer one shows up
+          ((and best
+                (!= best cur)
+                (< (* 1.5 (vector-vector-distance (-> this root trans) (-> best root trans)))
+                   (vector-vector-distance (-> this root trans) (-> cur root trans))
+                   )
+                )
+           (set! cur best)
+           )
+          )
+        )
+      )
+    (when (and *sentinel-ally-debug* cur (!= (process->handle cur) (-> this target-handle)))
+      (format 0 "sentinel: target ~A~%" (-> cur type))
+      )
+    (set! (-> this target-handle) (if cur
+                                      (process->handle cur)
+                                      (the-as handle #f)
+                                      )
+          )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Movement and shooting
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun sentinel-ally-follow ((this sentinel-ally) (owner process-drawable))
+  ;; hover at a spot beside the owner (left or right by slot), bobbing a little
+  (let ((want *sentinel-ally-want*)
+        (face (quaternion-y-angle (-> owner root quat)))
+        (side (if (zero? (-> this slot))
+                  (- *sentinel-ally-side*)
+                  *sentinel-ally-side*
+                  )
+              )
+        (k (fmin 1.0 (* *sentinel-ally-follow-rate* (seconds-per-frame))))
+        )
+    (+! (-> this bob-phase) (* 0.6 (seconds-per-frame)))
+    (set-vector! want side 0.0 (- *sentinel-ally-back*) 1.0)
+    (vector-rotate-around-y! want want face)
+    (vector+! want want (-> owner root trans))
+    (+! (-> want y) (+ *sentinel-ally-height* (* 2048.0 (sin (* 65536.0 (-> this bob-phase))))))
+    (+! (-> this root trans x) (* k (- (-> want x) (-> this root trans x))))
+    (+! (-> this root trans y) (* k (- (-> want y) (-> this root trans y))))
+    (+! (-> this root trans z) (* k (- (-> want z) (-> this root trans z))))
+    )
+  (none)
+  )
+
+(defun sentinel-ally-shoot ((this sentinel-ally) (owner process-drawable) (dir vector))
+  ;; one gun-yellow-shot (Jak's own Blaster shot) from just in front of the sentinel along dir
+  (let ((params *sentinel-ally-params*)
+        (start *sentinel-ally-start*)
+        )
+    (vector-normalize-copy! start dir 8192.0)
+    (vector+! start start (-> this root trans))
+    (set! (-> params ent) (the-as entity #f))
+    (set! (-> params charge) 1.0)
+    (set! (-> params options) (projectile-options po17))
+    (logclear! (-> params options) (projectile-options po14 po15 po16))
+    (vector-copy! (-> params pos) start)
+    (vector-normalize-copy! (-> params vel) dir 819200.0)
+    (set! (-> params notify-handle) (the-as handle #f))
+    (set! (-> params owner-handle)
+          (if (and *target* *sentinel-ally-credit-jak*)
+              (process->handle *target*)
+              (process->handle this)
+              )
+          )
+    (set! (-> params target-handle) (the-as handle #f))
+    (set! (-> params target-pos quad) (the-as uint128 0))
+    (set! (-> params ignore-handle) (process->handle owner))
+    (let* ((v1 *game-info*)
+           (id (+ (-> v1 attack-id) 1))
+           )
+      (set! (-> v1 attack-id) id)
+      (set! (-> params attack-id) id)
+      )
+    (set! (-> params timeout) (seconds 4))
+    ;; the owner (the bot) is the parent, the same combination blast-bot-fire-yellow uses
+    (spawn-projectile gun-yellow-shot params owner *default-dead-pool*)
+    )
+  (none)
+  )
+
+(defun sentinel-ally-aim-and-fire ((this sentinel-ally) (owner process-drawable))
+  (let ((p (as-type (handle->process (-> this target-handle)) process-focusable)))
+    (when p
+      (let ((aim *sentinel-ally-aim*))
+        (vector-! aim (get-trans p 3) (-> this root trans))
+        (let ((dist (vector-length aim))
+              (want (atan (-> aim x) (-> aim z)))
+              (cur (quaternion-y-angle (-> this root quat)))
+              )
+          ;; turn towards the enemy
+          (quaternion-identity! (-> this root quat))
+          (quaternion-rotate-y! (-> this root quat) (-> this root quat) (deg-seek cur want (* 36408.89 (seconds-per-frame))))
+          (when (and (< dist *sentinel-ally-range*)
+                     (< 0.0 dist)
+                     (time-elapsed? (-> this fire-time) (the int (* 300.0 *sentinel-ally-fire-gap*)))
+                     )
+            (set-time! (-> this fire-time))
+            (if *sentinel-ally-debug*
+                (format 0 "sentinel: shoot~%")
+                )
+            (sentinel-ally-shoot this owner aim)
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun sentinel-ally-update ((this sentinel-ally))
+  ;; once per frame from the active state's :trans
+  (let ((owner (as-type (handle->process (-> this owner-handle)) process-drawable)))
+    (cond
+      ((or (not owner)
+           (and (< 0.0 *sentinel-ally-life*)
+                (time-elapsed? (-> this spawn-time) (the int (* *sentinel-ally-life* 300.0)))
+                )
+           )
+       ;; the bot is gone, or the time is up
+       (if *sentinel-ally-debug*
+           (format 0 "sentinel: leaving (owner ~A)~%" (if owner #t #f))
+           )
+       (go (method-of-object this die))
+       )
+      (else
+        (when (and *sentinel-ally-debug* (time-elapsed? (-> this state-time) (seconds 2)))
+          (set-time! (-> this state-time))
+          (format 0 "sentinel: slot ~D at ~M ~M ~M~%" (-> this slot) (-> this root trans x) (-> this root trans y) (-> this root trans z))
+          (format 0 "sentinel:   draw status #x~X on-screen ~A mgeo ~A~%"
+                  (the-as int (-> this draw status))
+                  (if (logtest? (-> this draw status) (draw-control-status on-screen)) #t #f)
+                  (-> this draw mgeo)
+                  )
+          )
+        (sentinel-ally-follow this owner)
+        (sentinel-ally-retarget this)
+        (sentinel-ally-aim-and-fire this owner)
+        )
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; States and init
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defstate active (sentinel-ally)
+  :virtual #t
+  :enter (behavior ()
+    (set-time! (-> self state-time))
+    (ja-channel-set! 1)
+    (ja :group! (-> self draw art-group data 2) :num! min)
+    )
+  :trans (behavior ()
+    (sentinel-ally-update self)
+    )
+  :code (behavior ()
+    (until #f
+      (ja :num! (loop!))
+      (suspend)
+      )
+    )
+  :post (behavior ()
+    (ja-post)
+    )
+  )
+
+(defstate die (sentinel-ally)
+  :virtual #t
+  :code (behavior ()
+    (deactivate self)
+    )
+  )
+
+(defbehavior sentinel-ally-init-by-other sentinel-ally ((owner process-drawable) (pos vector) (slot int))
+  (format 0 "sentinel: init begin slot ~D~%" slot)
+  (set! (-> self root) (new 'process 'trsqv))
+  (vector-copy! (-> self root trans) pos)
+  (quaternion-identity! (-> self root quat))
+  (set-vector! (-> self root scale) *sentinel-ally-scale* *sentinel-ally-scale* *sentinel-ally-scale* 1.0)
+  (if (>= *sentinel-ally-texture-level* 0)
+      (set! (-> skel-sentinel-ally texture-level) *sentinel-ally-texture-level*)
+      )
+  (initialize-skeleton self skel-sentinel-ally (the-as pair 0))
+  ;; the stock turret sets this too
+  (set! (-> self draw lod-set lod 0 dist) 409600.0)
+  (format 0 "sentinel: skeleton ok (texture level ~D)~%" *sentinel-ally-texture-level*)
+  (set! (-> self owner-handle) (process->handle owner))
+  (set! (-> self target-handle) (the-as handle #f))
+  (set! (-> self slot) slot)
+  (set! (-> self bob-phase) (* 0.5 (the float slot)))
+  (set-time! (-> self spawn-time))
+  (set-time! (-> self scan-time))
+  (set-time! (-> self fire-time))
+  (format 0 "sentinel: init done~%")
+  (go-virtual active)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Launch / clear
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun sentinel-ally-clear ()
+  ;; removes every sentinel
+  (let ((p (-> *entity-pool* child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (proc (the-as process (-> p 0)))
+            )
+        (if (type? proc sentinel-ally)
+            (deactivate proc)
+            )
+        (set! p next)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun sentinel-ally-spawn ((owner process-drawable) (slot int))
+  (let ((pos *sentinel-ally-pos*))
+    (vector-copy! pos (-> owner root trans))
+    (+! (-> pos y) *sentinel-ally-height*)
+    (let ((spawned (process-spawn sentinel-ally
+                                  :init sentinel-ally-init-by-other owner pos slot
+                                  :name "sentinel-ally"
+                                  :to *entity-pool*
+                                  )
+                   )
+          )
+      (format 0 "sentinel: spawn ~D returned ~A~%" slot (if spawned (ppointer->process spawned) #f))
+      )
+    )
+  (none)
+  )
+
+(defun sentinel-ally-launch ((owner process-drawable))
+  ;; Gyro Burster: replaces any sentinels still alive with a fresh set of *sentinel-ally-count*
+  (sentinel-ally-clear)
+  (dotimes (i *sentinel-ally-count*)
+    (sentinel-ally-spawn owner i)
+    )
+  (format 0 "Sentinel ally: launched ~D~%" *sentinel-ally-count*)
+  (none)
+  )
+
+;; REPL: (sentinel-ally-test) launches them from Jak (no bot needed), (sentinel-ally-clear) removes them
+(defun sentinel-ally-test ()
+  (if *target*
+      (sentinel-ally-launch *target*)
+      )
+  (none)
+  )
+
+(defun sentinel-ally-dump ()
+  ;; REPL: lists every live sentinel (address, state, position)
+  (let ((p (-> *entity-pool* child))
+        (n 0)
+        )
+    (while p
+      (let ((proc (the-as process (-> p 0))))
+        (when (type? proc sentinel-ally)
+          (+! n 1)
+          (format 0 "sentinel: ~A state ~A at ~M ~M ~M~%" proc (if (-> proc state) (-> proc state name) #f)
+                  (-> (the-as sentinel-ally proc) root trans x)
+                  (-> (the-as sentinel-ally proc) root trans y)
+                  (-> (the-as sentinel-ally proc) root trans z))
+          )
+        )
+      (set! p (-> p 0 brother))
+      )
+    (format 0 "sentinel: ~D alive~%" n)
+    )
+  (none)
+  )

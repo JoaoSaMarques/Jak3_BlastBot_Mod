@@ -136,7 +136,7 @@
   "rip_streamed_audio": false,
 
   // art groups always available in the common FR3
-  "common_art_groups": ["bombbot-ag", "spydroid-orig-ag", "shield-sphere-ag", "shield-sphere-distort-ag", "shield-sphere-explode-ag"],
+  "common_art_groups": ["bombbot-ag", "kg-flying-turret-ag", "spydroid-orig-ag", "shield-sphere-ag", "shield-sphere-distort-ag", "shield-sphere-explode-ag"],
 
   ////////////////////////////
   // PATCHING OPTIONS

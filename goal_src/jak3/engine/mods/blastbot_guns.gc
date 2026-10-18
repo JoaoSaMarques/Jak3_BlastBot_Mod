@@ -703,7 +703,7 @@
 ;;                  fired one every *blast-bot-reflexor-gap* seconds by blast-bot-yellow-update. The doc's upgrade
 ;;                  "adds ricochet": *blast-bot-reflexor-ricochet* #t swaps them for gun-yellow-shot-2 (Jak's own
 ;;                  bouncing beam shot). Untested, so it is off by default.
-;; Gyro Burster   : not wired up yet, see blast-bot-fire-gyro-burster.
+;; Gyro Burster   : launches two sentinel turrets (sentinel-ally.gc); missiles and the hover guard are not in yet.
 (define *blast-bot-reflexor-bullets* 5)
 (define *blast-bot-reflexor-gap* 0.1)    ;; seconds between the bullets of a burst (0.05 looked like one solid beam)
 (define *blast-bot-reflexor-ricochet* #f)
@@ -745,9 +745,11 @@
   )
 
 (defun blast-bot-fire-gyro-burster ((this blast-bot-player))
-  ;; Doc: launch missiles and spawn two sentinels (+ a hover guard with the upgrade). Not wired up: the sentinel and
-  ;; missile types are not confirmed yet. Uses no heat. Sentinel = flying-turret (flying-turret.gc).
-  (format 0 "Blast Bot: Gyro Burster is not wired up yet (sentinel/missile types unknown), no heat used~%")
+  ;; Doc: launch missiles and spawn two sentinels that help you (+ a hover guard with the upgrade).
+  ;; So far: the two sentinels (sentinel-ally.gc). The missiles (KG RT) and the hover guard are not in yet.
+  (if (blast-bot-heat-try-use 1.0)        ;; one use before overheating
+      (sentinel-ally-launch this)
+      )
   (none)
   )
 
