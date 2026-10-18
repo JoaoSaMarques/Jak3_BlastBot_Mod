@@ -1,0 +1,804 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: blastbot-ordnance.gc
+;; name in dgo: blastbot-ordnance
+;; dgos: GAME
+
+;; The Blast Bot's two "gunship" weapons, rebuilt so they work in EVERY level.
+;;   - Gyro Burster (yellow 3): homing missiles (the KG transport's missile, cty-homing-missile) next to the sentinels.
+;;   - Arc Wielder  (blue 2)  : 4 rotating lasers (the KG transport's spinning laser). They last until they have turned
+;;                              one full 360 degrees, then they switch off.
+;;
+;; protect-gunship.gc itself is only loaded inside LCTYPROT, so its missile process, particles and beam do not exist
+;; anywhere else. This file does not use any of that code:
+;;   - the missile is a small process of its own (same pattern as sentinel-ally.gc) that flies and steers by hand;
+;;   - the beams are drawn with part 2059, the laser pointer beam from mod-common-functions.gc;
+;;   - the explosion is group-gun-dark-shot-hit, the same group the stock missile uses (gun-dark-shot.gc, in GAME).
+;;
+;; WHO GETS HIT: both weapons use ONE target rule, blast-ord-valid-target?, the same rule as spydroid-ally and sentinel-ally:
+;; enemies / metalheads / KG robots only. Civilians, crates, Jak, the bot, the allies and every type listed in
+;; *spydroid-ally-ignore-types* (crimson-guard, the wastelanders, ...) are never aimed at and never damaged, not even by the
+;; blast of a missile that explodes next to them. Add a type name to that list and it applies to everything here too.
+;;
+;; Needs, in game.gd:
+;;   "blastbot-ordnance.o"      after sentinel-ally.o, before mod-common-functions.o
+;;   "cty-homing-missile-ag.go" in the art group list at the end (next to kg-flying-turret-ag.go)
+;; and in jak3_config.jsonc, common_art_groups:  "cty-homing-missile-ag"
+;; (if the model is not there the missiles still fly and explode, you just see the red streak and no model: set
+;; *blast-missile-model* to #f to leave the model out completely)
+;;
+;; Called from blastbot_guns.gc: blast-missile-launch (Gyro Burster), blast-arc-launch / blast-arc-update (Arc Wielder).
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Knobs (change from the REPL, no rebuild needed)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; ---- missiles ----
+(define *blast-missile-count* 6)                 ;; missiles per Gyro Burster use
+(define *blast-missile-free-count* 3)            ;; missiles when there is no enemy to aim at (they fly straight ahead)
+(define *blast-missile-range* 409600.0)          ;; 100 m: how far they look for enemies, measured from the bot
+(define *blast-missile-damage* 4.0)              ;; damage of the blast
+(define *blast-missile-radius* 24576.0)          ;; 6 m blast radius
+(define *blast-missile-hit-dist* 12288.0)        ;; 3 m: closer than this to the target centre and it detonates
+(define *blast-missile-speed-start* 61440.0)     ;; 15 m/s at launch
+(define *blast-missile-speed* 245760.0)          ;; 60 m/s cruise speed
+(define *blast-missile-accel* 307200.0)          ;; how fast it gets there (units/s^2)
+(define *blast-missile-climb-time* 0.4)          ;; seconds they fly straight up and out before they start homing
+(define *blast-missile-turn-rate* 5.0)           ;; homing sharpness (higher = tighter turns)
+(define *blast-missile-life* 5.0)                ;; seconds before a missile detonates on its own
+(define *blast-missile-free-life* 1.5)           ;; same, for the ones without a target
+(define *blast-missile-fan-side* 0.5)            ;; how far the missiles splay sideways when they leave the bot
+(define *blast-missile-spawn-spread* 4096.0)     ;; 1 m: spacing between the launch points
+(define *blast-missile-spawn-height* 24576.0)    ;; 6 m above the bot's position
+(define *blast-missile-scale* 1.0)               ;; model size (the stock gunship missile is 0.8 / 0.8 / 0.9 at 1.0)
+(define *blast-missile-model* #t)                ;; #f = no model, only the streak
+(define *blast-missile-streak* #t)               ;; the red streak behind each missile
+(define *blast-missile-streak-len* 16384.0)      ;; 4 m
+(define *blast-missile-streak-width* 1024.0)     ;; game units (4096 = 1 m), NOT metres: the laser pointer uses 1228.8
+(define *blast-ord-credit-jak* #t)               ;; #t: their kills count as Jak's (same idea as *sentinel-ally-credit-jak*)
+(define *blast-ord-debug* #t)                    ;; #t: print launch / explode lines (set to #f once it works)
+
+;; ---- rotating lasers ----
+(define *blast-arc-beams* 4)                     ;; doc: 4 rotating lasers (the stock ship uses 2 to 4)
+(define *blast-arc-speed* 21845.0)               ;; turn speed in internal angle units per second: 21845 = 120 deg/s = 3 s for a full turn
+(define *blast-arc-length* 245760.0)             ;; 60 m: longest a beam can get (it stops at walls)
+(define *blast-arc-height* 18432.0)              ;; 4.5 m: the lasers leave at "body height" = this far above the bot's position (its hip)
+(define *blast-arc-drop-height* 8192.0)          ;; 2 m: how far they arc down from the start (half of a 4 m leg), then run level
+(define *blast-arc-level-dist* 8192.0)           ;; 2 m: they run level at body height for this far from the start before the arc begins
+(define *blast-arc-drop-dist* 16384.0)           ;; 4 m: how far the arc itself takes to come down (shorter = steeper); flat at the low height after that
+(define *blast-arc-damage* 1.0)                  ;; doc: 1
+(define *blast-arc-pulse-gap* 0.1)               ;; seconds between damage pulses (without this an enemy takes a hit every frame)
+(define *blast-arc-tol-y* 8192.0)                ;; 2 m (+ the enemy's radius): how far above / below the beam an enemy still gets hit
+;; the bolt: a jagged chain of short beam segments, redrawn with new random kinks every frame (crackling lightning).
+;; Two passes per segment: a wide dim glow, then a thin bright core. Widths are in GAME UNITS (4096 = 1 m), NOT metres.
+(define *blast-arc-inner* 6144.0)               ;; 1.5 m: the lasers start this far from the bot's centre, in the direction they point
+(define *blast-arc-seg-len* 6144.0)              ;; 1.5 m per kink: shorter = more detailed bolt, more particles
+(define *blast-arc-segs* 20)                     ;; most segments one bolt may have (4 bolts x 2 passes x this = particles per frame)
+(define *blast-arc-jitter* 3072.0)               ;; 0.75 m: how far the kinks stray sideways (largest mid-bolt, zero at both ends)
+(define *blast-arc-glow-width* 1843.2)           ;; 0.45 m
+(define *blast-arc-glow-r* 0.0)                  ;; glow colour (0..255)
+(define *blast-arc-glow-g* 60.0)
+(define *blast-arc-glow-b* 255.0)
+(define *blast-arc-glow-a* 90.0)
+(define *blast-arc-core-width* 512.0)            ;; 0.125 m
+(define *blast-arc-core-r* 220.0)                ;; core colour: near white with a blue tint
+(define *blast-arc-core-g* 235.0)
+(define *blast-arc-core-b* 255.0)
+(define *blast-arc-core-a* 255.0)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Scratch memory. Global, never on the stack: the bot calls all of this from deep inside its state code.
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *blast-missile-mat* (new 'global 'matrix))
+(define *blast-missile-tmp* (new 'global 'vector))
+(define *blast-missile-tmp2* (new 'global 'vector))
+(define *blast-missile-tail* (new 'global 'vector))
+(define *blast-missile-pos* (new 'global 'vector))
+(define *blast-missile-dir* (new 'global 'vector))
+(define *blast-missile-hitpos* (new 'global 'vector))
+(define *blast-missile-box* (new 'global 'vector))
+(define *blast-missile-hits* (new 'global 'array 'collide-shape 128))
+(define *blast-missile-query* (new 'global 'collide-query))
+
+(define *blast-arc-active* #f)
+(define *blast-arc-angle* 0.0)                   ;; where beam 0 points now (internal angle units, 0..65536)
+(define *blast-arc-swept* 0.0)                   ;; how far the lasers have turned so far (65536 = one full turn)
+(define *blast-arc-acc* 0.0)                     ;; turned since the last damage pulse
+(define *blast-arc-pulse-time* (the-as time-frame 0))
+(define *blast-arc-seen-time* (the-as time-frame 0))   ;; last frame blast-arc-update ran (a stale arc switches itself off)
+(define *blast-arc-debug-time* (the-as time-frame 0))
+(define *blast-arc-start* (new 'global 'vector))
+(define *blast-arc-extent* (new 'global 'vector))
+(define *blast-arc-end* (new 'global 'vector))
+(define *blast-arc-bstart* (new 'global 'vector))
+(define *blast-arc-pdrop* (new 'global 'vector))
+(define *blast-arc-ground-y* -4096000000.0)     ;; ground under the bot, written by the bot every frame (blast-bot-yellow-update)
+(define *blast-arc-y-body* 0.0)                  ;; world height of the lasers at their start (worked out every frame)
+(define *blast-arc-y-low* 0.0)                   ;; world height of the lasers once the arc is down
+(define *blast-arc-prev* (new 'global 'vector))
+(define *blast-arc-cur* (new 'global 'vector))
+(define *blast-arc-seg* (new 'global 'vector))
+(define *blast-arc-box* (new 'global 'vector))
+(define *blast-arc-hits* (new 'global 'array 'collide-shape 128))
+(define *blast-arc-lens* (new 'global 'array 'float 8))
+(define *blast-arc-query* (new 'global 'collide-query))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Shared: who may be hit, who gets the credit
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun blast-ord-valid-target? ((owner process) (p process-focusable))
+  ;; same rule as spydroid-ally-valid-target? / sentinel-ally-valid-target?
+  (and p
+       (!= p *target*)
+       (!= p owner)
+       (not (type? p spydroid-ally))
+       (not (type? p sentinel-ally))
+       (not (focus-test? p inactive))
+       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+       (not (logtest? (process-mask crate civilian) (-> p mask)))
+       (not (spydroid-ally-ignored-type? p))
+       (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
+       )
+  )
+
+(defun blast-ord-attacker ((owner process))
+  ;; who the enemies think hit them
+  (if (and *target* *blast-ord-credit-jak*)
+      (process->handle *target*)
+      (process->handle owner)
+      )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Missiles
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defskelgroup skel-blast-missile cty-homing-missile cty-homing-missile-lod0-jg cty-homing-missile-idle-ja
+              ((cty-homing-missile-lod0-mg (meters 999999)))
+              :bounds (static-spherem 0 0 0 3)
+              :texture-level 10
+              :origin-joint-index 3
+              )
+
+(deftype blast-missile (process-drawable)
+  ((owner-handle   handle)      ;; the bot that launched it
+   (target-handle  handle)      ;; the enemy it chases
+   (spawn-time     time-frame)
+   (fly-dir        vector  :inline)   ;; unit vector, where it is heading
+   (dest-pos       vector  :inline)   ;; last known position of the target
+   (fly-speed      float)
+   (has-target     symbol)
+   (climb-time     float)       ;; seconds of straight flight before it starts to home
+   (max-life       float)       ;; seconds before it detonates by itself
+   )
+  (:state-methods
+    active
+    die
+    )
+  )
+
+(defun blast-missile-explode ((this blast-missile) (pos vector))
+  ;; the blast: the stock missile's own effect, plus damage to every valid enemy inside the radius
+  (vector-copy! (-> *launch-matrix* trans) pos)
+  (if (logtest? (-> group-gun-dark-shot-hit flags) (sp-group-flag sp13))
+      (part-tracker-spawn part-tracker-subsampler :to *entity-pool* :group group-gun-dark-shot-hit)
+      (part-tracker-spawn part-tracker :to *entity-pool* :group group-gun-dark-shot-hit)
+      )
+  (let ((owner (handle->process (-> this owner-handle)))
+        (id (new-attack-id))
+        (box *blast-missile-box*)
+        (hits *blast-missile-hits*)
+        (n 0)
+        )
+    (vector-copy! box pos)
+    (set! (-> box w) (* 2.0 *blast-missile-radius*))
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (and (blast-ord-valid-target? owner p)
+                       (< (vector-vector-distance pos (get-trans p 3)) (+ *blast-missile-radius* 4096.0))
+                       )
+              (+! n 1)
+              (send-event
+                p
+                'attack
+                #f
+                (static-attack-info ((id id)
+                                     (damage *blast-missile-damage*)
+                                     (vehicle-damage-factor 1.0)
+                                     (vehicle-impulse-factor 1.0)
+                                     (attacker (blast-ord-attacker owner))
+                                     )
+                                    )
+                )
+              )
+            )
+          )
+        )
+      )
+    (if *blast-ord-debug*
+        (format 0 "missile: exploded, ~D enemies in the blast~%" n)
+        )
+    )
+  (go (method-of-object this die))
+  (none)
+  )
+
+(defun blast-missile-wall-hit ((this blast-missile) (stp float))
+  ;; #t (and *blast-missile-hitpos* filled in) when this frame's step would cross level geometry
+  (let ((q *blast-missile-query*))
+    (vector-copy! (-> q start-pos) (-> this root trans))
+    (vector-float*! (-> q move-dist) (-> this fly-dir) (+ stp 2048.0))
+    (set! (-> q radius) 409.6)
+    (set! (-> q collide-with) (collide-spec backgnd))
+    (set! (-> q ignore-process0) (handle->process (-> this owner-handle)))
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat)
+          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q action-mask) (collide-action solid))
+    (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+      (when (>= hit 0.0)
+        (vector+float*! *blast-missile-hitpos* (-> q start-pos) (-> q move-dist) hit)
+        )
+      (>= hit 0.0)
+      )
+    )
+  )
+
+(defun blast-missile-streak ((this blast-missile))
+  ;; a red streak behind the missile: the laser pointer's beam part, short and thick
+  (when *blast-missile-streak*
+    (vector+float*! *blast-missile-tail* (-> this root trans) (-> this fly-dir) (- *blast-missile-streak-len*))
+    (vector-float*! *blast-missile-tmp2* (-> this fly-dir) *blast-missile-streak-len*)
+    (set! (-> *part-id-table* 2059 init-specs 5 initial-valuef) 255.0)
+    (set! (-> *part-id-table* 2059 init-specs 7 initial-valuef) 0.0)
+    (set! (-> *part-id-table* 2059 init-specs 3 initial-valuef) *blast-missile-streak-width*)
+    (set! (-> *part-id-table* 2059 init-specs 3 random-rangef) 0.0)
+    (draw-beam (-> *part-id-table* 2059) *blast-missile-tail* *blast-missile-tmp2* #t)
+    )
+  (none)
+  )
+
+(defun blast-missile-update ((this blast-missile))
+  ;; once per frame from the active state's :trans
+  (let* ((dt (seconds-per-frame))
+         (age (/ (the float (- (current-time) (-> this spawn-time))) 300.0))
+         (pos (-> this root trans))
+         (dir (-> this fly-dir))
+         (tmp *blast-missile-tmp*)
+         )
+    ;; follow the target while it is alive; afterwards the missile keeps going to where it died
+    (when (-> this has-target)
+      (let ((p (as-type (handle->process (-> this target-handle)) process-focusable)))
+        (when (and p (not (logtest? (-> p focus-status) (focus-status disable dead))))
+          (vector-copy! (-> this dest-pos) (get-trans p 3))
+          )
+        )
+      )
+    (seek! (-> this fly-speed) *blast-missile-speed* (* *blast-missile-accel* dt))
+    ;; homing: bend the heading towards the target, but only after the climb
+    (when (and (-> this has-target) (< (-> this climb-time) age))
+      (vector-! tmp (-> this dest-pos) pos)
+      (vector-normalize! tmp 1.0)
+      (vector-! tmp tmp dir)
+      (vector-float*! tmp tmp (fmin 1.0 (* *blast-missile-turn-rate* dt)))
+      (vector+! dir dir tmp)
+      (vector-normalize! dir 1.0)
+      )
+    (let ((stp (* (-> this fly-speed) dt)))
+      (cond
+        ((and (< 0.1 age) (blast-missile-wall-hit this stp))
+         (blast-missile-explode this *blast-missile-hitpos*)
+         )
+        (else
+          (vector+float*! pos pos dir stp)
+          (matrix-f-compose *blast-missile-mat* dir)
+          (matrix->quaternion (-> this root quat) *blast-missile-mat*)
+          (blast-missile-streak this)
+          (cond
+            ((and (-> this has-target)
+                  (< (vector-vector-distance pos (-> this dest-pos)) *blast-missile-hit-dist*)
+                  )
+             (blast-missile-explode this pos)
+             )
+            ((< (-> this max-life) age)
+             (blast-missile-explode this pos)
+             )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defstate active (blast-missile)
+  :virtual #t
+  :enter (behavior ()
+    (set-time! (-> self state-time))
+    )
+  :trans (behavior ()
+    (blast-missile-update self)
+    )
+  :code sleep-code
+  :post (behavior ()
+    (if (nonzero? (-> self draw))
+        (ja-post)
+        )
+    )
+  )
+
+(defstate die (blast-missile)
+  :virtual #t
+  :code (behavior ()
+    (deactivate self)
+    )
+  )
+
+(defbehavior blast-missile-init-by-other blast-missile ((owner process-drawable) (pos vector) (dir vector) (target process-focusable) (climb float))
+  (set! (-> self root) (new 'process 'trsqv))
+  (vector-copy! (-> self root trans) pos)
+  (vector-copy! (-> self fly-dir) dir)
+  (vector-normalize! (-> self fly-dir) 1.0)
+  (matrix-f-compose *blast-missile-mat* (-> self fly-dir))
+  (matrix->quaternion (-> self root quat) *blast-missile-mat*)
+  (set-vector! (-> self root scale)
+               (* 0.8 *blast-missile-scale*)
+               (* 0.8 *blast-missile-scale*)
+               (* 0.9 *blast-missile-scale*)
+               1.0)
+  (when *blast-missile-model*
+    (initialize-skeleton self skel-blast-missile (the-as pair 0))
+    )
+  (set! (-> self owner-handle) (process->handle owner))
+  (set! (-> self fly-speed) *blast-missile-speed-start*)
+  (set! (-> self climb-time) climb)
+  (cond
+    (target
+      (set! (-> self has-target) #t)
+      (set! (-> self target-handle) (process->handle target))
+      (vector-copy! (-> self dest-pos) (get-trans target 3))
+      (set! (-> self max-life) *blast-missile-life*)
+      )
+    (else
+      (set! (-> self has-target) #f)
+      (set! (-> self target-handle) (the-as handle #f))
+      (set! (-> self max-life) *blast-missile-free-life*)
+      )
+    )
+  (set-time! (-> self spawn-time))
+  (go-virtual active)
+  )
+
+(defun blast-missile-spawn ((owner process-drawable) (pos vector) (dir vector) (target process-focusable) (climb float))
+  (process-spawn blast-missile
+                 :init blast-missile-init-by-other owner pos dir target climb
+                 :name "blast-missile"
+                 :to *entity-pool*
+                 )
+  (none)
+  )
+
+(defun blast-missile-next-target ((owner process-drawable) (min-d float))
+  ;; the nearest valid enemy that is farther away than min-d (so repeated calls walk outwards through the enemies), or #f
+  (let ((best (the-as process-focusable #f))
+        (best-d 0.0)
+        (box *blast-missile-box*)
+        (hits *blast-missile-hits*)
+        )
+    (vector-copy! box (-> owner root trans))
+    (set! (-> box w) *blast-missile-range*)
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (blast-ord-valid-target? owner p)
+              (let ((d (vector-vector-distance (-> owner root trans) (-> p root trans))))
+                (when (and (< min-d d) (or (not best) (< d best-d)))
+                  (set! best p)
+                  (set! best-d d)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    best
+    )
+  )
+
+(defun blast-missile-fire-one ((owner process-drawable) (face float) (i int) (n int) (target process-focusable))
+  ;; one missile leaves the bot's top, splayed sideways by its number; with a target it climbs first, without it flies ahead
+  (let ((pos *blast-missile-pos*)
+        (dir *blast-missile-dir*)
+        (fan (- (the float i) (* 0.5 (the float (+ n -1)))))
+        )
+    (set-vector! pos (* *blast-missile-spawn-spread* fan) *blast-missile-spawn-height* 0.0 1.0)
+    (vector-rotate-around-y! pos pos face)
+    (vector+! pos pos (-> owner root trans))
+    (if target
+        (set-vector! dir (* *blast-missile-fan-side* fan) 1.0 0.35 1.0)
+        (set-vector! dir (* *blast-missile-fan-side* fan) 0.25 1.0 1.0)
+        )
+    (vector-rotate-around-y! dir dir face)
+    (blast-missile-spawn owner pos dir target (if target *blast-missile-climb-time* 0.0))
+    )
+  (none)
+  )
+
+(defun blast-missile-launch ((owner process-drawable))
+  ;; Gyro Burster: *blast-missile-count* missiles, each on its own enemy (nearest first). With fewer enemies than missiles
+  ;; the enemies are used again, nearest first. No enemy at all: a few missiles fly straight ahead.
+  (let ((count *blast-missile-count*)
+        (spawned 0)
+        (rounds 0)
+        (face (quaternion-y-angle (-> owner root quat)))
+        )
+    (while (and (< spawned count) (< rounds 4))
+      (+! rounds 1)
+      (let ((prev -1.0)
+            (more #t)
+            )
+        (while (and more (< spawned count))
+          (let ((p (blast-missile-next-target owner prev)))
+            (cond
+              (p
+               (set! prev (vector-vector-distance (-> owner root trans) (-> p root trans)))
+               (blast-missile-fire-one owner face spawned count p)
+               (+! spawned 1)
+               )
+              (else
+                (set! more #f)
+                )
+              )
+            )
+          )
+        )
+      (if (zero? spawned)
+          (set! rounds 99)
+          )
+      )
+    (when (zero? spawned)
+      (dotimes (i *blast-missile-free-count*)
+        (blast-missile-fire-one owner face i *blast-missile-free-count* (the-as process-focusable #f))
+        )
+      )
+    (if *blast-ord-debug*
+        (format 0 "missile: launched ~D homing~%" spawned)
+        )
+    )
+  (none)
+  )
+
+(defun blast-missile-clear ()
+  ;; REPL: removes every missile in flight
+  (let ((p (-> *entity-pool* child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (proc (the-as process (-> p 0)))
+            )
+        (if (type? proc blast-missile)
+            (deactivate proc)
+            )
+        (set! p next)
+        )
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Rotating lasers (Arc Wielder)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; No process: the bot calls blast-arc-update every frame (from blast-bot-yellow-update). The lasers turn at
+;; *blast-arc-speed* until the total turn reaches 65536 (one full 360), then they stop. Damage comes in pulses every
+;; *blast-arc-pulse-gap* seconds; a pulse hits every valid enemy that the beams swept over since the last pulse (so a fast turn
+;; cannot jump over somebody), as long as the enemy is inside the beam's length (walls shorten it).
+
+;; The beam part 2059 is shared with the laser pointer, which only ever sets its colour (r, b) and width. Everything else
+;; changed here is put back by blast-arc-style-restore at the end of the frame.
+(defun blast-arc-style ((r float) (g float) (b float) (w float) (a float) (seg-len float))
+  (set! (-> *part-id-table* 2059 init-specs 5 initial-valuef) r)
+  (set! (-> *part-id-table* 2059 init-specs 6 initial-valuef) g)
+  (set! (-> *part-id-table* 2059 init-specs 7 initial-valuef) b)
+  (set! (-> *part-id-table* 2059 init-specs 3 initial-valuef) w)
+  (set! (-> *part-id-table* 2059 init-specs 3 random-rangef) 0.0)
+  (set! (-> *part-id-table* 2059 init-specs 4 initial-valuef) seg-len)
+  (set! (-> *part-id-table* 2059 init-specs 8 initial-valuef) a)
+  (set! (-> *part-id-table* 2059 init-specs 8 random-rangef) 0.0)
+  (none)
+  )
+
+(defun blast-arc-style-restore ()
+  (set! (-> *part-id-table* 2059 init-specs 6 initial-valuef) 0.0)
+  (set! (-> *part-id-table* 2059 init-specs 4 initial-valuef) 163840.0)
+  (set! (-> *part-id-table* 2059 init-specs 8 initial-valuef) 64.0)
+  (set! (-> *part-id-table* 2059 init-specs 8 random-rangef) 32.0)
+  (none)
+  )
+
+(defun blast-arc-y-at ((d float))
+  ;; height of the lasers at horizontal distance d past their start: level at body height for *blast-arc-level-dist*, then a
+  ;; smooth arc (level at both ends) down to the low height over *blast-arc-drop-dist*, level at the low height from there to the end
+  (let ((frac (fmax 0.0 (fmin 1.0 (/ (- d *blast-arc-level-dist*) (fmax 1.0 *blast-arc-drop-dist*))))))
+    (- *blast-arc-y-body* (* (- *blast-arc-y-body* *blast-arc-y-low*) 0.5 (- 1.0 (cos (* 32768.0 frac)))))
+    )
+  )
+
+(defun blast-arc-probe ((this process-drawable) (from vector) (move vector))
+  ;; how far along move (0..1) a line from `from` gets before it hits level geometry, negative if it never does
+  (let ((q *blast-arc-query*))
+    (vector-copy! (-> q start-pos) from)
+    (vector-copy! (-> q move-dist) move)
+    (set! (-> q radius) 40.96)
+    (set! (-> q collide-with) (collide-spec backgnd obstacle pusher))
+    (set! (-> q ignore-process0) this)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat)
+          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q action-mask) (collide-action solid))
+    (fill-and-probe-using-line-sphere *collide-cache* q)
+    )
+  )
+
+(defun blast-arc-draw-bolt ((start vector) (sx float) (cz float) (blen float))
+  ;; one lightning bolt: from start, horizontally along (sx, cz) for blen, following the height profile of blast-arc-y-at.
+  ;; Short segments with random sideways / vertical kinks that are strongest in the middle and zero at both ends, so the
+  ;; bolt stays attached to its two end points.
+  (let* ((n (max 3 (min *blast-arc-segs* (the int (/ blen *blast-arc-seg-len*)))))
+         (prev *blast-arc-prev*)
+         (cur *blast-arc-cur*)
+         (seg *blast-arc-seg*)
+         )
+    (vector-copy! prev start)
+    (dotimes (i n)
+      (let* ((t1 (/ (the float (+ i 1)) (the float n)))
+             (d (* blen t1))
+             (env (sin (* 32768.0 t1)))
+             (side (* *blast-arc-jitter* env (rand-vu-float-range -1.0 1.0)))
+             (lift (* 0.6 *blast-arc-jitter* env (rand-vu-float-range -1.0 1.0)))
+             )
+        (set-vector! cur
+                     (+ (-> start x) (* sx d) (* cz side))
+                     (+ (blast-arc-y-at d) lift)
+                     (+ (-> start z) (* cz d) (* (- sx) side))
+                     1.0)
+        (vector-! seg cur prev)
+        (let ((seg-len (vector-length seg)))
+          (blast-arc-style *blast-arc-glow-r* *blast-arc-glow-g* *blast-arc-glow-b* *blast-arc-glow-width* *blast-arc-glow-a* seg-len)
+          (draw-beam (-> *part-id-table* 2059) prev seg #t)
+          (blast-arc-style *blast-arc-core-r* *blast-arc-core-g* *blast-arc-core-b* *blast-arc-core-width* *blast-arc-core-a* seg-len)
+          (draw-beam (-> *part-id-table* 2059) prev seg #t)
+          )
+        (vector-copy! prev cur)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-arc-launch ((this process-drawable))
+  (set! *blast-arc-active* #t)
+  (set! *blast-arc-angle* (quaternion-y-angle (-> this root quat)))
+  (while (< *blast-arc-angle* 0.0)
+    (set! *blast-arc-angle* (+ *blast-arc-angle* 65536.0))
+    )
+  (while (>= *blast-arc-angle* 65536.0)
+    (set! *blast-arc-angle* (- *blast-arc-angle* 65536.0))
+    )
+  (set! *blast-arc-swept* 0.0)
+  (set! *blast-arc-acc* 0.0)
+  (set-time! *blast-arc-pulse-time*)
+  (set-time! *blast-arc-seen-time*)
+  (set-time! *blast-arc-debug-time*)
+  (if *blast-ord-debug*
+      (format 0 "arc: lasers on~%")
+      )
+  (none)
+  )
+
+(defun blast-arc-hit-test ((this process-drawable) (p process-focusable) (a0 float) (stp float))
+  ;; a0 = where beam 0 pointed at the last pulse, stp = how far it has turned since. Hits p once if any beam passed over it.
+  (let* ((c (get-trans p 3))
+         (rx (- (-> c x) (-> *blast-arc-start* x)))
+         (rz (- (-> c z) (-> *blast-arc-start* z)))
+         (dist (sqrtf (+ (* rx rx) (* rz rz))))
+         (dy (fabs (- (-> c y) (blast-arc-y-at (- dist *blast-arc-inner*)))))
+         (rad (if (-> p root root-prim)
+                  (fmax 2048.0 (fmin 16384.0 (-> p root root-prim prim-core world-sphere w)))
+                  4096.0
+                  )
+              )
+         )
+    (when (and (< dy (+ *blast-arc-tol-y* rad)) (< 1.0 dist) (< *blast-arc-inner* (+ dist rad)))
+      (let ((bearing (atan rx rz))
+            (halfw (atan rad dist))
+            (spacing (/ 65536.0 (the float *blast-arc-beams*)))
+            (hit #f)
+            )
+        (dotimes (k *blast-arc-beams*)
+          (when (and (not hit) (< (- dist rad) (-> *blast-arc-lens* k)))
+            (let ((ak (+ a0 (* spacing (the float k)))))
+              (while (>= ak 65536.0)
+                (set! ak (- ak 65536.0))
+                )
+              (let ((rel (deg- bearing ak)))
+                (when (and (>= rel (- halfw)) (<= rel (+ stp halfw)))
+                  (set! hit #t)
+                  )
+                )
+              )
+            )
+          )
+        (when hit
+          (send-event
+            p
+            'attack
+            #f
+            (static-attack-info ((id (new-attack-id))
+                                 (damage *blast-arc-damage*)
+                                 (vehicle-damage-factor 1.0)
+                                 (vehicle-impulse-factor 1.0)
+                                 (mode 'shock)
+                                 (attacker (blast-ord-attacker this))
+                                 )
+                                )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-arc-update ((this process-drawable))
+  ;; every frame from the bot; does nothing while the lasers are off
+  (when *blast-arc-active*
+    (cond
+      ((time-elapsed? *blast-arc-seen-time* (seconds 0.5))
+       ;; the bot stopped calling us (it died / was replaced): do not resume the old lasers on the next bot
+       (set! *blast-arc-active* #f)
+       (format 0 "arc: not updated for 0.5 s, lasers off~%")
+       )
+      (else
+        (set-time! *blast-arc-seen-time*)
+        (let* ((dt (seconds-per-frame))
+               (stp (fmin (* *blast-arc-speed* dt) (- 65536.0 *blast-arc-swept*)))
+               (a0 *blast-arc-angle*)
+               (a1 (+ a0 stp))
+               (n *blast-arc-beams*)
+               (spacing (/ 65536.0 (the float n)))
+               (start *blast-arc-start*)
+               (extent *blast-arc-extent*)
+               (q *blast-arc-query*)
+               )
+          (vector-copy! start (-> this root trans))
+          ;; heights: body height at the start, and *blast-arc-drop-height* (2 m) below that for the arc's end.
+          ;; Never lower than 0.5 m above the ground under the bot (when the bot knows where the ground is).
+          (let ((ry (-> start y)))
+            (set! *blast-arc-y-body* (+ ry *blast-arc-height*))
+            (set! *blast-arc-y-low* (- *blast-arc-y-body* *blast-arc-drop-height*))
+            (when (< (- ry 61440.0) *blast-arc-ground-y*)
+              (set! *blast-arc-y-low* (fmax *blast-arc-y-low* (+ *blast-arc-ground-y* 2048.0)))
+              )
+            )
+          (set! (-> start y) *blast-arc-y-body*)
+          ;; the lasers: each one starts *blast-arc-inner* (4 m) away from the centre at body height, runs level for
+          ;; *blast-arc-level-dist*, arcs down over *blast-arc-drop-dist*, then runs level to its end. Walls shorten it: the
+          ;; level + arc part is probed as one straight chord, the final level part as a second line.
+          (dotimes (k n)
+            (let ((ak (+ a1 (* spacing (the float k)))))
+              (while (>= ak 65536.0)
+                (set! ak (- ak 65536.0))
+                )
+              (let* ((sx (sin ak))
+                     (cz (cos ak))
+                     (drop (+ *blast-arc-level-dist* *blast-arc-drop-dist*))   ;; where the low level part begins
+                     (bstart *blast-arc-bstart*)
+                     (pdrop *blast-arc-pdrop*)
+                     (blen *blast-arc-length*)
+                     (hit-wall #f)
+                     )
+                (set-vector! bstart
+                             (+ (-> start x) (* *blast-arc-inner* sx))
+                             *blast-arc-y-body*
+                             (+ (-> start z) (* *blast-arc-inner* cz))
+                             1.0)
+                (set-vector! pdrop (+ (-> bstart x) (* drop sx)) *blast-arc-y-low* (+ (-> bstart z) (* drop cz)) 1.0)
+                (vector-! extent pdrop bstart)
+                (let ((ha (blast-arc-probe this bstart extent)))
+                  (cond
+                    ((>= ha 0.0)
+                     (set! blen (* drop ha))
+                     (set! hit-wall #t)
+                     )
+                    (else
+                      (set-vector! extent (* (- *blast-arc-length* drop) sx) 0.0 (* (- *blast-arc-length* drop) cz) 1.0)
+                      (let ((hb (blast-arc-probe this pdrop extent)))
+                        (when (>= hb 0.0)
+                          (set! blen (+ drop (* (- *blast-arc-length* drop) hb)))
+                          (set! hit-wall #t)
+                          )
+                        )
+                      )
+                    )
+                  )
+                (when hit-wall
+                  ;; spark where it hits a wall
+                  (set-vector! *blast-arc-end*
+                               (+ (-> bstart x) (* sx blen))
+                               (blast-arc-y-at blen)
+                               (+ (-> bstart z) (* cz blen))
+                               1.0)
+                  (launch-particles (-> *part-id-table* 2060) *blast-arc-end*)
+                  )
+                ;; (distance from the bot's centre, used by the damage test)
+                (set! (-> *blast-arc-lens* k) (+ *blast-arc-inner* blen))
+                (blast-arc-draw-bolt bstart sx cz blen)
+                (when (and (zero? k) *blast-ord-debug* (time-elapsed? *blast-arc-debug-time* (seconds 0.5)))
+                  (set-time! *blast-arc-debug-time*)
+                  (format 0 "arc: beam 0 angle ~D, length ~M, turned ~D of 360, body y ~M low y ~M~%"
+                          (the int (* 0.0054931640625 ak))
+                          (-> *blast-arc-lens* 0)
+                          (the int (* 0.0054931640625 *blast-arc-swept*))
+                          *blast-arc-y-body* *blast-arc-y-low*)
+                  )
+                )
+              )
+            )
+          (blast-arc-style-restore)
+          ;; turn
+          (set! *blast-arc-angle* a1)
+          (while (>= *blast-arc-angle* 65536.0)
+            (set! *blast-arc-angle* (- *blast-arc-angle* 65536.0))
+            )
+          (set! *blast-arc-swept* (+ *blast-arc-swept* stp))
+          (set! *blast-arc-acc* (+ *blast-arc-acc* stp))
+          ;; damage pulse (always one more on the very last frame, so the end of the turn is not skipped)
+          (let ((done (>= *blast-arc-swept* 65535.0)))
+            (when (or done (time-elapsed? *blast-arc-pulse-time* (the int (* 300.0 *blast-arc-pulse-gap*))))
+              (set-time! *blast-arc-pulse-time*)
+              (let ((pulse-a0 (- a1 *blast-arc-acc*)))
+                (while (< pulse-a0 0.0)
+                  (set! pulse-a0 (+ pulse-a0 65536.0))
+                  )
+                (vector-copy! *blast-arc-box* start)
+                (set! (-> *blast-arc-box* w) *blast-arc-length*)
+                (countdown (i (fill-actor-list-for-box *actor-hash* *blast-arc-box* *blast-arc-hits* 128))
+                  (let ((cs (as-type (-> *blast-arc-hits* i) collide-shape)))
+                    (when cs
+                      (let ((p (as-type (-> cs process) process-focusable)))
+                        (when (blast-ord-valid-target? this p)
+                          (blast-arc-hit-test this p pulse-a0 *blast-arc-acc*)
+                          )
+                        )
+                      )
+                    )
+                  )
+                (set! *blast-arc-acc* 0.0)
+                )
+              )
+            (when done
+              (set! *blast-arc-active* #f)
+              (if *blast-ord-debug*
+                  (format 0 "arc: full turn done, lasers off~%")
+                  )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-arc-stop ()
+  ;; REPL: switches the lasers off
+  (set! *blast-arc-active* #f)
+  (none)
+  )

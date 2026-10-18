@@ -500,6 +500,9 @@
   "spydroid-orig.o" ;; added - stock droid code, needed by spydroid-ally (normally only in SEA / FACTORYA)
   "spydroid-ally.o" ;; added - allied droids for the Plasmite RPG (must be after spydroid-orig.o, before mod-common-functions.o)
   "sentinel-ally.o" ;; added - sentinel turrets for the Gyro Burster (must be after spydroid-ally.o, before mod-common-functions.o)
+  "roboguard.o" ;; added - stock roboguard code, needed by roboguard-ally (normally only in SEA / FACC / FACD)
+  "roboguard-ally.o" ;; added - allied roboguard for the Needle Lazer (must be after roboguard.o, before blastbot-ordnance.o)
+  "blastbot-ordnance.o" ;; added - Gyro Burster missiles + Arc Wielder rotating lasers (must be after sentinel-ally.o, before mod-common-functions.o)
   "mod-common-functions.o" ;; added
   "blastbot_guns.o" ;; added - Blast Bot weapons (must be after mod-common-functions.o, which it needs for the blast-bot-player type)
   "orb-placer.o"  ;; added
@@ -509,9 +512,12 @@
   "mod-debug.o" ;; added
     "tpage-1320.go"
     "tpage-2384.go"
+    "tpage-1244.go"
     "bombbot-ag.go"
     "spydroid-orig-ag.go"
+    "roboguard-ag.go"
     "kg-flying-turret-ag.go"
+    "cty-homing-missile-ag.go"
     "shield-sphere-ag.go"
     "shield-sphere-distort-ag.go"
     "shield-sphere-explode-ag.go"

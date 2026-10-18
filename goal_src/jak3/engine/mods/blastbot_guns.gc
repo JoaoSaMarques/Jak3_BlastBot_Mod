@@ -580,10 +580,58 @@
     )
   )
 
+;; ---- blue selection (same idea as red / yellow) ----
+(define *blast-bot-blue-weapon* 1)        ;; 1 Vulcan Fury, 2 Arc Wielder, 3 Needle Lazer
+(define *blast-bot-blue-max* 3)           ;; highest blue level that is built (3 = Needle Lazer, roboguard-ally.gc)
+
+(defun blast-bot-blue-fix ()
+  ;; keep *blast-bot-blue-weapon* on a built level Jak actually owns
+  (when (or (< *blast-bot-blue-max* *blast-bot-blue-weapon*)
+            (not (blast-bot-gun-level-owned? 2 *blast-bot-blue-weapon*))
+            )
+    (let ((found #f))
+      (dotimes (i *blast-bot-blue-max*)
+        (when (and (not found) (blast-bot-gun-level-owned? 2 (+ i 1)))
+          (set! *blast-bot-blue-weapon* (+ i 1))
+          (set! found #t)
+          )
+        )
+      )
+    (if (< *blast-bot-blue-max* *blast-bot-blue-weapon*)
+        (set! *blast-bot-blue-weapon* 1)
+        )
+    )
+  (none)
+  )
+
+(defun blast-bot-blue-cycle ()
+  ;; next owned (and built) blue weapon after the current one (wraps)
+  (let ((found #f))
+    (dotimes (i *blast-bot-blue-max*)
+      (let ((lvl (+ 1 (mod (+ *blast-bot-blue-weapon* i) *blast-bot-blue-max*))))
+        (when (and (not found) (blast-bot-gun-level-owned? 2 lvl))
+          (set! *blast-bot-blue-weapon* lvl)
+          (set! found #t)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-blue-name ((level int))
+  (case level
+    ((1) "Vulcan Fury")
+    ((2) "Arc Wielder")
+    (else "Needle Lazer")
+    )
+  )
+
 (defun blast-bot-gun-select ()
   (let ((old *blast-bot-gun-mode*)
         (old-red *blast-bot-red-weapon*)
         (old-yellow *blast-bot-yellow-weapon*)
+        (old-blue *blast-bot-blue-weapon*)
         (want -1)
         )
     (cond
@@ -604,6 +652,10 @@
          ;; pressing yellow again while on yellow cycles through the yellow weapons you own
          (blast-bot-yellow-cycle)
          )
+        ((and (= want 2) (= *blast-bot-gun-mode* 2))
+         ;; pressing blue again while on blue cycles through the blue weapons you own
+         (blast-bot-blue-cycle)
+         )
         (else
           (set! *blast-bot-gun-mode* want)
           )
@@ -619,6 +671,7 @@
       )
     (blast-bot-red-fix)
     (blast-bot-yellow-fix)
+    (blast-bot-blue-fix)
     (if (!= old *blast-bot-gun-mode*)
         (format 0 "Blast Bot: gun ~A~%" (case *blast-bot-gun-mode* ((0) 'red) ((1) 'yellow) (else 'blue)))
         )
@@ -628,9 +681,34 @@
     (if (and (= *blast-bot-gun-mode* 1) (or (!= old *blast-bot-gun-mode*) (!= old-yellow *blast-bot-yellow-weapon*)))
         (format 0 "Blast Bot: yellow weapon ~A~%" (blast-bot-yellow-name *blast-bot-yellow-weapon*))
         )
+    (if (and (= *blast-bot-gun-mode* 2) (or (!= old *blast-bot-gun-mode*) (!= old-blue *blast-bot-blue-weapon*)))
+        (format 0 "Blast Bot: blue weapon ~A~%" (blast-bot-blue-name *blast-bot-blue-weapon*))
+        )
     (if (!= old *blast-bot-gun-mode*)
         (set! *blast-bot-burst-left* 0)
         )
+    ;; what is selected: feeds the coloured bar above the health bar (mod-common-functions.gc) and prints the name
+    (let ((lvl (case *blast-bot-gun-mode*
+                 ((0) *blast-bot-red-weapon*)
+                 ((1) *blast-bot-yellow-weapon*)
+                 (else *blast-bot-blue-weapon*)
+                 )
+               )
+          )
+      (set! *blast-bot-hud-gun-color* *blast-bot-gun-mode*)
+      (set! *blast-bot-hud-gun-level* lvl)
+      (when *blast-bot-weapon-text*
+        (format *stdcon* "WEAPON ~A ~D/3: ~A~%"
+                (case *blast-bot-gun-mode* ((0) "RED") ((1) "YELLOW") (else "BLUE"))
+                lvl
+                (case *blast-bot-gun-mode*
+                  ((0) (blast-bot-red-name lvl))
+                  ((1) (blast-bot-yellow-name lvl))
+                  (else (blast-bot-blue-name lvl))
+                  )
+                )
+        )
+      )
     )
   (none)
   )
@@ -703,7 +781,8 @@
 ;;                  fired one every *blast-bot-reflexor-gap* seconds by blast-bot-yellow-update. The doc's upgrade
 ;;                  "adds ricochet": *blast-bot-reflexor-ricochet* #t swaps them for gun-yellow-shot-2 (Jak's own
 ;;                  bouncing beam shot). Untested, so it is off by default.
-;; Gyro Burster   : launches two sentinel turrets (sentinel-ally.gc); missiles and the hover guard are not in yet.
+;; Gyro Burster   : launches two sentinel turrets (sentinel-ally.gc) and a salvo of homing missiles (blastbot-ordnance.gc);
+;;                  the hover guard is not in yet.
 (define *blast-bot-reflexor-bullets* 5)
 (define *blast-bot-reflexor-gap* 0.1)    ;; seconds between the bullets of a burst (0.05 looked like one solid beam)
 (define *blast-bot-reflexor-ricochet* #f)
@@ -741,15 +820,18 @@
     (blast-bot-fire-reflexor-bullet this)
     (+! *blast-bot-burst-left* -1)
     )
+  ;; the Arc Wielder's lasers (blastbot-ordnance.gc): turn, draw and hurt until they have done a full 360
+  (blast-arc-update this)
   (none)
   )
 
 (defun blast-bot-fire-gyro-burster ((this blast-bot-player))
   ;; Doc: launch missiles and spawn two sentinels that help you (+ a hover guard with the upgrade).
-  ;; So far: the two sentinels (sentinel-ally.gc). The missiles (KG RT) and the hover guard are not in yet.
-  (if (blast-bot-heat-try-use 1.0)        ;; one use before overheating
-      (sentinel-ally-launch this)
-      )
+  ;; Missiles: blastbot-ordnance.gc (they only go for enemies, never guards / civilians). The hover guard is not in yet.
+  (when (blast-bot-heat-try-use 1.0)      ;; one use before overheating
+    (sentinel-ally-launch this)
+    (blast-missile-launch this)
+    )
   (none)
   )
 
@@ -796,6 +878,31 @@
   (none)
   )
 
+(defun blast-bot-fire-blue-arsenal ((this blast-bot-player))
+  (case *blast-bot-blue-weapon*
+    ((2)
+     ;; Arc Wielder: 4 rotating lasers that last for one full 360 (blastbot-ordnance.gc). One use before overheating.
+     ;; Pressing again while they are still turning does nothing (and costs no heat).
+     (when (and (not *blast-arc-active*) (blast-bot-heat-try-use 1.0))
+       (blast-arc-launch this)
+       )
+     )
+    ((3)
+     ;; Needle Lazer: launches an allied roboguard (roboguard-ally.gc). One use before overheating; nothing is spent when
+     ;; the maximum number of roboguards is already alive.
+     (when (and (< (roboguard-ally-count) *roboguard-ally-max*) (blast-bot-heat-try-use 1.0))
+       (roboguard-ally-launch this)
+       )
+     )
+    (else
+      (if (blast-bot-heat-try-use 100.0)    ;; Vulcan Fury: a hundred shots before overheating
+          (blast-bot-fire-blue this)
+          )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-shot ((this blast-bot-player))
   ;; morphgun only when the toggle is on AND Jak owns the selected colour; otherwise the old guard shot
   (if (and *blast-bot-use-morphgun* *target* (blast-bot-gun-owned? *blast-bot-gun-mode*))
@@ -804,9 +911,7 @@
          (blast-bot-fire-yellow-arsenal this)
          )
         ((2)
-         (if (blast-bot-heat-try-use 100.0)    ;; Vulcan Fury: a hundred shots before overheating
-             (blast-bot-fire-blue this)
-             )
+         (blast-bot-fire-blue-arsenal this)
          )
         (else (blast-bot-fire-red-arsenal this))
         )
@@ -831,9 +936,10 @@
   )
 
 ;; ---- R1 handling (called every frame by the bot's active state) ----
-;; Blue (Vulcan Fury) fires while R1 is HELD and speeds up the longer you hold; every other weapon is one shot per press.
+;; Blue (Vulcan Fury) fires while R1 is HELD and speeds up the longer you hold; every other weapon (Arc Wielder, Needle Lazer too) is one shot per press.
 (defun blast-bot-fire-input ((this blast-bot-player))
-  (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2))))
+  (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2)
+                   (!= *blast-bot-blue-weapon* 2) (!= *blast-bot-blue-weapon* 3))))
     (cond
       ((not (cpad-hold? 0 r1))
        (set! *blast-bot-hold-start* 0)

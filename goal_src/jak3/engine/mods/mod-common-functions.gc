@@ -1157,12 +1157,22 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 (define *blast-bot-shield-w* 8)
 (define *blast-bot-hud-shield* 1.0)       ;; 0..1 shield left (while broken: recharge progress), written by the bot every frame
 (define *blast-bot-hud-shield-show* #f)   ;; only shown while the shield is up, damaged or recharging
-;; layout: heat meter, horizontal, directly under the health bar (same x and width). Gray = empty; the fill goes
-;; white -> yellow -> orange -> red (red from about 90%). While overheated it blinks red.
-(define *blast-bot-heat-gap* 10)          ;; hud pixels between the health bar and the heat meter
-(define *blast-bot-heat-h* 6)
+;; layout: heat meter, vertical, on the RIGHT side of the screen (same size as the jump / shield bars, growing upwards from
+;; fuel-bottom). Gray = empty; the fill goes white -> yellow -> orange -> red (red from about 90%). While overheated it blinks red.
+;; The selected-weapon bar sits right next to it, on its left.
+(define *blast-bot-heat-x* 476)           ;; 512 - 28 - 8: the mirror image of the jump bar's x
+(define *blast-bot-heat-w* 8)
 (define *blast-bot-hud-heat* 0.0)         ;; 0..1, written by blast-bot-heat-update (blastbot_guns.gc)
 (define *blast-bot-hud-overheat* #f)
+;; layout: selected-weapon indicator, vertical, right of the screen next to the heat meter (same size as the jump / shield
+;; bars). The colour is the gun's colour (red / yellow / blue); the fill is 1/3, 2/3 or all of the bar for the 1st / 2nd / 3rd
+;; weapon of that colour.
+(define *blast-bot-weapon-x* (+ (- *blast-bot-heat-x* 8) -6))   ;; 6 pixels left of the heat meter
+;; The weapon's name is printed in the top-left console by blast-bot-gun-select (blastbot_guns.gc).
+(define *blast-bot-hud-gun-color* 0)      ;; 0 red, 1 yellow, 2 blue; written by blast-bot-gun-select
+(define *blast-bot-hud-gun-level* 1)      ;; 1..3
+(define *blast-bot-weapon-bar* #t)        ;; the coloured indicator above the health bar
+(define *blast-bot-weapon-text* #t)       ;; the weapon name line in the top-left console
 
 (deftype blast-bot-hud (hud)
   ()
@@ -1262,11 +1272,11 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
                          255 gb gb)
     )
   )
-  ;; sprites 9-11: heat meter (border, background, fill), under the health bar
+    ;; sprites 9-11: heat meter (border, background, fill), vertical, right side
   (let* ((h (fmax 0.0 (fmin 1.0 *blast-bot-hud-heat*)))
-         (hw (the float *blast-bot-hp-w*))
-         (hh (the float *blast-bot-heat-h*))
-         (hy (+ *blast-bot-hp-y* *blast-bot-hp-h* *blast-bot-heat-gap*))
+         (hw (the float *blast-bot-heat-w*))
+         (hh (the float *blast-bot-fuel-h*))
+         (fill (* hh h))
          ;; white until 25%, yellow at 55%, orange at 80%, red from 95%
          (cb (the int (* 255.0 (- 1.0 (fmax 0.0 (fmin 1.0 (/ (- h 0.25) 0.3)))))))
          (cg (cond
@@ -1277,10 +1287,38 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
          (hot *blast-bot-hud-overheat*)
          (blink (and hot (logtest? (the int (current-time)) 32)))
          )
-    (blast-bot-hud-rect! (-> this sprites 9) (+ *blast-bot-hp-x* -2) (+ hy -2) (+ hw 4.0) (+ hh 4.0) 0 0 0)
-    (blast-bot-hud-rect! (-> this sprites 10) *blast-bot-hp-x* hy hw hh 90 90 90)
-    (blast-bot-hud-rect! (-> this sprites 11) *blast-bot-hp-x* hy (* hw h) hh
+    (blast-bot-hud-rect! (-> this sprites 9)
+                         (+ *blast-bot-heat-x* -2) (+ (- *blast-bot-fuel-bottom* *blast-bot-fuel-h*) -2)
+                         (+ hw 4.0) (+ hh 4.0) 0 0 0)
+    (blast-bot-hud-rect! (-> this sprites 10)
+                         *blast-bot-heat-x* (- *blast-bot-fuel-bottom* *blast-bot-fuel-h*)
+                         hw hh 90 90 90)
+    (blast-bot-hud-rect! (-> this sprites 11)
+                         *blast-bot-heat-x* (the int (- (the float *blast-bot-fuel-bottom*) fill))
+                         hw fill
                          (if blink 120 255) (if hot 0 cg) (if hot 0 cb))
+    )
+  ;; sprites 12-14: selected weapon (border, background, fill), vertical, right of the screen next to the heat meter
+  (when *blast-bot-weapon-bar*
+    (let* ((ww 8.0)
+           (wh (the float *blast-bot-fuel-h*))
+           (lv (the float (max 1 (min 3 *blast-bot-hud-gun-level*))))
+           (fill (* wh (/ lv 3.0)))
+           (c *blast-bot-hud-gun-color*)
+           (cr (case c ((0) 255) ((1) 255) (else 40)))
+           (cg (case c ((0) 40) ((1) 220) (else 120)))
+           (cb (case c ((0) 40) ((1) 0) (else 255)))
+           )
+      (blast-bot-hud-rect! (-> this sprites 12)
+                           (+ *blast-bot-weapon-x* -2) (+ (- *blast-bot-fuel-bottom* *blast-bot-fuel-h*) -2)
+                           (+ ww 4.0) (+ wh 4.0) 0 0 0)
+      (blast-bot-hud-rect! (-> this sprites 13)
+                           *blast-bot-weapon-x* (- *blast-bot-fuel-bottom* *blast-bot-fuel-h*)
+                           ww wh 40 40 40)
+      (blast-bot-hud-rect! (-> this sprites 14)
+                           *blast-bot-weapon-x* (the int (- (the float *blast-bot-fuel-bottom*) fill))
+                           ww fill cr cg cb)
+      )
     )
   ((method-of-type hud draw) this)
   0
@@ -1305,7 +1343,7 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
         )
   (format 0 "Blast Bot HUD: gui registered~%")
   (logior! (-> this flags) (hud-flags show))
-  (dotimes (i 12)   ;; 0-2 health, 3-5 fuel, 6-8 shield, 9-11 heat
+  (dotimes (i 15)   ;; 0-2 health, 3-5 fuel, 6-8 shield, 9-11 heat, 12-14 selected weapon
     (set! (-> this sprites i tid) (the-as texture-id (get-texture common-white common)))
     (set! (-> this sprites i flags) (hud-sprite-flags))
     (set! (-> this sprites i scale-x) 0.0)

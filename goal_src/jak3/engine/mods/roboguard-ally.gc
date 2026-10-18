@@ -1,0 +1,613 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: roboguard-ally.gc
+;; name in dgo: roboguard-ally
+;; dgos: GAME
+
+;; Allied roboguard for the Blast Bot's Needle Lazer (blue weapon 3). Doc: spawn a roboguard (two with the upgrade),
+;; one use before overheating, damage 2, health 8.
+;;
+;; Built exactly like spydroid-ally.gc: roboguard-ally is a CHILD of roboguard, so models, animations, nav, formation
+;; walking, turret aiming and the explosion are the stock roboguard code. What it changes:
+;;   1. launch    : roboguard-ally-launch spawns *roboguard-ally-count* of them in front of the owner.
+;;   2. allied    : they never target Jak, the bot or other allies. They pick the nearest enemy themselves and hand it to
+;;                  the stock states as the focus (same retarget as the spydroid).
+;;   3. shooting  : the stock roboguard fires guard projectiles that only hurt Jak and the bot. The shot method is replaced:
+;;                  every shot damages the focus directly (damage *roboguard-ally-damage*, 2) with a short tracer.
+;;   4. punching  : the stock close-attack arms a 'deadly' collision sphere that hurts Jak / the bot. The ally's own
+;;                  close-attack does the same swing without it and damages enemies in reach instead.
+;;   5. 8 hp      : enemy shots can hurt them (penetrated-by), they explode the stock way when they die.
+;;
+;; Needs, in game.gd:
+;;   "roboguard.o"          (stock roboguard code; normally only in SEA / FACC / FACD) before this file
+;;   "roboguard-ally.o"     after sentinel-ally.o and before blastbot-ordnance.o
+;;   "roboguard-ag.go"      in the art group list at the end
+;; and in jak3_config.jsonc, common_art_groups:  "roboguard-ag"
+;; and add  roboguard-ally  to *spydroid-ally-ignore-types* (spydroid-ally.gc) so the spydroids, the missiles and the lasers
+;; never aim at it:   '(wlander-female wlander-male crimson-guard bombbot-bomb roboguard-ally)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Knobs (set from the REPL)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *roboguard-ally-count* 1)               ;; doc: one roboguard (two with the upgrade, which is not in yet)
+(define *roboguard-ally-max* 4)                 ;; never more than this many alive at once
+(define *roboguard-ally-hp* 8.0)                ;; doc: 8
+(define *roboguard-ally-damage* 2.0)            ;; damage of every shot (doc: 2)
+(define *roboguard-ally-punch-damage* 2.0)      ;; damage of the close-range punch
+(define *roboguard-ally-punch-reach* 28672.0)   ;; 7 m (+ the target's radius): how far the punch reaches
+(define *roboguard-ally-scan-range* 409600.0)   ;; 100 m: how far they look for enemies
+(define *roboguard-ally-life* 0.0)              ;; seconds before it blows up on its own. 0 = until it is destroyed
+(define *roboguard-ally-credit-jak* #t)         ;; #t = their kills count as Jak's, same as the other allies
+(define *roboguard-ally-mesh-range* 61440.0)    ;; 15 m: a nav mesh must lie this close to the owner, or nothing is launched
+(define *roboguard-ally-child-prims* #t)        ;; #t = the body spheres become 'bot' like the spydroid's. #f = leave them stock
+(define *roboguard-ally-collide-each-other* #t) ;; #t: allies block each other instead of overlapping
+(define *roboguard-ally-spawn-dist* 49152.0)    ;; 12 m in front of the owner
+(define *roboguard-ally-tracer* #t)             ;; #t: a short red streak from the muzzle to the target on every shot
+(define *roboguard-ally-debug* #t)              ;; #t: print launches, target changes and state changes
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Type + scratch (global heap, never the stack: the bot calls the launch from deep inside its state code)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *roboguard-ally-params* (new 'global 'enemy-init-by-other-params))
+(define *roboguard-ally-fwd* (new 'global 'vector))
+(define *roboguard-ally-pos* (new 'global 'vector))
+(define *roboguard-ally-muzzle* (new 'global 'vector))
+(define *roboguard-ally-beam* (new 'global 'vector))
+(define *roboguard-ally-find-box* (new 'global 'vector))
+(define *roboguard-ally-find-hits* (new 'global 'array 'collide-shape 128))
+(define *roboguard-ally-punch-box* (new 'global 'vector))
+(define *roboguard-ally-punch-hits* (new 'global 'array 'collide-shape 64))
+
+(deftype roboguard-ally (roboguard)
+  ((owner-handle  handle)
+   (spawn-time    time-frame)
+   (scan-time     time-frame)
+   (dbg-state     symbol)     ;; last state name printed by the state-change log
+   )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Helpers
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun roboguard-ally-attacker ((this roboguard-ally))
+  ;; who the enemies think hit them
+  (if (and *target* *roboguard-ally-credit-jak*)
+      (process->handle *target*)
+      (process->handle this)
+      )
+  )
+
+(defun roboguard-ally-valid-target? ((this roboguard-ally) (p process-focusable))
+  ;; same rule as spydroid-ally-valid-target?, plus "not another roboguard ally"
+  (and p
+       (!= this p)
+       (!= p *target*)
+       (not (type? p roboguard-ally))
+       (not (type? p spydroid-ally))
+       (not (type? p sentinel-ally))
+       (!= (handle->process (-> this owner-handle)) p)
+       (not (focus-test? p inactive))
+       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+       (not (logtest? (process-mask crate civilian) (-> p mask)))
+       (not (spydroid-ally-ignored-type? p))
+       (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
+       )
+  )
+
+(defun roboguard-ally-find-target ((this roboguard-ally))
+  ;; nearest valid enemy within *roboguard-ally-scan-range*, or #f
+  (let ((best (the-as process-focusable #f))
+        (best-dist 0.0)
+        (box *roboguard-ally-find-box*)
+        (hits *roboguard-ally-find-hits*)
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) *roboguard-ally-scan-range*)
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (roboguard-ally-valid-target? this p)
+              (let ((d (vector-vector-xz-distance (-> this root trans) (-> p root trans))))
+                (when (or (not best) (< d best-dist))
+                  (set! best p)
+                  (set! best-dist d)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    best
+    )
+  )
+
+(defun roboguard-ally-retarget ((this roboguard-ally))
+  ;; Overwrites the stock focus (normally Jak) with the nearest enemy. Same as spydroid-ally-retarget.
+  (let* ((old-p (handle->process (-> this focus handle)))
+         (cur (as-type old-p process-focusable))
+         )
+    (if (not (roboguard-ally-valid-target? this cur))
+        (set! cur #f)
+        )
+    ;; do not swap targets in the middle of a burst / punch (the stock attack states set lock-focus)
+    (when (and (not (logtest? (-> this enemy-flags) (enemy-flag lock-focus)))
+               (time-elapsed? (-> this scan-time) (seconds 0.4))
+               )
+      (set-time! (-> this scan-time))
+      (let ((best (roboguard-ally-find-target this)))
+        (cond
+          ((not cur)
+           (set! cur best)
+           )
+          ;; hysteresis: only swap if the new one is at least 1.5x closer
+          ((and best
+                (!= best cur)
+                (< (* 1.5 (vector-vector-xz-distance (-> this root trans) (-> best root trans)))
+                   (vector-vector-xz-distance (-> this root trans) (-> cur root trans))
+                   )
+                )
+           (set! cur best)
+           )
+          )
+        )
+      )
+    (cond
+      (cur
+        (when (and *roboguard-ally-debug* (!= cur old-p))
+          (format 0 "roboguard ally target: ~A mask #x~X~%" (-> cur type) (-> cur mask))
+          )
+        (set! (-> this focus handle) (process->handle cur))
+        (set! (-> this focus aware) (enemy-aware hostile))
+        )
+      (else
+        (set! (-> this focus handle) (the-as handle #f))
+        (set! (-> this focus aware) (the-as enemy-aware 0))
+        )
+      )
+    )
+  (none)
+  )
+
+(defun roboguard-ally-tracer ((from vector) (to vector))
+  ;; one-frame red streak from the muzzle to the target, drawn with the laser pointer's beam part (2059).
+  ;; Widths are in game units. Only r, b, width, scale-y and alpha are touched, and put back right after.
+  (when *roboguard-ally-tracer*
+    (vector-! *roboguard-ally-beam* to from)
+    (set! (-> *part-id-table* 2059 init-specs 5 initial-valuef) 255.0)
+    (set! (-> *part-id-table* 2059 init-specs 7 initial-valuef) 0.0)
+    (set! (-> *part-id-table* 2059 init-specs 3 initial-valuef) 614.4)
+    (set! (-> *part-id-table* 2059 init-specs 3 random-rangef) 0.0)
+    (set! (-> *part-id-table* 2059 init-specs 4 initial-valuef) (vector-length *roboguard-ally-beam*))
+    (set! (-> *part-id-table* 2059 init-specs 8 initial-valuef) 200.0)
+    (set! (-> *part-id-table* 2059 init-specs 8 random-rangef) 0.0)
+    (draw-beam (-> *part-id-table* 2059) from *roboguard-ally-beam* #t)
+    (set! (-> *part-id-table* 2059 init-specs 4 initial-valuef) 163840.0)
+    (set! (-> *part-id-table* 2059 init-specs 8 initial-valuef) 64.0)
+    (set! (-> *part-id-table* 2059 init-specs 8 random-rangef) 32.0)
+    (launch-particles (-> *part-id-table* 2060) to)
+    )
+  (none)
+  )
+
+(defun roboguard-ally-shoot ((this roboguard-ally) (muzzle vector))
+  ;; one shot: damage the focus directly (the stock guard projectile would only ever hurt Jak or the bot)
+  (let ((p (as-type (handle->process (-> this focus handle)) process-focusable)))
+    (when (roboguard-ally-valid-target? this p)
+      (let ((tp (get-trans p 3)))
+        (roboguard-ally-tracer muzzle tp)
+        )
+      (send-event p 'attack #f
+                  (static-attack-info ((id (new-attack-id))
+                                       (damage *roboguard-ally-damage*)
+                                       (vehicle-damage-factor 1.0)
+                                       (vehicle-impulse-factor 1.0)
+                                       (attacker (roboguard-ally-attacker this))
+                                       )
+                                      )
+                  )
+      )
+    )
+  (none)
+  )
+
+(defun roboguard-ally-punch ((this roboguard-ally))
+  ;; the close-range punch: every valid enemy in reach takes one hit (one attack id for the whole swing)
+  (let ((box *roboguard-ally-punch-box*)
+        (hits *roboguard-ally-punch-hits*)
+        (atk-id (new-attack-id))
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) (+ *roboguard-ally-punch-reach* 16384.0))
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (and (roboguard-ally-valid-target? this p)
+                       (< (vector-vector-xz-distance (-> this root trans) (-> p root trans))
+                          (+ *roboguard-ally-punch-reach* (-> p root nav-radius)))
+                       (< (fabs (- (-> p root trans y) (-> this root trans y))) 24576.0)
+                       )
+              (send-event p 'attack #f
+                          (static-attack-info ((id atk-id)
+                                               (damage *roboguard-ally-punch-damage*)
+                                               (vehicle-damage-factor 1.0)
+                                               (vehicle-impulse-factor 1.0)
+                                               (mode 'shock)
+                                               (attacker (roboguard-ally-attacker this))
+                                               )
+                                              )
+                          )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun roboguard-ally-update ((this roboguard-ally))
+  ;; once per frame at the end of enemy-common-post
+  (cond
+    ((not (handle->process (-> this owner-handle)))
+     ;; the owner (the bot) is gone: vanish quietly
+     (cleanup-for-death this)
+     (deactivate this)
+     )
+    ((and (< 0.0 *roboguard-ally-life*)
+          (time-elapsed? (-> this spawn-time) (the int (* *roboguard-ally-life* 300.0)))
+          )
+     (set-time! (-> this spawn-time))
+     (go-die this)
+     )
+    (else
+      (roboguard-ally-retarget this)
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Overridden methods
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defmethod enemy-common-post ((this roboguard-ally))
+  "Stock post (roboguard), then the ally logic on top."
+  (call-parent-method this)
+  (roboguard-ally-update this)
+  (none)
+  )
+
+(defmethod update-focus ((this roboguard-ally))
+  "Stock focus update, then the ally retarget. The stock idle state does not run enemy-common-post (its post only calls
+update-focus and ja-post), so the retarget lives here: every state's post reaches it."
+  (let ((result (call-parent-method this)))
+    (roboguard-ally-retarget this)
+    (let ((st (if (-> this state) (-> this state name) #f)))
+      (when (and *roboguard-ally-debug* (!= st (-> this dbg-state)))
+        (format 0 "roboguard ally state: ~A -> ~A aware ~D target ~A~%"
+                (-> this dbg-state)
+                st
+                (the-as int (-> this focus aware))
+                (handle->process (-> this focus handle))
+                )
+        (set! (-> this dbg-state) st)
+        )
+      )
+    result
+    )
+  )
+
+(defmethod roboguard-method-196 ((this roboguard-ally) (arg0 int))
+  "Fires one shot from joint arg0. Stock: spawn-guard-projectile. Ally: damage the focus directly."
+  (let ((s5-0 (-> this node-list data arg0)))
+    (vector<-cspace! *roboguard-ally-muzzle* s5-0)
+    (roboguard-ally-shoot this *roboguard-ally-muzzle*)
+    )
+  (sound-play "robo-fire" :position (-> this root trans))
+  (+! (-> this fire-count) 1)
+  0
+  (none)
+  )
+
+(defmethod init-enemy-collision! ((this roboguard-ally))
+  "Same shapes as the roboguard, retuned like the spydroid ally: 'bot' (so enemy shots can hit them), no collision with
+Jak or the bot, and the punch sphere stays off (the punch damage is sent by roboguard-ally-punch)."
+  (call-parent-method this)
+  (let* ((cs (-> this root))
+         (grp (the-as collide-shape-prim-group (-> cs root-prim)))
+         )
+    (set! (-> grp prim-core collide-as) (collide-spec bot))
+    (set! (-> grp prim-core collide-with)
+          (if *roboguard-ally-collide-each-other*
+              (collide-spec backgnd obstacle hit-by-others-list bot)
+              (collide-spec backgnd obstacle hit-by-others-list)
+              )
+          )
+    (when *roboguard-ally-child-prims*
+      (let ((a (-> grp child 0))
+            (b (-> grp child 1))
+            )
+        (set! (-> a prim-core collide-as) (collide-spec bot))
+        (set! (-> a prim-core collide-with)
+              (if *roboguard-ally-collide-each-other*
+                  (collide-spec backgnd obstacle hit-by-others-list bot)
+                  (collide-spec backgnd obstacle hit-by-others-list)
+                  )
+              )
+        (set! (-> b prim-core collide-as) (collide-spec bot))
+        (set! (-> b prim-core collide-with)
+              (if *roboguard-ally-collide-each-other*
+                  (collide-spec backgnd obstacle hit-by-others-list bot)
+                  (collide-spec backgnd obstacle hit-by-others-list)
+                  )
+              )
+        )
+      )
+    (set! (-> cs backup-collide-as) (-> grp prim-core collide-as))
+    (set! (-> cs backup-collide-with) (-> grp prim-core collide-with))
+    )
+  0
+  (none)
+  )
+
+(defmethod init-enemy! ((this roboguard-ally))
+  "Stock init, then: 8 hp, no notice distance, enemy shots can hurt it, and the stock target search finds nothing."
+  (format 0 "roboguard ally: init-enemy! start~%")
+  (call-parent-method this)
+  (format 0 "roboguard ally: stock init-enemy! returned~%")
+  (set! (-> this hit-points) *roboguard-ally-hp*)
+  (set! (-> this last-hit-points) (the int *roboguard-ally-hp*))
+  (set! (-> this owner-handle) (the-as handle #f))
+  (set-time! (-> this spawn-time))
+  (set-time! (-> this scan-time))
+  (set! (-> this dbg-state) #f)
+  ;; stock roboguards stand where their level placed them; this one is spawned from code, so let it drop to the ground
+  (logclear! (-> this enemy-flags) (enemy-flag no-initial-move-to-ground))
+  (logclear! (-> this enemy-flags) (enemy-flag use-notice-distance))
+  ;; setup-enemy! (run by the parent) just rebuilt penetrated-by, so add after it
+  (logior! (-> this root penetrated-by) (penetrate enemy-yellow-shot enemy-dark-shot explode))
+  ;; empty focus mask: the stock update-focus can no longer pick Jak. roboguard-ally-retarget sets the focus instead.
+  (reset-to-collide-spec (-> this focus) (the-as collide-spec 0))
+  (format 0 "roboguard ally: init-enemy! done~%")
+  0
+  (none)
+  )
+
+(defstate active (roboguard-ally)
+  :virtual #t
+  :enter (behavior ()
+    ;; Same problem as the spydroid ally: the stock 'active' state ends in process-drawable-art-error for an entity-less
+    ;; enemy and freezes it. Park in idle instead; the retarget in update-focus wakes it up as soon as an enemy shows up.
+    (go-virtual idle)
+    )
+  )
+
+(defstate close-attack (roboguard-ally)
+  :virtual #t
+  :event enemy-event-handler
+  :enter (behavior ()
+    (set-time! (-> self state-time))
+    (set-time! (-> self fire-time))
+    (nav-enemy-method-180 self 8192.0 (the-as float #f))
+    )
+  :exit (behavior ()
+    (nav-enemy-method-179 self)
+    )
+  :code (behavior ()
+    ;; the stock punch, minus the 'deadly' collision sphere (it would hurt Jak and the bot). The damage is sent once,
+    ;; when the swing starts, by roboguard-ally-punch.
+    (let ((f30-0
+            (lerp-scale 0.0 1.0 (vector-vector-xz-distance (-> self root trans) (-> self focus-pos)) 12288.0 20480.0)
+            )
+          )
+      (ja-channel-push! 2 (seconds 0.3))
+      (ja-no-eval :group! roboguard-punch-close-rotate-ja :num! (seek!) :frame-num 0.0)
+      (ja-no-eval :chan 1 :group! roboguard-punch-far-rotate-ja :num! (seek!) :frame-num 0.0)
+      (until (ja-done? 0)
+        (ja :chan 1 :num! (chan 0) :frame-interp0 f30-0 :frame-interp1 f30-0)
+        (seek-to-point-toward-point!
+          (-> self root)
+          (-> self focus-pos)
+          (* 1.2 (-> self nav max-rotation-rate))
+          (seconds 0.02)
+          )
+        (seek! (-> self torso-aim-blend) 0.0 (* 3.0 (seconds-per-frame)))
+        (suspend)
+        (ja :num! (seek!))
+        )
+      (roboguard-ally-punch self)
+      (ja-no-eval :group! roboguard-punch-close-go-ja :num! (seek!) :frame-num 0.0)
+      (ja-no-eval :chan 1 :group! roboguard-punch-far-go-ja :num! (seek!) :frame-num 0.0)
+      (until (ja-done? 0)
+        (ja :chan 1 :num! (chan 0) :frame-interp0 f30-0 :frame-interp1 f30-0)
+        (suspend)
+        (ja :num! (seek! max 1.2))
+        )
+      (ja-no-eval :group! roboguard-punch-close-hold-ja :num! (seek!) :frame-num 0.0)
+      (ja-no-eval :chan 1 :group! roboguard-punch-far-hold-ja :num! (seek!) :frame-num 0.0)
+      (until (ja-done? 0)
+        (ja :chan 1 :num! (chan 0) :frame-interp0 f30-0 :frame-interp1 f30-0)
+        (suspend)
+        (ja :num! (seek! max 4.0))
+        )
+      )
+    0
+    (go-virtual hostile-stand)
+    )
+  :post (behavior ()
+    (seek! (-> self arm-rot-mult 0) 0.0 (* 10.0 (seconds-per-frame)))
+    (seek! (-> self arm-rot-mult 1) 0.0 (* 10.0 (seconds-per-frame)))
+    (nav-enemy-simple-post)
+    )
+  )
+
+(defstate notice (roboguard-ally)
+  :virtual #t
+  :exit (behavior ()
+    ;; stock exit: remember where the formation starts, then the nav-enemy exit
+    (vector-copy! (-> self formation-position) (-> self root trans))
+    (let ((t9-0 (-> (method-of-type nav-enemy notice) exit)))
+      (if t9-0
+          (t9-0)
+          )
+      )
+    )
+  :code (behavior ()
+    ;; the stock notice jump turns toward (target-pos 0), i.e. Jak. The ally turns toward its own focus instead.
+    (ja-channel-push! 1 (seconds 0.075))
+    (let ((f30-0 (rnd-float-range self 0.8 1.2)))
+      (let ((gp-0 (new 'stack-no-clear 'vector)))
+        (ja-no-eval :group! roboguard-notice-jump-ja :num! (seek! max f30-0) :frame-num 0.0)
+        (until (ja-done? 0)
+          (let ((p (as-type (handle->process (-> self focus handle)) process-focusable)))
+            (when p
+              (vector-! gp-0 (get-trans p 0) (-> self root trans))
+              (seek-toward-heading-vec! (-> self root) gp-0 131072.0 (seconds 0.05))
+              )
+            )
+          (suspend)
+          (ja :num! (seek! max f30-0))
+          )
+        )
+      (ja-no-eval :group! roboguard-notice-land-ja :num! (seek! max f30-0) :frame-num 0.0)
+      (until (ja-done? 0)
+        (suspend)
+        (ja :num! (seek! max f30-0))
+        )
+      )
+    (go-state-for-focused self)
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Spawning
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun roboguard-ally-count ()
+  ;; how many are alive (spawned under *entity-pool*, so walk its children)
+  (let ((n 0)
+        (p (-> *entity-pool* child))
+        )
+    (while p
+      (if (type? (-> p 0) roboguard-ally)
+          (+! n 1)
+          )
+      (set! p (-> p 0 brother))
+      )
+    n
+    )
+  )
+
+(defun roboguard-ally-prepare-mesh ((owner process-drawable))
+  ;; Same trick as the spydroid: spawned from code the roboguard has no level entity to find its nav mesh through, so the
+  ;; mesh that covers the owner is put into the roboguard's enemy-info, which setup-enemy! reads. #f if there is none.
+  (let ((mesh (find-nearest-nav-mesh (-> owner root trans) *roboguard-ally-mesh-range*)))
+    (cond
+      (mesh
+        (set! (-> *roboguard-nav-enemy-info* nav-mesh) mesh)
+        #t
+        )
+      (else
+        (format 0 "Roboguard ally: no nav mesh near the bot, nothing launched (range ~f m)~%" (* 0.000244140625 *roboguard-ally-mesh-range*))
+        #f
+        )
+      )
+    )
+  )
+
+(defun roboguard-ally-spawn ((owner process-drawable) (pos vector) (angle float))
+  ;; enemy-init-by-other reads every field; art-level and entity MUST be #f (params is a reused global)
+  (let ((params *roboguard-ally-params*))
+    (vector-copy! (-> params trans) pos)
+    (quaternion-identity! (-> params quat))
+    (quaternion-rotate-y! (-> params quat) (-> params quat) angle)
+    (set! (-> params entity) (the-as entity #f))
+    (set! (-> params art-level) #f)
+    (set! (-> params directed?) #f)
+    (set! (-> params no-initial-move-to-ground?) #f)
+    (let ((spawned (process-spawn roboguard-ally
+                                  :init enemy-init-by-other owner params
+                                  :name "roboguard-ally"
+                                  :to *entity-pool*
+                                  )
+                   )
+          )
+      (when spawned
+        (set! (-> (the-as roboguard-ally (ppointer->process spawned)) owner-handle) (process->handle owner))
+        )
+      (if *roboguard-ally-debug*
+          (format 0 "roboguard ally: spawned ~A at ~f ~f ~f (m)~%"
+                  (if spawned (ppointer->process spawned) #f)
+                  (* 0.000244140625 (-> pos x)) (* 0.000244140625 (-> pos y)) (* 0.000244140625 (-> pos z)))
+          )
+      )
+    )
+  (none)
+  )
+
+(defun roboguard-ally-launch ((owner process-drawable))
+  ;; Needle Lazer: *roboguard-ally-count* roboguards, *roboguard-ally-spawn-dist* in front of the owner (a pair stands
+  ;; 30 degrees to each side), each one facing outwards. Returns how many were spawned.
+  (let* ((alive (roboguard-ally-count))
+         (n (min *roboguard-ally-count* (- *roboguard-ally-max* alive)))
+         (face (quaternion-y-angle (-> owner root quat)))
+         (fwd *roboguard-ally-fwd*)
+         (pos *roboguard-ally-pos*)
+         )
+    (if (and (< 0 n) (not (roboguard-ally-prepare-mesh owner)))
+        (set! n 0)
+        )
+    (when (< 0 n)
+      (dotimes (i n)
+        (let ((off (* (- (the float i) (* 0.5 (the float (- n 1)))) (degrees 30.0))))
+          (set-vector! fwd 0.0 0.0 *roboguard-ally-spawn-dist* 1.0)
+          (vector-rotate-around-y! fwd fwd (+ face off))
+          (vector+! pos (-> owner root trans) fwd)
+          (roboguard-ally-spawn owner pos (+ face off))
+          )
+        )
+      )
+    (format 0 "Roboguard ally: launched ~D (alive before ~D)~%" n alive)
+    n
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; REPL helpers
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun roboguard-ally-test ()
+  ;; launches them from Jak
+  (if *target*
+      (roboguard-ally-launch *target*)
+      0
+      )
+  )
+
+(defun roboguard-ally-clear ()
+  ;; removes every roboguard ally, quietly
+  (let ((p (-> *entity-pool* child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (proc (the-as process (-> p 0)))
+            )
+        (when (type? proc roboguard-ally)
+          (cleanup-for-death (the-as roboguard-ally proc))
+          (deactivate proc)
+          )
+        (set! p next)
+        )
+      )
+    )
+  (none)
+  )
+
+;; load check: this line must show in the console while the game boots
+(format 0 "roboguard-ally.gc loaded~%")
