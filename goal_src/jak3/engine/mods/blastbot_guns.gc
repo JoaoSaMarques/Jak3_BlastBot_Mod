@@ -937,7 +937,78 @@
 
 ;; ---- R1 handling (called every frame by the bot's active state) ----
 ;; Blue (Vulcan Fury) fires while R1 is HELD and speeds up the longer you hold; every other weapon (Arc Wielder, Needle Lazer too) is one shot per press.
+;; ---- Secret shop upgrades ----
+;; The secrets menu (*menu-secrets-array*) only sells bits of (-> *game-info* purchase-secrets). Nothing happens when a
+;; bit is bought; whoever checks the bit does the work. These functions are the Blast Bot's checks. The menu entries
+;; are the stock ones (same slot, same bit, same cost, same unlock mission), so the doc's upgrades map like this:
+;;   gun-upgrade-ammo-red/yellow/blue : heat meter doubled for that colour
+;;   gun-upgrade-red-1  Scattergun      : 7 x 4 grenades
+;;   gun-upgrade-red-2  Wave Concussor  : second, inner ring (16 total)
+;;   gun-upgrade-red-3  Plasmite RPG    : +5 spydroids (10 -> 15 per shot); max alive is *blast-bot-spydroid-max-upgraded* (doc: 30, kept at 20 for now)
+;;   gun-upgrade-yellow-2 Beam Reflexor : ricochet
+;;   gun-upgrade-yellow-3 Gyro Burster  : +1 sentinel (2 -> 3)
+;;   gun-upgrade-blue-1 Vulcan Fury     : ramps to a faster fire rate
+;;   gun-upgrade-blue-3 Needle Lazer    : +1 roboguard (1 -> 2)
+;;   endless-ammo (cheat)               : weapons never overheat
+;;   invulnerable (cheat)               : *blast-bot-god-mode* (blastbot-main-mod.gc), the bot ignores all damage
+(define *blast-bot-secrets-debug* #f)   ;; #t: print the upgrade set whenever it changes
+(define *blast-bot-secrets-last* (the-as int -1))
+;; Plasmite RPG upgrade: most spydroids alive at once. The doc says 30, but with more than about 20 droids on screen the
+;; shadow renderer overflows (Shadow2.cpp assertion, game exits), so it stays at 20 until their shadows are dealt with.
+(define *blast-bot-spydroid-max-upgraded* 20)
+(define *blast-bot-blue-fast-upgraded* 0.03)   ;; Vulcan Fury upgrade: seconds between shots at full spin-up (stock 0.05)
+
+(defmacro blast-bot-secret? (name)
+  `(logtest? (-> *game-info* purchase-secrets) (game-secrets ,name))
+  )
+
+(defun blast-bot-secrets-apply ()
+  ;; heat capacity belongs to the colour in hand
+  (set! *blast-bot-heat-capacity*
+        (case *blast-bot-gun-mode*
+          ((0) (if (blast-bot-secret? gun-upgrade-ammo-red) 2.0 1.0))
+          ((1) (if (blast-bot-secret? gun-upgrade-ammo-yellow) 2.0 1.0))
+          (else (if (blast-bot-secret? gun-upgrade-ammo-blue) 2.0 1.0))
+          )
+        )
+  ;; red
+  (if (blast-bot-secret? gun-upgrade-red-1)
+      (begin (set! *blast-bot-scatter-cols* 7) (set! *blast-bot-scatter-rows* 4))
+      (begin (set! *blast-bot-scatter-cols* 4) (set! *blast-bot-scatter-rows* 2))
+      )
+  (set! *blast-bot-wave-inner-ring* (blast-bot-secret? gun-upgrade-red-2))
+  (if (blast-bot-secret? gun-upgrade-red-3)
+      (begin (set! *spydroid-ally-count* 15) (set! *spydroid-ally-max* *blast-bot-spydroid-max-upgraded*))
+      (begin (set! *spydroid-ally-count* 10) (set! *spydroid-ally-max* 20))
+      )
+  ;; yellow
+  (set! *blast-bot-reflexor-ricochet* (blast-bot-secret? gun-upgrade-yellow-2))
+  (set! *sentinel-ally-count* (if (blast-bot-secret? gun-upgrade-yellow-3) 3 2))
+  ;; blue
+  (set! *blast-bot-blue-fast* (if (blast-bot-secret? gun-upgrade-blue-1) *blast-bot-blue-fast-upgraded* 0.05))
+  (set! *roboguard-ally-count* (if (blast-bot-secret? gun-upgrade-blue-3) 2 1))
+  ;; cheat
+  (set! *blast-bot-unlimited-ammo* (blast-bot-secret? endless-ammo))
+  ;; invulnerable: only ever turns god mode ON, so (set! *blast-bot-god-mode* #t) from the REPL still works without the purchase
+  (when (blast-bot-secret? invulnerable)
+    (set! *blast-bot-god-mode* #t)
+    )
+  (when *blast-bot-secrets-debug*
+    (let ((sig (+ (* 1000 *spydroid-ally-count*) (* 100 *sentinel-ally-count*) (* 10 *roboguard-ally-count*)
+                  (if *blast-bot-unlimited-ammo* 1 0))))
+      (when (!= sig *blast-bot-secrets-last*)
+        (set! *blast-bot-secrets-last* sig)
+        (format 0 "Blast Bot secrets: spydroids ~D (max ~D), sentinels ~D, roboguards ~D, unlimited ~A, heat x~f~%"
+                *spydroid-ally-count* *spydroid-ally-max* *sentinel-ally-count* *roboguard-ally-count*
+                *blast-bot-unlimited-ammo* *blast-bot-heat-capacity*)
+        )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-input ((this blast-bot-player))
+  (blast-bot-secrets-apply)
   (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2)
                    (!= *blast-bot-blue-weapon* 2) (!= *blast-bot-blue-weapon* 3))))
     (cond

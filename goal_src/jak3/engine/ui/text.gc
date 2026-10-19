@@ -156,9 +156,38 @@
 
 ;; og:preserve-this extracted implementation out so that callers of `lookup-text!` were uneffected
 ;; this implementation is different from the original (has fallback text lookup)
+;; Blast Bot mod: replacement names for the secrets menu (see *menu-secrets-array*). The stock strings live in the
+;; compiled .TXT files, so instead of editing those, lookup-text-impl! asks this first. #f = use the normal text.
+;; Applies to every language. Add a line here to rename any other text-id.
+(defun blast-bot-text-override ((arg0 text-id))
+  (cond
+    ((= arg0 (text-id progress-secrets-red-ammo-capacity)) "Red: Increased Ammo Capacity")
+    ((= arg0 (text-id progress-secrets-yellow-ammo-capacity)) "Yellow: Increased Ammo Capacity")
+    ((= arg0 (text-id progress-secrets-blue-ammo-capacity)) "Blue: Increased Ammo Capacity")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-red-1)) "Scattergun: Bigger Cone (7x4)")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-red-2)) "Wave Concussor: Inner Ring (16)")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-red-3)) "Plasmite RPG: +5 Spy Droids")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-yellow-1)) "Blaster: Auto-Mode")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-yellow-2)) "Beam Reflexor: Ricochet")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-yellow-3)) "Gyro Burster: +1 Sentinel")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-blue-1)) "Vulcan Fury: Faster Ramp-Up")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-blue-2)) "Arc Wielder: Chain Companions")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-blue-3)) "Needle Lazer: +1 Roboguard")
+    ((= arg0 (text-id progress-secrets-board-fast)) "Turbo Jetboard in Desert")
+    ((= arg0 (text-id progress-secrets-darkjak-tracking)) "Homing Attacks")
+    ((= arg0 (text-id progress-secrets-button-invis)) "Spy-Bot Invisibility")
+    ((= arg0 (text-id progress-secrets-endless-ammo)) "Unlimited Ammo")
+    ((= arg0 (text-id progress-secrets-invulnerable)) "Invulnerability")
+    (else #f)
+    )
+  )
+
 (define-extern lookup-text-impl! (function game-text-info text-id symbol symbol string))
 (defun lookup-text-impl! ((this game-text-info) (arg0 text-id) (arg1 symbol) (fallback-call? symbol))
   (cond
+    ((blast-bot-text-override arg0)
+     (the-as string (blast-bot-text-override arg0))
+     )
     ((= this #f)
      (cond
        (arg1

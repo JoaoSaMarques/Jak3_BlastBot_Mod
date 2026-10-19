@@ -64,7 +64,7 @@
    (spawn-time     time-frame)
    (scan-time      time-frame)
    (fire-time      time-frame)
-   (slot           int32)       ;; 0 = left of the bot, 1 = right
+   (slot           int32)       ;; 0 = left of the bot, 1 = right, 2 = behind (upgrade)
    (bob-phase      float)       ;; 0..1 hover bob, in turns
    )
   (:state-methods
@@ -164,15 +164,18 @@
   ;; hover at a spot beside the owner (left or right by slot), bobbing a little
   (let ((want *sentinel-ally-want*)
         (face (quaternion-y-angle (-> owner root quat)))
-        (side (if (zero? (-> this slot))
-                  (- *sentinel-ally-side*)
-                  *sentinel-ally-side*
-                  )
+        (side (cond
+                ((zero? (-> this slot)) (- *sentinel-ally-side*))
+                ((= (-> this slot) 1) *sentinel-ally-side*)
+                (else 0.0)                 ;; slot 2 (Gyro Burster upgrade): straight behind / above the bot
+                )
               )
+        (extra-back (if (> (-> this slot) 1) *sentinel-ally-back* 0.0))
+        (extra-up (if (> (-> this slot) 1) 8192.0 0.0))
         (k (fmin 1.0 (* *sentinel-ally-follow-rate* (seconds-per-frame))))
         )
     (+! (-> this bob-phase) (* 0.6 (seconds-per-frame)))
-    (set-vector! want side 0.0 (- *sentinel-ally-back*) 1.0)
+    (set-vector! want side extra-up (- (+ *sentinel-ally-back* extra-back)) 1.0)
     (vector-rotate-around-y! want want face)
     (vector+! want want (-> owner root trans))
     (+! (-> want y) (+ *sentinel-ally-height* (* 2048.0 (sin (* 65536.0 (-> this bob-phase))))))
