@@ -26,13 +26,13 @@
 (define *ahud-enabled* #t)              ;; #f = no counting and no boxes
 (define *ahud-debug* #f)                ;; #t: log the counts whenever they change
 ;; layout (hud pixels, 512 x 416)
-(define *ahud-x* 20)                    ;; left edge of the first box
+(define *ahud-x* 15)                    ;; left edge of the first box
 (define *ahud-y* 20)                    ;; top edge of the boxes
 (define *ahud-box* 40)                  ;; outer size of a box (square); the border is 4 pixels, so the inside is box - 8
-(define *ahud-gap* 2)                   ;; gap between two boxes
+(define *ahud-gap* 35)                   ;; gap between two boxes (Doesn't work?)
 (define *ahud-text-gap* 2)              ;; gap between a box and its number
-(define *ahud-text-scale* 1.0)          ;; size of the number (large font)
-(define *ahud-char-w* 7.0)              ;; width of one digit at scale 1.0, in hud pixels; only used to centre the number. Tune if it sits off-centre
+(define *ahud-text-scale* 0.5)          ;; size of the number (large font)
+(define *ahud-char-w* 20.0)              ;; width of one digit at scale 1.0, in hud pixels; only used to centre the number. Tune if it sits off-centre
 
 ;; living minions per kind, written by ahud-count-allies every frame
 (define *ahud-n-sd* 0)                  ;; spydroids
@@ -117,7 +117,7 @@
   ;; the number centred right under the box.
   (let* ((s (case kind ((0) 0) ((1) 3) (else 8)))
          (count (case kind ((0) 3) ((1) 5) (else 7)))
-         (x (+ *ahud-x* (* cell (+ *ahud-box* *ahud-gap*))))
+         (x (+ *ahud-x* (* cell (+ *ahud-gap*))))
          (y *ahud-y*)
          (ix (+ x 4))
          (iy (+ y 4))
@@ -136,21 +136,21 @@
         (case kind
           ((0)
            ;; red square
-           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 8) (+ iy 8) 16 16 255 40 40)
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 7) (+ iy 8) 16 16 255 40 40)
            )
           ((1)
-           ;; yellow triangle: three rows, 4 / 12 / 20 wide
-           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 14) (+ iy 6) 4 6 255 220 0)
-           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 10) (+ iy 12) 12 6 255 220 0)
-           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 6) (+ iy 18) 20 8 255 220 0)
+           ;; yellow triangle: three rows, 5 / 12 / 20 wide
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 11) (+ iy 6)  5 6 255 220 0)
+           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 8)  (+ iy 12) 12 6 255 220 0)
+           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 5) (+ iy 18) 20 8 255 220 0)
            )
           (else
             ;; blue X: four corner blocks and a centre block
-            (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 6) (+ iy 6) 6 6 60 120 255)
-            (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 20) (+ iy 6) 6 6 60 120 255)
-            (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 6) (+ iy 20) 6 6 60 120 255)
-            (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 20) (+ iy 20) 6 6 60 120 255)
-            (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 12) (+ iy 12) 8 8 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 4)  (+ iy 6)  6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 18) (+ iy 6)  6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 4)  (+ iy 20) 6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 18) (+ iy 20) 6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 10) (+ iy 12) 9 8 60 120 255)
             )
           )
         ;; the number: string KIND, centred under the box (x = 0 hides it)

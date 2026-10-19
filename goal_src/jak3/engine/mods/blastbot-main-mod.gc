@@ -1128,7 +1128,7 @@
 (define *bbh-margin-x* 20)   ;; gap to the left screen edge
 (define *bbh-margin-y* 22)   ;; gap to the bottom screen edge
 (define *bbh-bar-w* 104)     ;; width of every bar
-(define *bbh-col-gap* 12)    ;; gap between the two columns
+(define *bbh-col-gap* 280)    ;; gap between the two columns
 (define *bbh-hp-h* 18)       ;; health + weapon bar height
 (define *bbh-sh-h* 12)       ;; shield + heat bar height
 (define *bbh-jump-h* 8)
