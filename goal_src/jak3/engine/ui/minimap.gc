@@ -7,6 +7,10 @@
 
 ;; DECOMP BEGINS
 
+;; Blast Bot mod: how many hud pixels (512 x 416) the minimap is lifted, so it clears the bot's weapon + heat bars in the
+;; bottom right corner. 0 = stock position. Applied in draw-1 only (not the race map).
+(define *minimap-raise* 56)
+
 (deftype minimap-texture-name-array (structure)
   ((data  string  35)
    )
@@ -3517,6 +3521,7 @@
   (let ((gp-0 (new 'stack-no-clear 'minimap-draw-work)))
     (set! (-> gp-0 buf) arg0)
     (set! (-> gp-0 draw-pos quad) (-> arg1 quad))
+    (set! (-> gp-0 draw-pos y) (- (-> gp-0 draw-pos y) *minimap-raise*))
     (set! (-> gp-0 justify-right) arg2)
     (set! (-> gp-0 global-flags) (the-as uint 0))
     (if (= (level-status? *level* 'ctywide #f) 'active)

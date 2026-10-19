@@ -45,6 +45,7 @@
 (define *roboguard-ally-collide-each-other* #t) ;; #t: allies block each other instead of overlapping
 (define *roboguard-ally-spawn-dist* 49152.0)    ;; 12 m in front of the owner
 (define *roboguard-ally-tracer* #t)             ;; #t: a short red streak from the muzzle to the target on every shot
+(define *roboguard-ally-ignore-los* #t)         ;; #t: the stock line-of-sight gate for shooting is skipped (see hostile-stand / shoot-attack below)
 (define *roboguard-ally-debug* #t)              ;; #t: print launches, target changes and state changes
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -198,6 +199,9 @@
 (defun roboguard-ally-shoot ((this roboguard-ally) (muzzle vector))
   ;; one shot: damage the focus directly (the stock guard projectile would only ever hurt Jak or the bot)
   (let ((p (as-type (handle->process (-> this focus handle)) process-focusable)))
+    (when *roboguard-ally-debug*
+      (format 0 "roboguard ally: shot at ~A (valid ~A)~%" p (roboguard-ally-valid-target? this p))
+      )
     (when (roboguard-ally-valid-target? this p)
       (let ((tp (get-trans p 3)))
         (roboguard-ally-tracer muzzle tp)
@@ -445,6 +449,84 @@ Jak or the bot, and the punch sphere stays off (the punch damage is sent by robo
     (seek! (-> self arm-rot-mult 0) 0.0 (* 10.0 (seconds-per-frame)))
     (seek! (-> self arm-rot-mult 1) 0.0 (* 10.0 (seconds-per-frame)))
     (nav-enemy-simple-post)
+    )
+  )
+
+(defstate hostile-stand (roboguard-ally)
+  :virtual #t
+  :trans (behavior ()
+    ;; the stock trans, with one change: shooting no longer needs the stock line-of-sight check (should-check-los?).
+    ;; That check never passed for an ally (it probes toward the focus with the stock enemy collide masks), so the
+    ;; roboguard only ever walked up and punched. Every other handler of the state is inherited.
+    (when (and (time-elapsed? (-> self state-time) (-> self reaction-time)) (ja-done? 0))
+      (if (or (and (< 65536.0 (vector-vector-xz-distance (-> self focus-pos) (-> self root trans)))
+                   (< 2048.0 (vector-vector-xz-distance (-> self root trans) (-> self formation-position)))
+                   )
+              (< 14336.0 (vector-vector-xz-distance (-> self root trans) (-> self formation-position)))
+              )
+          (go-virtual hostile)
+          )
+      (when (and (time-elapsed? (-> self state-time) (seconds 0.3))
+                 (and (< (fabs (-> self torso-to-focus-angle)) 3640.889) (get-focus! self))
+                 )
+        (cond
+          ((>= 24576.0 (vector-vector-xz-distance (-> self root trans) (-> self focus-pos)))
+           (go-virtual close-attack)
+           )
+          ((or *roboguard-ally-ignore-los* (should-check-los? (-> self los) (seconds 0.4)))
+           (go-virtual shoot-attack)
+           )
+          )
+        )
+      )
+    )
+  )
+
+(defstate shoot-attack (roboguard-ally)
+  :virtual #t
+  :trans (behavior ()
+    ;; the stock trans, with one change: the burst is no longer cancelled when the stock line-of-sight check says "lost"
+    ;; (los-control-method-11). It ends after 8 shots like the stock one, or when the target gets into punch range.
+    (when (and (time-elapsed? (-> self state-time) (seconds 0.2)) (zero? (-> self skel float-channels)))
+      (if (or (= (-> self fire-count) 8)
+              (and (not *roboguard-ally-ignore-los*) (los-control-method-11 (-> self los) (seconds 0.1)))
+              )
+          (go-virtual hostile-stand)
+          )
+      (let ((f0-0 (vector-vector-xz-distance (-> self focus-pos) (-> self root trans))))
+        (if (>= 24576.0 f0-0)
+            (go-virtual close-attack)
+            )
+        )
+      (let ((v1-22 (ja-channel-float! (the-as art-joint-anim roboguard-idle-shoot0-loop-ja) 0.0 1.0 0.0)))
+        (when v1-22
+          (set! (-> self skel interp-select 0) #x1bbf8)
+          (set! (-> self skel interp-select 1) 0)
+          (set! (-> v1-22 param 0) 1.0)
+          (set! (-> v1-22 param 1) 1.0)
+          (set! (-> v1-22 param 2) 2.0)
+          (set! (-> v1-22 num-func) num-func-interp1-play!)
+          )
+        )
+      (set-time! (-> self fire-time))
+      )
+    (let ((gp-0 (joint-control-method-12 (-> self skel) 0)))
+      (when gp-0
+        (let ((f1-1 (-> gp-0 frame-num))
+              (f0-4 (-> self last-torso-frame-num))
+              )
+          (cond
+            ((and (< 0.5 f1-1) (>= 0.5 f0-4))
+             (roboguard-method-196 self 11)
+             )
+            ((and (< 3.0 f1-1) (>= 3.0 f0-4))
+             (roboguard-method-196 self 15)
+             )
+            )
+          )
+        (set! (-> self last-torso-frame-num) (-> gp-0 frame-num))
+        )
+      )
     )
   )
 

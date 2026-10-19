@@ -310,6 +310,19 @@
 (defstate die (sentinel-ally)
   :virtual #t
   :code (behavior ()
+    ;; blows up (same explosion as the roboguard's) instead of just disappearing. The effect is a child of this
+    ;; process, so wait for it before deactivating.
+    (sound-play "robo-explode" :position (-> self root trans))
+    (logior! (-> self draw status) (draw-control-status no-draw))
+    (vector-copy! (-> *launch-matrix* trans) (-> self root trans))
+    (if (logtest? (-> group-kg-explosion flags) (sp-group-flag sp13))
+        (part-tracker-spawn part-tracker-subsampler :to self :group group-kg-explosion)
+        (part-tracker-spawn part-tracker :to self :group group-kg-explosion)
+        )
+    (set-time! (-> self state-time))
+    (until (time-elapsed? (-> self state-time) (seconds 1.5))
+      (suspend)
+      )
     (deactivate self)
     )
   )
