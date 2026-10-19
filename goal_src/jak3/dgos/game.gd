@@ -507,6 +507,7 @@
   "mod-common-functions.o" ;; added
   "blastbot-main-mod.o" ;; added - the Blast Bot itself, its HUD and spawn functions (must be before blastbot_guns.o and mod-custom-code.o)
   "blastbot_guns.o" ;; added - Blast Bot weapons (must be after blastbot-main-mod.o, which it needs for the blast-bot-player type)
+  "blastbot-spybot.o" ;; added - Blast Bot's Spybot (must be after blastbot-main-mod.o, which it needs for the blast-bot-player type)
   "orb-placer.o"  ;; added
   "mod-custom-code.o" ;; added
   "path-editor-h.o" ;; added - path-editor-h

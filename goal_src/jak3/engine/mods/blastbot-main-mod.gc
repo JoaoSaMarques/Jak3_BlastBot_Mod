@@ -135,6 +135,13 @@
 (define-extern blast-bot-yellow-update (function blast-bot-player none))
 (define-extern blast-bot-scan-update (function blast-bot-player none))
 (define-extern blast-bot-fire-input (function blast-bot-player none))
+;; L2 spy-bot (blastbot-spybot.gc). While *blast-bot-spy-active* the bot stands idle: no steering, jumping, dash, hover,
+;; shield or shooting, and the camera zooms in (*blast-bot-spy-cam-zoom*, 1.0 = the normal distance) on the droid.
+(define *blast-bot-spy-active* #f)
+(define *blast-bot-spy-cam-zoom* 0.4)
+(define *blast-bot-spy-turret-speed* 5461.33)   ;; while spying, the turret spins this fast, in angle units per second (65536 = 360 degrees: 5461 = 30 degrees/s, one turn in 12 s)
+(define *blast-bot-spy-turret-angle* 0.0)
+(define-extern spybot-toggle (function none))
 
 
 (defun blast-bot-credit-jak! ((info attack-info))
@@ -356,7 +363,7 @@
 (defun blast-bot-foot-landed ((this blast-bot-player) (i int))
   ;; A foot just planted: footstep camera shake (only while walking) + stomp.
   (when (< 0.2 (-> this speed))
-    (activate! *camera-smush-control* (* 256.0 (-> this speed)) 37 45 1.0 0.95 (-> this clock))
+    (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* (* 256.0 (-> this speed)) 37 45 1.0 0.95 (-> this clock)))
     )
   (when (>= (current-time) (-> this foot-cool i))
     (set! (-> this foot-cool i) (+ (current-time) (seconds 0.3)))
@@ -805,6 +812,8 @@
 
 (defun blast-bot-update-aim ((this blast-bot-player))
   ;; Call every frame from :post. Locks on to the nearest visible enemy, otherwise follows the camera's left/right.
+  ;; While the spy droid is out (*blast-bot-spy-active*) the camera is on the droid, so with NO enemy to lock on to the turret
+  ;; turns slowly through 360 degrees on its own instead. The lock-on (and the Blaster's auto-mode) work as usual.
   (let ((p (as-type (handle->process (-> this lock-handle)) process-focusable)))
     ;; drop a bad lock right away, and re-pick the nearest enemy every 20 frames
     (when (or (not (blast-bot-lock-ok? this p))
@@ -818,13 +827,24 @@
         (vector-copy! (-> this target-pos) (get-trans p 3))
         )
       (else
-        ;; no enemy: only swing left/right with the camera, gun stays level
+        ;; no enemy: swing left/right with the camera (gun stays level), or spin while the spy droid is out
         (let ((flat (new 'stack-no-clear 'vector))
               (pos (new 'stack-no-clear 'vector))
               )
           (set! (-> this locked) #f)
           (matrix->trans (-> this node-list data 5 bone transform) pos)
-          (vector-copy! flat (-> (camera-matrix) fvec))
+          (cond
+            (*blast-bot-spy-active*
+              (set! *blast-bot-spy-turret-angle* (+ *blast-bot-spy-turret-angle* (* *blast-bot-spy-turret-speed* (seconds-per-frame))))
+              (if (< 65536.0 *blast-bot-spy-turret-angle*)
+                  (set! *blast-bot-spy-turret-angle* (- *blast-bot-spy-turret-angle* 65536.0))
+                  )
+              (set-vector! flat (sin *blast-bot-spy-turret-angle*) 0.0 (cos *blast-bot-spy-turret-angle*) 1.0)
+              )
+            (else
+              (vector-copy! flat (-> (camera-matrix) fvec))
+              )
+            )
           (set! (-> flat y) 0.0)
           (vector-normalize! flat 204800.0)
           (vector+! (-> this target-pos) pos flat)
@@ -973,7 +993,7 @@
     )
   (vector-copy! (-> this last-trans) (-> this root trans))
   (vector-reset! (-> this linear-speed))
-  (activate! *camera-smush-control* 1024.0 37 120 1.0 0.99 (-> this clock))
+  (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 1024.0 37 120 1.0 0.99 (-> this clock)))
   (blast-bot-foot-attack this (-> this root trans) 36864.0)
   (none)
   )
@@ -1005,7 +1025,7 @@
           (set! (-> this jump-x-released) (not (cpad-hold? 0 x)))
           (set! (-> this thrusting) #f)
           )
-         ((cpad-pressed? 0 x)
+         ((and (cpad-pressed? 0 x) (not *blast-bot-spy-active*))
           (set! (-> this jump-mode) 1)
           (set! (-> this jump-timer) (current-time))
           )
@@ -1030,7 +1050,7 @@
          (set! (-> this jump-timer) (current-time))
          (set! (-> this jump-x-released) #f)
          (set! (-> this thrusting) #f)
-         (activate! *camera-smush-control* 512.0 37 60 1.0 0.99 (-> this clock))
+         (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 512.0 37 60 1.0 0.99 (-> this clock)))
          )
        )
       ((2)
@@ -2054,7 +2074,7 @@
               )
         (set! (-> this hit-flash) 1.0)
         (set! (-> this health) (fmax 0.0 (- (-> this health) (* amount *blast-bot-damage-scale*))))
-        (activate! *camera-smush-control* 768.0 37 60 1.0 0.99 (-> this clock))
+        (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 768.0 37 60 1.0 0.99 (-> this clock)))
         (cpad-set-buzz! (-> *cpad-list* cpads 0) 1 200 (seconds 0.2))
         (format 0 "Blast Bot: hit for ~f, health ~f / ~f~%" amount (-> this health) (-> this max-health))
         (if (<= (-> this health) 0.0)
@@ -2310,13 +2330,19 @@
     (blast-bot-absorb-push self)
     (blast-bot-jump-update self)
     (blast-bot-hazard-check self)
+    ;; L2: launch the spy droid / summon the bot to it (blastbot-spybot.gc). Handled here, in the bot's own state, so it does
+    ;; not depend on how your mod code calls blast-bot-pad-check.
+    (when (cpad-pressed? 0 l2)
+      (format 0 "Spy bot: L2 pressed~%")
+      (spybot-toggle)
+      )
     (let ((speed (-> *cpad-list* cpads 0 stick0-speed))
           (dt (seconds-per-frame))
           (dashing (< (current-time) (-> self dash-until)))
           )
       (set! (-> self input-active) #f)
       (seek! (-> self hit-flash) 0.0 (* dt 3.0))
-      (when (< 0.05 speed)
+      (when (and (< 0.05 speed) (not *blast-bot-spy-active*))
         (let ((move (new 'stack-no-clear 'vector)))
           (vector-copy! move (-> *math-camera* inv-camera-rot fvec))
           (set! (-> move y) 0.0)
@@ -2340,7 +2366,7 @@
       ;; R2 hover glide: the velocity follows the stick (accel) and bleeds off slowly when it is released (decel),
       ;; so the bot keeps drifting instead of stopping dead. Walking (hover off) is unchanged.
       (cond
-        ((and (-> self hover-on) (= (-> self jump-mode) 0) (not dashing))
+        ((and (-> self hover-on) (= (-> self jump-mode) 0) (not dashing) (not *blast-bot-spy-active*))
          (let* ((top (* 49152.0 (if (-> self input-active) speed 0.0) (-> self ramp)))
                 (tx (if (-> self input-active) (* (sin (-> self input-yaw)) top) 0.0))
                 (tz (if (-> self input-active) (* (cos (-> self input-yaw)) top) 0.0))
@@ -2378,7 +2404,7 @@
         )
       ;; camera: the follow camera has a limited speed, so pull it back the faster the bot glides
       (let* ((spd (/ (sqrtf (+ (* (-> self hover-vx) (-> self hover-vx)) (* (-> self hover-vz) (-> self hover-vz)))) 49152.0))
-             (want (+ 1.0 (* *blast-bot-cam-pullback* (fmin 1.0 (fmax 0.0 (/ (- spd 1.0) 3.0))))))
+             (want (if *blast-bot-spy-active* *blast-bot-spy-cam-zoom* (+ 1.0 (* *blast-bot-cam-pullback* (fmin 1.0 (fmax 0.0 (/ (- spd 1.0) 3.0)))))))
              )
         (seek! (-> self cam-zoom) want (* dt 1.5))
         (when (< 0.02 (fabs (- (-> self cam-zoom) (-> self cam-zoom-set))))
@@ -2401,7 +2427,7 @@
           (seek! (-> self ramp) 1.0 (* dt (if (-> self hover-on) 0.25 2.0)))
           )
       ;; Square: charge forward in the stick direction (or where the head already points)
-      (when (and (cpad-pressed? 0 square)
+      (when (and (cpad-pressed? 0 square) (not *blast-bot-spy-active*)
                  (= (-> self jump-mode) 0)
                  (not dashing)
                  (>= (current-time) (-> self dash-ready))
@@ -2412,7 +2438,7 @@
         (set! (-> self dash-ready) (+ (current-time) (seconds 1.0)))
         (set! (-> self dash-id) (new-attack-id))
         (set! dashing #t)
-        (activate! *camera-smush-control* 768.0 37 60 1.0 0.99 (-> self clock))
+        (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 768.0 37 60 1.0 0.99 (-> self clock)))
         )
       (when dashing
         (let* ((amount (* *blast-bot-dash-speed* dt))
@@ -2425,7 +2451,7 @@
             ;; hit a wall: the charge ends with a bang
             (set! (-> self dash-until) 0)
             (set! (-> self ramp) 1.0)
-            (activate! *camera-smush-control* 1024.0 37 90 1.0 0.99 (-> self clock))
+            (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 1024.0 37 90 1.0 0.99 (-> self clock)))
             )
           )
         )
@@ -2441,7 +2467,7 @@
       (blast-bot-scan-update self)
       ;; R2 (held): hover. Legs sweep back and the body floats up.
       ;; R2 (press): toggle hover on/off. Only switchable from the ground or while airborne.
-      (when (and (cpad-pressed? 0 r2) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2)))
+      (when (and (cpad-pressed? 0 r2) (not *blast-bot-spy-active*) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2)))
         (set! (-> self hover-on) (not (-> self hover-on)))
         )
       (seek! (-> self hover-blend)
@@ -2450,7 +2476,7 @@
       (set! (-> self hover-lift) (* (-> self hover-blend) *blast-bot-hover-height*))
       ;; Circle (held): the mech's shield. Movement is not touched.
       (blast-bot-update-shield-break self)
-      (let ((want (and (cpad-hold? 0 circle) (zero? (-> self shield-broken-until)))))
+      (let ((want (and (cpad-hold? 0 circle) (not *blast-bot-spy-active*) (zero? (-> self shield-broken-until)))))
         (when (!= want (-> self shield-on))
           (set! (-> self shield-on) want)
           (format 0 "Blast Bot: shield ~A (handle ok: ~A)~%" (if want 'on 'off) (if (handle->process (-> self shield-handle)) #t #f))
@@ -2484,7 +2510,9 @@
                               (else 0.0)
                               ))
       )
-    (blast-bot-fire-input self)   ;; R1 for every weapon: see blastbot_guns.gc
+    (if (not *blast-bot-spy-active*)
+        (blast-bot-fire-input self)   ;; R1 for every weapon: see blastbot_guns.gc
+        )
     ;; our own shots start inside the shield: its hit sphere is off for a moment after each shot so they fly out
     (let ((sh (as-type (handle->process (-> self shield-handle)) shield-sphere)))
       (when sh
@@ -2607,7 +2635,7 @@
       )
     (logior! (-> self draw status) (draw-control-status no-draw))
     (format 0 "Blast Bot: die 4 - camera / explosion~%")
-    (activate! *camera-smush-control* 1024.0 37 210 1.0 0.995 (-> self clock))
+    (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 1024.0 37 210 1.0 0.995 (-> self clock)))
     ;; big visual-only explosion (the group comes from the krimson guard / bombbot code; skipped when it is not loaded)
     (when (and *blast-bot-death-explosion* group-kg-huge-explosion (nonzero? group-kg-huge-explosion))
       (let ((gp (new 'stack-no-clear 'explosion-init-params)))

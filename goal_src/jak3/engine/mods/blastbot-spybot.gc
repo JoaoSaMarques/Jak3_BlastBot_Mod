@@ -1,0 +1,559 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; blastbot-spybot.gc: L2 = launch a small spydroid you drive, L2 again = summon the blast bot to where the droid is.
+;;
+;;   L2 (first press)   the blast bot stays where it is (idle, Jak stays inside it) and a spydroid walks out in front of it.
+;;                      The camera follows and zooms in on the droid. Stick = walk, Square = headbutt (shock damage 2).
+;;   L2 (second press)  the blast bot is moved to the droid's position, the droid is removed and the camera goes back.
+;;   If the droid is destroyed, or the bot is despawned, control simply goes back without moving the bot.
+;;
+;; LOAD ORDER: put this file LAST in your list (after blastbot-main-mod, blastbot_guns, spydroid-ally, roboguard-ally...)
+;; because it uses the blast-bot-player and spydroid-ally types. blastbot-main-mod.gc calls spybot-toggle from the bot's own
+;; :trans when L2 is pressed (declared there with define-extern).
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Knobs (all can be changed from the REPL)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *spybot-speed* 32768.0)        ;; walk speed at full stick: 8 m/s
+(define *spybot-turn-rate* 91022.0)    ;; how fast it turns to face the way you steer (500 degrees/s)
+(define *spybot-lunge-speed* 49152.0)  ;; forward speed during the headbutt jump: 12 m/s
+(define *spybot-damage* 2.0)           ;; headbutt shock damage (doc: 2)
+(define *spybot-reach* 12288.0)        ;; headbutt reach, 3 m, measured to the target's edge
+(define *spybot-hp* 3)                 ;; hits it survives (enemy attacks count at most once per 0.5 s)
+(define *spybot-scale* 1.0)            ;; model size multiplier (1.0 = stock spydroid)
+(define *spybot-wall-radius* 2560.0)   ;; 0.625 m: walls stop the droid this far from its centre
+(define *spybot-wall-height* 5120.0)   ;; wall probe height above the feet (1.25 m): its bottom is 0.625 m up, so lips and steps lower than that are walked over
+(define *spybot-gravity* 163840.0)     ;; 40 m/s^2
+(define *spybot-spawn-dist* 0.0)       ;; spawns this far in front of the blast bot (0 = right at its centre)
+
+(define-extern spybot-end (function symbol none))
+
+(define *spybot-box* (new 'global 'vector))
+(define *spybot-hits* (new 'global 'array 'collide-shape 64))
+(define *spybot-pos* (new 'global 'vector))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Type
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(deftype spy-bot-player (process-focusable)
+  ((yaw        float)       ;; the way the droid faces
+   (vy         float)       ;; vertical speed (falling)
+   (anim-mode  int32)       ;; 0 = walking / idle, 1 = headbutt jump, 2 = headbutt landing
+   (cur-anim   int32)       ;; art-group index of the looping animation, -1 = none yet
+   (hb-ready   time-frame)  ;; headbutt cooldown
+   (hb-hit     time-frame)  ;; last time the headbutt hit something (one hit per 0.1 s)
+   (hb-id      uint32)      ;; attack id of the current headbutt: an enemy only takes one hit per swing
+   (hurt-time  time-frame)  ;; last time an enemy attack was counted
+   (hp         int32)
+   (is-dead    int32)       ;; 0 = alive (a symbol field would read as truthy before init)
+   )
+  (:state-methods
+    active
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Helpers
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun spybot-find ()
+  ;; the first spy-bot-player in the entity pool, or #f
+  (let ((p (-> *entity-pool* child))
+        (found (the-as process #f))
+        )
+    (while (and p (not found))
+      (if (type? (-> p 0) spy-bot-player)
+          (set! found (the-as process (-> p 0)))
+          )
+      (set! p (-> p 0 brother))
+      )
+    found
+    )
+  )
+
+(defun spybot-valid-target? ((this spy-bot-player) (p process-focusable))
+  ;; what the headbutt may hit: enemies, crimson guards, metalheads, kg robots. Not Jak, not the bot, not the allies.
+  (and p
+       (!= this p)
+       (!= p *target*)
+       (not (type? p spydroid-ally))
+       (not (type? p roboguard-ally))
+       (not (type? p blast-bot-player))
+       (not (focus-test? p inactive))
+       (not (blast-target-dead? p))
+       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+       (not (logtest? (process-mask crate civilian) (-> p mask)))
+       (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
+       )
+  )
+
+(defun spybot-ground-y ((this spy-bot-player) (up float))
+  ;; height of the ground under the droid (probing down from UP units above it), or -1e9 if there is none
+  (let ((q (new 'stack-no-clear 'collide-query)))
+    (vector+*! (-> q start-pos) (-> this root trans) *y-vector* up)
+    (vector-float*! (-> q move-dist) *y-vector* -163840.0)
+    (set! (-> q radius) 40.96)
+    (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+    (set! (-> q ignore-process0) #f)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat)
+          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q action-mask) (collide-action solid))
+    (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+      (if (>= hit 0.0)
+          (+ (-> q start-pos y) (* hit (-> q move-dist y)))
+          -1000000000.0
+          )
+      )
+    )
+  )
+
+(defun spybot-ground-update ((this spy-bot-player))
+  ;; stick to the ground (steps up slopes and stairs), fall when there is none right below
+  (let* ((dt (seconds-per-frame))
+         (gy (spybot-ground-y this 8192.0))
+         (y (-> this root trans y))
+         )
+    (cond
+      ((and (< -900000000.0 gy) (>= gy (- y 4096.0)))
+       (set! (-> this root trans y) gy)
+       (set! (-> this vy) 0.0)
+       )
+      (else
+        (set! (-> this vy) (- (-> this vy) (* *spybot-gravity* dt)))
+        (let ((ny (+ y (* (-> this vy) dt))))
+          (cond
+            ((and (< -900000000.0 gy) (<= ny gy))
+             (set! (-> this root trans y) gy)
+             (set! (-> this vy) 0.0)
+             )
+            (else
+              (set! (-> this root trans y) ny)
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun spybot-move-xz ((this spy-bot-player) (dx float) (dz float))
+  ;; Move the droid horizontally by (dx, dz). Steep surfaces (walls, platforms, doors) stop it and it slides along them.
+  ;; Same method as blast-bot-move-xz, with a droid-sized probe. Returns the fraction of the move that happened.
+  (let* ((q (new 'stack-no-clear 'collide-query))
+         (move (new 'stack-no-clear 'vector))
+         (n (new 'stack-no-clear 'vector))
+         (ext (new 'stack-no-clear 'vector))
+         (start (new 'stack-no-clear 'vector))
+         (before-x (-> this root trans x))
+         (before-z (-> this root trans z))
+         (intended (sqrtf (+ (* dx dx) (* dz dz))))
+         )
+    (set-vector! move dx 0.0 dz 1.0)
+    (when (< 1.0 intended)
+      (set-vector! ext 20480.0 16384.0 20480.0 1.0)
+      (set-vector! start (-> this root trans x) (+ (-> this root trans y) *spybot-wall-height*) (-> this root trans z) 1.0)
+      (vector-! (-> q bbox min) start ext)
+      (vector+! (-> q bbox max) start ext)
+      (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+      (set! (-> q ignore-process0) this)
+      (set! (-> q ignore-process1) #f)
+      (set! (-> q ignore-pat)
+            (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+      (fill-using-bounding-box *collide-cache* q)
+      (dotimes (iter 2)
+        (when (< 1.0 (vector-length move))
+          (set-vector! start (-> this root trans x) (+ (-> this root trans y) *spybot-wall-height*) (-> this root trans z) 1.0)
+          (vector-copy! (-> q start-pos) start)
+          (vector-copy! (-> q move-dist) move)
+          (set! (-> q radius) *spybot-wall-radius*)
+          (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+          (set! (-> q action-mask) (collide-action solid))
+          (let ((hit (if (< 0 (-> *collide-cache* num-tris))
+                         (probe-using-line-sphere *collide-cache* q)
+                         -1.0
+                         )
+                     )
+                )
+            (cond
+              ((and (>= hit 0.0) (< (fabs (-> q best-other-tri normal y)) 0.7))
+               (let ((frac0 (fmax 0.0 (- hit 0.03))))
+                 (+! (-> this root trans x) (* (-> move x) frac0))
+                 (+! (-> this root trans z) (* (-> move z) frac0))
+                 )
+               (vector-copy! n (-> q best-other-tri normal))
+               (set! (-> n y) 0.0)
+               (if (< 0.01 (vector-length n))
+                   (vector-normalize! n 1.0)
+                   (set-vector! n 0.0 0.0 0.0 1.0)
+                   )
+               (vector-float*! move move (- 1.0 hit))
+               (let ((d (vector-dot move n)))
+                 (when (< d 0.0)
+                   (vector+*! move move n (- d))
+                   )
+                 )
+               (set! (-> move y) 0.0)
+               )
+              (else
+                (+! (-> this root trans x) (-> move x))
+                (+! (-> this root trans z) (-> move z))
+                (vector-reset! move)
+                )
+              )
+            )
+          )
+        )
+      )
+    (let ((ddx (- (-> this root trans x) before-x))
+          (ddz (- (-> this root trans z) before-z))
+          )
+      (if (< 1.0 intended)
+          (/ (sqrtf (+ (* ddx ddx) (* ddz ddz))) intended)
+          1.0
+          )
+      )
+    )
+  )
+
+(defun spybot-headbutt ((this spy-bot-player))
+  ;; Called every frame while the droid is in the air part of its headbutt: every valid enemy in reach gets a shock.
+  ;; hb-id is fresh per swing, so an enemy ignores repeat hits of one jump (same scheme as spydroid-ally-headbutt-update).
+  (when (time-elapsed? (-> this hb-hit) (seconds 0.1))
+    (let ((box *spybot-box*)
+          (hits *spybot-hits*)
+          )
+      (vector-copy! box (-> this root trans))
+      (set! (-> box w) 81920.0)
+      (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+        (let ((cs (as-type (-> hits i) collide-shape)))
+          (when cs
+            (let ((p (as-type (-> cs process) process-focusable)))
+              (when (and (spybot-valid-target? this p)
+                         (< (vector-vector-xz-distance (-> this root trans) (-> p root trans)) (+ *spybot-reach* (-> p root nav-radius)))
+                         (< (fabs (- (-> p root trans y) (-> this root trans y))) 16384.0)
+                         )
+                (set-time! (-> this hb-hit))
+                (send-event p 'attack #f
+                            (static-attack-info :mask (vehicle-impulse-factor) ((id (-> this hb-id))
+                                                                                (damage *spybot-damage*)
+                                                                                (vehicle-damage-factor 1.0)
+                                                                                (vehicle-impulse-factor 1.0)
+                                                                                (mode 'shock)
+                                                                                (attacker (if *target*
+                                                                                              (process->handle *target*)
+                                                                                              (process->handle this)
+                                                                                              ))
+                                                                                )
+                                                )
+                            )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Per-frame control (a behavior, so it can drive the animation)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defbehavior spybot-play spy-bot-player ((idx int))
+  ;; switch the looping animation to art-group entry IDX (spydroid-orig: 3 idle, 4 walk, 5 run)
+  (when (!= (-> self cur-anim) idx)
+    (set! (-> self cur-anim) idx)
+    (ja-channel-push! 1 (seconds 0.15))
+    (ja :group! (-> self draw art-group data idx) :num! min)
+    )
+  0
+  )
+
+(defbehavior spybot-update spy-bot-player ()
+  (let ((dt (seconds-per-frame))
+        (speed (-> *cpad-list* cpads 0 stick0-speed))
+        )
+    (case (-> self anim-mode)
+      ((0)
+       ;; walking / idle: the stick steers relative to the camera, the body turns to face the way it goes
+       (let ((moving #f))
+         (when (< 0.05 speed)
+           (let ((move (new 'stack-no-clear 'vector)))
+             (vector-copy! move (-> *math-camera* inv-camera-rot fvec))
+             (set! (-> move y) 0.0)
+             (vector-normalize! move 1.0)
+             (vector-rotate-around-y! move move (-> *cpad-list* cpads 0 stick0-dir))
+             (set! (-> self yaw) (deg-seek (-> self yaw) (vector-y-angle move) (* *spybot-turn-rate* dt)))
+             (let ((amount (* *spybot-speed* speed dt)))
+               (spybot-move-xz self (* (-> move x) amount) (* (-> move z) amount))
+               )
+             (set! moving #t)
+             )
+           )
+         ;; animation
+         (cond
+           ((not moving)
+            (spybot-play 3)
+            (ja :num! (loop!))
+            )
+           ((< speed 0.5)
+            (spybot-play 4)
+            (ja :num! (loop! (fmax 0.5 (* 2.0 speed))))
+            )
+           (else
+             (spybot-play 5)
+             (ja :num! (loop! (* 2.0 speed)))
+             )
+           )
+         )
+       ;; Square: headbutt
+       (when (and (cpad-pressed? 0 square) (>= (current-time) (-> self hb-ready)))
+         (set! (-> self anim-mode) 1)
+         (set! (-> self hb-ready) (+ (current-time) (seconds 1.0)))
+         (set! (-> self hb-id) (new-attack-id))
+         (set! (-> self cur-anim) -1)
+         (ja-channel-push! 1 (seconds 0.1))
+         (ja :group! spydroid-orig-attack-jump-ja :num! min)
+         )
+       )
+      ((1)
+       ;; the jump: lunges forward, dangerous from frame 4 on
+       (ja :num! (seek!))
+       (let ((amount (* *spybot-lunge-speed* dt)))
+         (spybot-move-xz self (* (sin (-> self yaw)) amount) (* (cos (-> self yaw)) amount))
+         )
+       (if (< 4.0 (ja-aframe-num 0))
+           (spybot-headbutt self)
+           )
+       (when (ja-done? 0)
+         (set! (-> self anim-mode) 2)
+         (ja :group! spydroid-orig-attack-land-ja :num! min)
+         )
+       )
+      (else
+        ;; landing
+        (ja :num! (seek!))
+        (when (ja-done? 0)
+          (set! (-> self anim-mode) 0)
+          (set! (-> self cur-anim) -1)
+          )
+        )
+      )
+    )
+  (spybot-ground-update self)
+  (quaternion-vector-angle! (-> self root quat) *up-vector* (-> self yaw))
+  ;; destroyed, or the bot is gone (despawned / killed): control goes back. This removes the droid, so it comes last.
+  (when (or (<= (-> self hp) 0) (not (blast-bot-find)))
+    (set! (-> self is-dead) 1)
+    (spybot-end #f)
+    )
+  0
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; State
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defstate active (spy-bot-player)
+  :virtual #t
+  :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
+    (case message
+      (('attack 'attack-invinc)
+       ;; enemy shots / swings: one hit point per 0.5 s at most
+       (when (and proc
+                  (!= proc *target*)
+                  (time-elapsed? (-> self hurt-time) (seconds 0.5))
+                  )
+         (set-time! (-> self hurt-time))
+         (+! (-> self hp) -1)
+         )
+       #t
+       )
+      (else
+        #f
+        )
+      )
+    )
+  :trans (behavior ()
+    (spybot-update)
+    )
+  :code sleep-code
+  :post (behavior ()
+    (ja-post)
+    (update-transforms (-> self root))
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Init
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defbehavior spy-bot-player-init-by-other spy-bot-player ((pos vector) (yaw float))
+  ;; collision: the stock droid's shapes (a group with one body sphere), 'bot' so enemy shots can hit it
+  (let ((cs (new 'process 'collide-shape-moving self (collide-list-enum usually-hit-by-player))))
+    (set! (-> cs dynam) (copy *standard-dynamics* 'process))
+    (set! (-> cs reaction) cshape-reaction-default)
+    (set! (-> cs no-reaction)
+          (the-as (function collide-shape-moving collide-query vector vector object) nothing)
+          )
+    (set! (-> cs penetrated-by) (the-as penetrate -1))
+    (let ((grp (new 'process 'collide-shape-prim-group cs (the-as uint 1) 0)))
+      (set! (-> cs total-prims) (the-as uint 2))
+      (set! (-> grp prim-core collide-as) (collide-spec bot))
+      (set! (-> grp prim-core collide-with) (collide-spec backgnd obstacle hit-by-others-list))
+      (set! (-> grp prim-core action) (collide-action solid))
+      (set! (-> grp transform-index) 3)
+      (set-vector! (-> grp local-sphere) 0.0 0.0 0.0 4300.8)
+      (set! (-> cs root-prim) grp)
+      )
+    (let ((sph (new 'process 'collide-shape-prim-sphere cs (the-as uint 0))))
+      (set! (-> sph prim-core collide-as) (collide-spec bot))
+      (set! (-> sph prim-core collide-with) (collide-spec backgnd obstacle hit-by-others-list))
+      (set! (-> sph prim-core action) (collide-action solid))
+      (set! (-> sph transform-index) 3)
+      (set-vector! (-> sph local-sphere) 0.0 0.0 0.0 3686.4)
+      )
+    (set! (-> cs nav-radius) 4096.0)
+    (let ((v1 (-> cs root-prim)))
+      (set! (-> cs backup-collide-as) (-> v1 prim-core collide-as))
+      (set! (-> cs backup-collide-with) (-> v1 prim-core collide-with))
+      )
+    (set! (-> self root) cs)
+    ;; process-focusable.water is zeroed memory, which GOAL treats as truthy: make it a real #f (same fix as the bot)
+    (set! (-> self water) (the-as water-control #f))
+    )
+  (vector-copy! (-> self root trans) pos)
+  (quaternion-vector-angle! (-> self root quat) *up-vector* yaw)
+  (set-vector! (-> self root scale) *spybot-scale* *spybot-scale* *spybot-scale* 1.0)
+  (initialize-skeleton self skel-spydroid-orig (the-as pair 0))
+  (set! (-> self yaw) yaw)
+  (set! (-> self vy) 0.0)
+  (set! (-> self anim-mode) 0)
+  (set! (-> self hb-ready) 0)
+  (set! (-> self hb-hit) 0)
+  (set! (-> self hurt-time) 0)
+  (set! (-> self hp) *spybot-hp*)
+  (set! (-> self is-dead) 0)
+  (set! (-> self cur-anim) 3)
+  (ja-channel-set! 1)
+  (ja :group! (-> self draw art-group data 3) :num! min)
+  (format 0 "Spy bot: launched~%")
+  ;; the camera follows the droid; the bot (still idle) zooms it in (blast-bot-spy-cam-zoom)
+  (when *camera*
+    (send-event *camera* 'change-target self)
+    )
+  (go-virtual active)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; L2: launch / summon
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun spybot-summon ((bot blast-bot-player) (sb spy-bot-player))
+  ;; moves the blast bot to the droid: body, aggro shape and feet (so the legs do not stretch back to the old spot)
+  (vector-copy! (-> bot root trans) (-> sb root trans))
+  (quaternion-copy! (-> bot root quat) (-> sb root quat))
+  (set! (-> bot head-yaw) (quaternion-y-angle (-> sb root quat)))
+  (set! (-> bot hover-vx) 0.0)
+  (set! (-> bot hover-vz) 0.0)
+  (set! (-> bot ground-y) (-> sb root trans y))
+  (let ((a (-> bot aggro-shape)))
+    (when (nonzero? a)
+      (vector-copy! (-> a trans) (-> bot root trans))
+      (update-transforms a)
+      )
+    )
+  (dotimes (i 4)
+    (let ((local (new 'stack-no-clear 'vector))
+          (world (new 'stack-no-clear 'vector))
+          )
+      (blast-bot-foot-local local i)
+      (vector-orient-by-quat! world local (-> bot root quat))
+      (vector+! world world (-> bot root trans))
+      (set! (-> world y) (-> sb root trans y))
+      (vector-copy! (-> bot foot-pos i) world)
+      (vector-copy! (-> bot foot-next i) world)
+      (vector-reset! (-> bot foot-speed i))
+      (set! (-> bot foot-moving i) #f)
+      (set! (-> bot foot-cool i) 0)
+      )
+    )
+  (vector-copy! (-> bot last-trans) (-> bot root trans))
+  (vector-reset! (-> bot linear-speed))
+  (update-transforms (-> bot root))
+  (none)
+  )
+
+(defun spybot-end ((summon symbol))
+  ;; back to the blast bot. SUMMON = #t moves the bot to the droid first.
+  (let ((sb (the-as spy-bot-player (spybot-find)))
+        (bot (the-as blast-bot-player (blast-bot-find)))
+        )
+    (set! *blast-bot-spy-active* #f)
+    (when (and sb bot summon)
+      (spybot-summon bot sb)
+      )
+    (if sb
+        (deactivate sb)
+        )
+    (when *camera*
+      (cond
+        (bot
+          (send-event *camera* 'change-target bot)
+          )
+        (*target*
+          (send-event *camera* 'change-target *target*)
+          )
+        )
+      )
+    (format 0 "Spy bot: back to the blast bot (summoned: ~A)~%" summon)
+    )
+  (none)
+  )
+
+(defun spybot-toggle ()
+  ;; L2
+  (cond
+    (*blast-bot-spy-active*
+      (spybot-end #t)
+      )
+    (else
+      (let ((bot (the-as blast-bot-player (blast-bot-find))))
+        (cond
+          ((not bot)
+           (format 0 "Spy bot: spawn the blast bot first (L1 + R3)~%")
+           )
+          (else
+            (let ((pos *spybot-pos*)
+                  (yaw (quaternion-y-angle (-> bot root quat)))
+                  )
+              (vector-copy! pos (-> bot root trans))
+              (+! (-> pos x) (* (sin yaw) *spybot-spawn-dist*))
+              (+! (-> pos z) (* (cos yaw) *spybot-spawn-dist*))
+              (+! (-> pos y) 4096.0)
+              (set! *blast-bot-spy-active* #t)
+              (let ((sp (process-spawn spy-bot-player
+                                       :init spy-bot-player-init-by-other pos yaw
+                                       :name "spy-bot-player"
+                                       :to *entity-pool*
+                                       )
+                        )
+                    )
+                (if (not sp)
+                    (set! *blast-bot-spy-active* #f)
+                    )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
