@@ -355,3 +355,7 @@
   )
 
 (define-extern *minimap* minimap)
+
+;; Blast Bot mod: how many hud pixels (512 x 416) the minimap and its ring are lifted, so they clear the bot's weapon + heat bars
+;; in the bottom right corner. 0 = stock position. Defined here so hud-classes.gc (compiled before minimap.gc) can see it.
+(define *minimap-raise* 56)

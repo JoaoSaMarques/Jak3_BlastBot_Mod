@@ -32,7 +32,7 @@
 (define *ahud-gap* 35)                   ;; gap between two boxes (Doesn't work?)
 (define *ahud-text-gap* 2)              ;; gap between a box and its number
 (define *ahud-text-scale* 0.5)          ;; size of the number (large font)
-(define *ahud-char-w* 20.0)              ;; width of one digit at scale 1.0, in hud pixels; only used to centre the number. Tune if it sits off-centre
+(define *ahud-char-w* 22.0)              ;; width of one digit at scale 1.0, in hud pixels; only used to centre the number. Tune if it sits off-centre
 
 ;; living minions per kind, written by ahud-count-allies every frame
 (define *ahud-n-sd* 0)                  ;; spydroids
