@@ -7,46 +7,32 @@
 
 ;; The minion part of the Blast Bot's HUD (spydroid-ally, sentinel-ally, roboguard-ally).
 ;;
-;; COMPACT VERSION. No numbered slots, no floating labels. Now:
+;; COMPACT VERSION. The old version gave every minion a numbered slot (handle array), a floating label and an icon with a
+;; bar under it. That is gone. Now:
 ;;   - once a frame the entity pool is walked and the living minions of each kind are COUNTED (no slots, no handles);
-;;   - the top-left of the screen shows one small card per kind that has at least one minion alive:
-;;         [red square] [yellow triangle] [blue X]        <- icon box
-;;             10              2              4           <- number box (its own border, a small gap under the icon box)
-;;     the cards sit right next to each other and close up when a kind is empty;
-;;   - the cards are drawn by their OWN small hud process (blast-ally-hud, below), because the bot's main hud (blast-bot-hud
-;;     in blastbot-main-mod.gc) already uses all of its 30 sprites for the bars. blast-ally-hud-update spawns it (as a child of
-;;     the bot) and counts the minions; blast-ally-hud-kill hides it when the bot dies.
-;;
-;; HORIZONTAL SCALING (why everything here goes through ahud-rp / ahud-rect-x!): the hud draws a sprite at its POSITION
-;; as given (512 wide hud space), but multiplies its WIDTH by (-> *video-params* relative-x-scale) (1.0 at 4:3, 0.83 at 16:10).
-;; So a box that is 20 wide is only 20 * 0.83 wide on screen while an offset of 10 inside it is still 10. Everything
-;; horizontal is therefore laid out in "visual" pixels (square on screen) and converted to hud positions with ahud-rp.
+;;   - the top-left of the screen shows one square box per kind that has at least one minion alive:
+;;         [red square]  10     [yellow triangle]  2     [blue X]  4
+;;     the boxes sit next to each other and close up when a kind is empty; the number is centred under its box.
+;;   - there is NO second hud process: the boxes are drawn by the bot's own hud (blast-bot-hud in blastbot-main-mod.gc),
+;;     which hands itself to ahud-draw-boxes below. They use its sprites 15..29 and its text strings 0..2.
 ;;
 ;; Needs, in game.gd:  "blastbot-allyhud.o"  after spydroid-ally.o, sentinel-ally.o, roboguard-ally.o
-;; and before blastbot-main-mod.o (which calls blast-ally-hud-update and blast-ally-hud-kill).
+;; and before blastbot-main-mod.o (which calls blast-ally-hud-update and ahud-draw-boxes).
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Knobs (set from the REPL)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define *ahud-enabled* #f)              ;; #f = no counting and no cards
+(define *ahud-enabled* #t)              ;; #f = no counting and no boxes
 (define *ahud-debug* #f)                ;; #t: log the counts whenever they change
-;; layout. Sizes are "visual" hud pixels (vertical hud pixels, horizontal ones are corrected for the aspect ratio)
-(define *ahud-x* 20)                    ;; left edge of the first card (hud position, same anchor as the health bar)
-(define *ahud-y* 20)                    ;; top edge of the cards
-(define *ahud-box* 20)                  ;; outer size of the icon box (square) = width of the number box
-(define *ahud-border* 2)                ;; border thickness of both boxes
-(define *ahud-gap* 2)                   ;; gap between two cards, and between the icon box and the number box
-(define *ahud-num-h* 16)                ;; outer height of the number box
-(define *ahud-text-scale* 0.333)        ;; size of the number (large font)
-(define *ahud-char-w* 15.3)             ;; width of one digit at scale 1.0, in visual pixels; only used to centre the number
-(define *ahud-text-dx* 0.0)             ;; extra shift of the number in hud positions (negative = left); tune from the REPL
-(define *ahud-text-dy* 0)               ;; extra shift of the number in hud pixels (negative = up)
-;; icon nudges, in visual pixels (negative = left); the icons are drawn for a 16 x 16 inside, the default
-(define *ahud-icon-dx-red* 0.0)
-(define *ahud-icon-dx-yel* -0.6)
-(define *ahud-icon-dx-blu* 0.0)
-(define *ahud-w-fix* 0.8)               ;; the hud draws every sprite about this much narrower than asked (measured); added back
+;; layout (hud pixels, 512 x 416)
+(define *ahud-x* 20)                    ;; left edge of the first box
+(define *ahud-y* 20)                    ;; top edge of the boxes
+(define *ahud-box* 40)                  ;; outer size of a box (square); the border is 4 pixels, so the inside is box - 8
+(define *ahud-gap* 2)                   ;; gap between two boxes
+(define *ahud-text-gap* 2)              ;; gap between a box and its number
+(define *ahud-text-scale* 1.0)          ;; size of the number (large font)
+(define *ahud-char-w* 7.0)              ;; width of one digit at scale 1.0, in hud pixels; only used to centre the number. Tune if it sits off-centre
 
 ;; living minions per kind, written by ahud-count-allies every frame
 (define *ahud-n-sd* 0)                  ;; spydroids
@@ -69,37 +55,6 @@
      (set! (-> rect-s color y) (/ ,cg 2))
      (set! (-> rect-s color z) (/ ,cb 2))
      0
-     )
-  )
-
-(defun ahud-rp ((v float))
-  ;; visual horizontal pixels -> hud position units (see HORIZONTAL SCALING above)
-  (the int (+ 0.5 (* v (-> *video-params* relative-x-scale))))
-  )
-
-(defmacro ahud-rect-x! (spr pl pr py ph cr cg cb)
-  ;; like ahud-rect!, but the horizontal extent is given as two hud POSITIONS (left PL, right PR, ints) so that the
-  ;; rectangle ends exactly at PR whatever the aspect ratio is; vertical: top PY, height PH in hud pixels.
-  `(let ((rect-s ,spr))
-     (set-hud-piece-position! rect-s ,pl ,py)
-     (set! (-> rect-s pos z) #xfffff0)
-     (set! (-> rect-s scale-x)
-           (* 0.25 (+ (/ (the float (- ,pr ,pl)) (-> *video-params* relative-x-scale)) *ahud-w-fix*))
-           )
-     (set! (-> rect-s scale-y) (* 0.25 (the float ,ph)))
-     (set! (-> rect-s color x) (/ ,cr 2))
-     (set! (-> rect-s color y) (/ ,cg 2))
-     (set! (-> rect-s color z) (/ ,cb 2))
-     0
-     )
-  )
-
-(defmacro ahud-icon! (spr ia a w dx py ph cr cg cb)
-  ;; one block of an icon: IA = visual left edge of the icon area, A = offset from it, W = width (visual pixels)
-  `(let ((ico-l (+ *ahud-x* (ahud-rp (+ ,ia ,a ,dx))))
-         (ico-r (+ *ahud-x* (ahud-rp (+ ,ia ,a ,dx ,w))))
-         )
-     (ahud-rect-x! ,spr ico-l ico-r ,py ,ph ,cr ,cg ,cb)
      )
   )
 
@@ -157,31 +112,16 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun ahud-box! ((this hud) (first int) (kind int) (n int) (cell int))
-  ;; Card of one kind. Sprites used (relative to FIRST): spydroid 0-4, sentinel 5-11, roboguard 12-20.
-  ;; Per kind: icon box outer, icon box inside, the icon blocks, number box outer, number box inside.
-  ;;     +------+
-  ;;     | icon |
-  ;;     +------+
-  ;;     +------+
-  ;;     |  12  |
-  ;;     +------+
-  (let* ((s (case kind ((0) 0) ((1) 5) (else 12)))
-         (count (case kind ((0) 5) ((1) 7) (else 9)))
-         (pn (case kind ((0) 3) ((1) 5) (else 7)))          ;; index of the number box sprites
-         (b *ahud-border*)
-         (v0 (the float (* cell (+ *ahud-box* *ahud-gap*)))) ;; visual offset of this card
-         (pl (+ *ahud-x* (ahud-rp v0)))                       ;; left / right hud position of the card
-         (pr (+ *ahud-x* (ahud-rp (+ v0 (the float *ahud-box*)))))
-         (bp (ahud-rp (the float b)))
-         (il (+ pl bp))
-         (ir (- pr bp))
-         (ia (+ v0 (the float b)))                            ;; visual left edge of the icon area
+  ;; Box of one kind. Sprites used (relative to FIRST): spydroid 0-2, sentinel 3-7, roboguard 8-14.
+  ;; Every box: light border, dark inside, the icon in the middle (drawn for a 32 x 32 inside, the default box size),
+  ;; the number centred right under the box.
+  (let* ((s (case kind ((0) 0) ((1) 3) (else 8)))
+         (count (case kind ((0) 3) ((1) 5) (else 7)))
+         (x (+ *ahud-x* (* cell (+ *ahud-box* *ahud-gap*))))
          (y *ahud-y*)
-         (iy (+ y b))
-         (ih (- *ahud-box* (* 2 b)))
-         (py (+ y *ahud-box* *ahud-gap*))                     ;; number box
-         (piy (+ py b))
-         (pih (- *ahud-num-h* (* 2 b)))
+         (ix (+ x 4))
+         (iy (+ y 4))
+         (inner (- *ahud-box* 8))
          (show (and (> n 0) (>= cell 0)))
          )
     ;; hide everything of this kind first, then draw it when it is shown
@@ -191,40 +131,37 @@
       )
     (cond
       (show
-        (ahud-rect-x! (-> this sprites (+ first s)) pl pr y *ahud-box* 170 170 170)
-        (ahud-rect-x! (-> this sprites (+ first s 1)) il ir iy ih 20 20 24)
+        (ahud-rect! (-> this sprites (+ first s)) x y *ahud-box* *ahud-box* 170 170 170)
+        (ahud-rect! (-> this sprites (+ first s 1)) ix iy inner inner 20 20 24)
         (case kind
           ((0)
-           ;; red square, 8 x 8
-           (ahud-icon! (-> this sprites (+ first s 2)) ia 4.0 8.0 *ahud-icon-dx-red* (+ iy 4) 8 255 40 40)
+           ;; red square
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 8) (+ iy 8) 16 16 255 40 40)
            )
           ((1)
-           ;; yellow triangle: three rows, 2 / 6 / 10 wide
-           (ahud-icon! (-> this sprites (+ first s 2)) ia 7.0 2.0 *ahud-icon-dx-yel* (+ iy 3) 3 255 220 0)
-           (ahud-icon! (-> this sprites (+ first s 3)) ia 5.0 6.0 *ahud-icon-dx-yel* (+ iy 6) 3 255 220 0)
-           (ahud-icon! (-> this sprites (+ first s 4)) ia 3.0 10.0 *ahud-icon-dx-yel* (+ iy 9) 4 255 220 0)
+           ;; yellow triangle: three rows, 4 / 12 / 20 wide
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 14) (+ iy 6) 4 6 255 220 0)
+           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 10) (+ iy 12) 12 6 255 220 0)
+           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 6) (+ iy 18) 20 8 255 220 0)
            )
           (else
-            ;; blue X: four corner blocks (3 x 3) and a centre block (4 x 4)
-            (ahud-icon! (-> this sprites (+ first s 2)) ia 3.0 3.0 *ahud-icon-dx-blu* (+ iy 3) 3 60 120 255)
-            (ahud-icon! (-> this sprites (+ first s 3)) ia 10.0 3.0 *ahud-icon-dx-blu* (+ iy 3) 3 60 120 255)
-            (ahud-icon! (-> this sprites (+ first s 4)) ia 3.0 3.0 *ahud-icon-dx-blu* (+ iy 10) 3 60 120 255)
-            (ahud-icon! (-> this sprites (+ first s 5)) ia 10.0 3.0 *ahud-icon-dx-blu* (+ iy 10) 3 60 120 255)
-            (ahud-icon! (-> this sprites (+ first s 6)) ia 6.0 4.0 *ahud-icon-dx-blu* (+ iy 6) 4 60 120 255)
+            ;; blue X: four corner blocks and a centre block
+            (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 6) (+ iy 6) 6 6 60 120 255)
+            (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 20) (+ iy 6) 6 6 60 120 255)
+            (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 6) (+ iy 20) 6 6 60 120 255)
+            (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 20) (+ iy 20) 6 6 60 120 255)
+            (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 12) (+ iy 12) 8 8 60 120 255)
             )
           )
-        ;; the number box
-        (ahud-rect-x! (-> this sprites (+ first s pn)) pl pr py *ahud-num-h* 170 170 170)
-        (ahud-rect-x! (-> this sprites (+ first s pn 1)) il ir piy pih 20 20 24)
-        ;; the number: string KIND, centred in the number box (x = 0 hides it)
+        ;; the number: string KIND, centred under the box (x = 0 hides it)
         (let* ((digits (cond ((< n 10) 1) ((< n 100) 2) (else 3)))
-               (tw (* (the float digits) *ahud-char-w* *ahud-text-scale* (-> *video-params* relative-x-scale)))
-               (cx (* 0.5 (the float (+ pl pr))))
+               (tw (* (the float digits) *ahud-char-w* *ahud-text-scale*))
+               (cx (+ x (/ *ahud-box* 2)))
                )
           (format (clear (-> this strings kind text)) "~D" n)
           (set! (-> this strings kind scale) *ahud-text-scale*)
-          (set! (-> this strings kind pos x) (the int (+ 0.5 (+ (- cx (* 0.5 tw)) *ahud-text-dx*))))
-          (set! (-> this strings kind pos y) (+ piy 1 *ahud-text-dy*))
+          (set! (-> this strings kind pos x) (the int (- (the float cx) (* 0.5 tw))))
+          (set! (-> this strings kind pos y) (+ y *ahud-box* *ahud-text-gap*))
           )
         )
       (else
@@ -236,7 +173,7 @@
   )
 
 (defun ahud-draw-boxes ((this hud) (first int))
-  ;; FIRST = the first of the 21 sprites the cards use (strings 0, 1, 2 are used for the numbers)
+  ;; FIRST = the first of the 15 sprites the boxes may use (strings 0, 1, 2 are used for the numbers)
   (let ((cell 0))
     (when (not *ahud-enabled*)
       (set! cell -1)   ;; hides everything
@@ -255,88 +192,13 @@
   )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; The hud process of the cards (same recipe as blast-bot-hud in blastbot-main-mod.gc)
-;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(deftype blast-ally-hud (hud)
-  ()
-  )
-
-(defmethod draw ((this blast-ally-hud))
-  (ahud-draw-boxes this 0)
-  ((method-of-type hud draw) this)
-  0
-  (none)
-  )
-
-(defmethod update-values! ((this blast-ally-hud))
-  (logclear! (-> this flags) (hud-flags disable))
-  ((method-of-type hud update-values!) this)
-  0
-  (none)
-  )
-
-(defmethod init-callback ((this blast-ally-hud))
-  (format 0 "Ally HUD: init-callback begin~%")
-  (set! (-> this level) (level-get-target-inside *level*))
-  (set! (-> this gui-id)
-        (add-process *gui-control* this (gui-channel hud-upper-center-2) (gui-action hidden) (-> this name) 81920.0 0)
-        )
-  (logior! (-> this flags) (hud-flags show))
-  (dotimes (i 30)
-    (set! (-> this sprites i tid) (the-as texture-id (get-texture common-white common)))
-    (set! (-> this sprites i flags) (hud-sprite-flags))
-    (set! (-> this sprites i scale-x) 0.0)
-    (set! (-> this sprites i scale-y) 0.0)
-    )
-  ;; strings 0-2 = the minion counts (pos x 0 = hidden)
-  (dotimes (i 3)
-    (alloc-string-if-needed this i)
-    (set! (-> this strings i scale) *ahud-text-scale*)
-    (set! (-> this strings i color) (font-color white))
-    (set! (-> this strings i flags) (font-flags shadow kerning large))
-    (set! (-> this strings i pos x) 0)
-    )
-  (format 0 "Ally HUD: init-callback done~%")
-  0
-  (none)
-  )
-
-(deftype ahud-state (structure)
-  ((hud  handle)      ;; the blast-ally-hud process
-   )
-  )
-(define *ahud-state* (new 'global 'ahud-state))
-(set! (-> *ahud-state* hud) (the-as handle #f))
-(define *ahud-retry* 0)                                ;; next frame we may try to (re)spawn it
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Called every frame by blast-bot-update-hud (blastbot-main-mod.gc)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun blast-ally-hud-update ((owner process))
-  (when *ahud-enabled*
-    (ahud-count-allies)
-    (when (and (not (handle->process (-> *ahud-state* hud)))
-               (>= (the int (current-time)) *ahud-retry*)
-               )
-      (set! *ahud-retry* (+ (the int (current-time)) 300))
-      (format 0 "Ally HUD: spawning~%")
-      (set! (-> *ahud-state* hud)
-            (ppointer->handle (process-spawn blast-ally-hud :init hud-init-by-other :name "blast-ally-hud" :to owner))
-            )
+  (if *ahud-enabled*
+      (ahud-count-allies)
       )
-    )
-  0
-  )
-
-(defun blast-ally-hud-kill ()
-  ;; called when the bot is destroyed (the hud is a child of the bot, so it also goes when the bot is deactivated)
-  (let ((h (handle->process (-> *ahud-state* hud))))
-    (if h
-        (send-event h 'hide-and-die)
-        )
-    )
   0
   )
 

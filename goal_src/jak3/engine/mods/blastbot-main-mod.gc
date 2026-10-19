@@ -1097,14 +1097,12 @@
 ;; in every level. Coordinates are hud pixels (512 wide, 416 high); a hud rectangle is the white texture (4x4 pixels)
 ;; stretched by scale-x / scale-y, positioned by its top-left corner (see ahud-rect! in blastbot-allyhud.gc).
 ;;
-;;   top left      : one small card per minion kind with its count (own hud process, blastbot-allyhud.gc)
+;;   top left      : one square box per minion kind with its count (blastbot-allyhud.gc, sprites 15-29, strings 0-2)
 ;;   bottom left   : jump (thruster) bar, only while jumping / recharging
-;;                   health bar
-;;                   shield bar right under the health (only while the shield is up, damaged or recharging)
-;;   bottom right  : selected weapon bar in the health row (gun colour, 1/3, 2/3 or all filled for the 1st / 2nd / 3rd weapon of the colour)
-;;                   heat bar in the shield row
-;; Every bar is *bbh-bar-w* wide; the blocks keep *bbh-margin-x* / *bbh-margin-y* away from the screen edges.
-;; Sprites: 0-2 jump, 3-5 health, 6-8 shield, 9-11 weapon, 12-14 heat (border, background, fill); 15-29 are free.
+;;                   health bar, with the selected weapon bar next to it (gun colour, 1/3, 2/3 or all filled for the 1st / 2nd / 3rd weapon of the colour)
+;;                   shield bar right under the health (only while the shield is up, damaged or recharging), with the heat bar next to it
+;; Every bar is *bbh-bar-w* wide; the block keeps *bbh-margin-x* / *bbh-margin-y* away from the screen edges.
+;; Sprites: 0-2 jump, 3-5 health, 6-8 shield, 9-11 weapon, 12-14 heat (border, background, fill), 15-29 minion boxes.
 
 (define *blast-bot-hud-health* 1.0)   ;; 0..1, written by the bot every frame
 (define *blast-bot-hud-fuel* 1.0)     ;; 0..1
@@ -1122,15 +1120,15 @@
 (define *blast-bot-hud-on* #t)
 (define *blast-bot-hud-drawn* #f) ;; debug: one-shot flag for the first-draw log line
 
-;; layout knobs (hud pixels). Left block (bottom left)       Right block (bottom right, same bars, other side)
+;; layout knobs (hud pixels). Everything bottom left is one block of two columns:
 ;;     [ jump ]
-;;     [ health ]                      [ weapon ]     <- same size, same row as health
-;;     [ shield ]                      [ heat   ]     <- same size, same row as shield
-;; The minimap (bottom right) is raised above the right block, see *minimap-raise* in minimap.gc.
+;;     [ health ]   [ weapon ]     <- same size, same row
+;;     [ shield ]   [ heat   ]     <- same size, same row
+;; It stays left of the minimap (bottom right).
 (define *bbh-margin-x* 20)   ;; gap to the left screen edge
 (define *bbh-margin-y* 22)   ;; gap to the bottom screen edge
 (define *bbh-bar-w* 104)     ;; width of every bar
-(define *bbh-right-x* 512)   ;; right edge of the hud space; the right block mirrors the left margin against it
+(define *bbh-col-gap* 12)    ;; gap between the two columns
 (define *bbh-hp-h* 18)       ;; health + weapon bar height
 (define *bbh-sh-h* 12)       ;; shield + heat bar height
 (define *bbh-jump-h* 8)
@@ -1162,10 +1160,7 @@
   (let* ((bw *bbh-bar-w*)
          (fbw (the float bw))
          (lx *bbh-margin-x*)
-         ;; left edge of the right-hand bars. The hud draws a bar bw * relative-x-scale wide (not bw), so the bars are placed
-         ;; from their drawn width; 4.66 = 2 (border) + 2 (the left bars start 2 inside the margin) + 0.66 (the hud draws sprites a bit narrow)
-         (rx (the int (+ 0.5 (- (+ (- (the float *bbh-right-x*) (the float *bbh-margin-x*)) 4.66)
-                                (* (the float (+ bw 4)) (-> *video-params* relative-x-scale))))))
+         (rx (+ (+ lx bw) *bbh-col-gap*))
          (bottom (- 416 *bbh-margin-y*))
          (sh-y (- bottom *bbh-sh-h*))
          (hp-y (- (- sh-y *bbh-gap*) *bbh-hp-h*))
@@ -1197,7 +1192,7 @@
                 (and *blast-bot-hud-shield-bar* *blast-bot-hud-shield-show*)
                 255 gb gb 45 15 15)
       )
-    ;; sprites 9-11: selected weapon, same place as the health bar but on the right side of the screen
+    ;; sprites 9-11: selected weapon, right of the health bar, same size and row
     (let* ((lv (the float (max 1 (min 3 *blast-bot-hud-gun-level*))))
            (c *blast-bot-hud-gun-color*)
            (cr (case c ((0) 255) ((1) 255) (else 40)))
@@ -1207,7 +1202,7 @@
       (bbh-bar! this 9 rx wp-y bw *bbh-hp-h* (the int (* fbw (/ lv 3.0))) *blast-bot-weapon-bar*
                 cr cg cb 40 40 40)
       )
-    ;; sprites 12-14: heat, same place as the shield bar but on the right side of the screen. Gray = empty; the fill goes white -> yellow -> orange -> red. While overheated it blinks red.
+    ;; sprites 12-14: heat, right of the shield bar, same size and row. Gray = empty; the fill goes white -> yellow -> orange -> red. While overheated it blinks red.
     (let* ((h (fmax 0.0 (fmin 1.0 *blast-bot-hud-heat*)))
            ;; white until 25%, yellow at 55%, orange at 80%, red from 95%
            (cb (the int (* 255.0 (- 1.0 (fmax 0.0 (fmin 1.0 (/ (- h 0.25) 0.3)))))))
@@ -1223,6 +1218,8 @@
                 (if blink 120 255) (if hot 0 cg) (if hot 0 cb) 90 90 90)
       )
     )
+  ;; sprites 15-29 + strings 0-2: the minion boxes, top left (blastbot-allyhud.gc)
+  (ahud-draw-boxes this 15)
   ((method-of-type hud draw) this)
   0
   (none)
@@ -1249,6 +1246,14 @@
     (set! (-> this sprites i flags) (hud-sprite-flags))
     (set! (-> this sprites i scale-x) 0.0)
     (set! (-> this sprites i scale-y) 0.0)
+    )
+  ;; strings 0-2 = the minion counts (pos x 0 = hidden)
+  (dotimes (i 3)
+    (alloc-string-if-needed this i)
+    (set! (-> this strings i scale) *ahud-text-scale*)
+    (set! (-> this strings i color) (font-color white))
+    (set! (-> this strings i flags) (font-flags shadow kerning large))
+    (set! (-> this strings i pos x) 0)
     )
   (format 0 "Blast Bot HUD: init-callback done~%")
   0
@@ -1375,7 +1380,7 @@
   (if *blast-bot-hide-stock-huds*
       (blast-bot-stock-huds #f)
       )
-  ;; count the living minions + keep the top-left cards' hud process alive (blastbot-allyhud.gc)
+  ;; count the living minions for the boxes in the top-left corner (blastbot-allyhud.gc)
   (blast-ally-hud-update this)
   (none)
   )
@@ -2581,7 +2586,6 @@
             )
         )
       )
-    (blast-ally-hud-kill)
     (format 0 "Blast Bot: die 2 - shield~%")
     (let ((sh (handle->process (-> self shield-handle))))
       (if sh
