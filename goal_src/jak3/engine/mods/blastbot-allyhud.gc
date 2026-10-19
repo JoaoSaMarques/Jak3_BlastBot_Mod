@@ -34,6 +34,19 @@
 (define *ahud-text-scale* 0.5)          ;; size of the number (large font)
 (define *ahud-char-w* 22.0)              ;; width of one digit at scale 1.0, in hud pixels; only used to centre the number. Tune if it sits off-centre
 
+;; green "v" over every living minion (two thin 3D lines in the world, no font, no format string)
+(define *ahud-tags* #t)                 ;; #f = no markers
+(define *ahud-tag-size* 2048.0)         ;; size of the v (1.2 m)
+(define *ahud-tag-strokes* 1)           ;; 1 = a single line "v"; 2 = drawn twice, 10 cm apart (looks like a doubled v)
+(define *ahud-tag-range* 327680.0)      ;; markers only within this distance of the bot (80 m)
+(define *ahud-tag-h-sd* 10240.0)         ;; height of the v's tip above a spydroid's origin (2.5 m)
+(define *ahud-tag-h-st* 4096.0)        ;; ... a sentinel (1.0 m)
+(define *ahud-tag-h-rg* 20480.0)        ;; ... a roboguard (5.0 m)
+(define *ahud-tag-color* (new 'static 'rgba :g #xff :a #x80))
+(define *ahud-tag-tip* (new 'global 'vector))
+(define *ahud-tag-a* (new 'global 'vector))
+(define *ahud-tag-b* (new 'global 'vector))
+
 ;; living minions per kind, written by ahud-count-allies every frame
 (define *ahud-n-sd* 0)                  ;; spydroids
 (define *ahud-n-st* 0)                  ;; sentinels
@@ -72,7 +85,42 @@
     )
   )
 
-(defun ahud-count-allies ()
+(defun ahud-tag! ((p process) (height float) (owner process))
+  ;; a green "v" (pointing down) above minion P, facing the camera. One stroke by default (*ahud-tag-strokes*).
+  (when *ahud-tags*
+    (let ((pd (the-as process-drawable p))
+          (bot (the-as process-drawable owner))
+          )
+      (when (and pd bot (< (vector-vector-distance (-> pd root trans) (-> bot root trans)) *ahud-tag-range*))
+        (let ((tip *ahud-tag-tip*)
+              (a *ahud-tag-a*)
+              (b *ahud-tag-b*)
+              (r (-> (camera-matrix) rvec))
+              (s *ahud-tag-size*)
+              )
+          (dotimes (i *ahud-tag-strokes*)
+            (let ((o (* (the float i) 409.6)))
+              (vector-copy! tip (-> pd root trans))
+              (+! (-> tip y) height)
+              (vector+*! tip tip r o)
+              (vector-copy! a tip)
+              (+! (-> a y) s)
+              (vector+*! a a r (* -0.6 s))
+              (vector-copy! b tip)
+              (+! (-> b y) s)
+              (vector+*! b b r (* 0.6 s))
+              (add-debug-line #t (bucket-id debug-no-zbuf1) a tip *ahud-tag-color* #f (the-as rgba -1))
+              (add-debug-line #t (bucket-id debug-no-zbuf1) b tip *ahud-tag-color* #f (the-as rgba -1))
+              )
+            )
+          )
+        )
+      )
+    )
+  0
+  )
+
+(defun ahud-count-allies ((owner process))
   ;; all allies are spawned under *entity-pool*: walk it and count (no handles, no arrays)
   (let ((sd 0)
         (st 0)
@@ -83,13 +131,22 @@
       (let ((proc (the-as process (-> c 0))))
         (cond
           ((type? proc roboguard-ally)
-           (if (ahud-alive? proc) (+! rg 1))
+           (when (ahud-alive? proc)
+             (+! rg 1)
+             (ahud-tag! proc *ahud-tag-h-rg* owner)
+             )
            )
           ((type? proc sentinel-ally)
-           (if (ahud-alive? proc) (+! st 1))
+           (when (ahud-alive? proc)
+             (+! st 1)
+             (ahud-tag! proc *ahud-tag-h-st* owner)
+             )
            )
           ((type? proc spydroid-ally)
-           (if (ahud-alive? proc) (+! sd 1))
+           (when (ahud-alive? proc)
+             (+! sd 1)
+             (ahud-tag! proc *ahud-tag-h-sd* owner)
+             )
            )
           )
         )
@@ -197,7 +254,7 @@
 
 (defun blast-ally-hud-update ((owner process))
   (if *ahud-enabled*
-      (ahud-count-allies)
+      (ahud-count-allies owner)
       )
   0
   )

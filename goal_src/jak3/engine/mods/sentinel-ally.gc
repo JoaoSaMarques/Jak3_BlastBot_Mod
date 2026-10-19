@@ -36,6 +36,14 @@
 ;; -1 = use the texture level compiled into skel-sentinel-ally below (10, the common level the bombbot and the gun models use).
 ;; To test others from the REPL: (set! *sentinel-ally-texture-level* 0), launch again, and try 1, 2 ...
 (define *sentinel-ally-texture-level* -1)
+;; Where the shots come out. The turret's barrel is NOT at the model origin, so the shot starts at a joint of the skeleton:
+;; *sentinel-ally-muzzle-joint* = the joint index of the barrel (not needed for now, leave at -1).
+;; -1 = no joint set yet: the shot starts at the offset below instead (right / up / forward from the origin, in the
+;; sentinel's own frame, already in world units, and it turns with the sentinel). Tune these from the REPL.
+(define *sentinel-ally-muzzle-joint* -1)
+(define *sentinel-ally-muzzle-x* 0.0)
+(define *sentinel-ally-muzzle-y* -3072.0)   ;; 0.75 m down
+(define *sentinel-ally-muzzle-z* 6144.0)    ;; 1.5 m forward (was 2 m): 0.5 m inwards, towards the body
 (define *sentinel-ally-debug* #t)                ;; #t: print spawn / state / target / shoot lines (set to #f once they work)
 (define *sentinel-ally-status-time* (the-as time-frame 0))
 
@@ -84,6 +92,7 @@
        (not (type? p sentinel-ally))
        (!= (handle->process (-> this owner-handle)) p)
        (not (focus-test? p inactive))
+       (not (blast-target-dead? p))
        (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
        (not (logtest? (process-mask crate civilian) (-> p mask)))
        (not (spydroid-ally-ignored-type? p))
@@ -186,13 +195,27 @@
   (none)
   )
 
+(defun sentinel-ally-muzzle! ((this sentinel-ally) (out vector))
+  ;; world position the shots start from: the barrel joint's bone, or the fallback offset from the origin
+  (let ((idx *sentinel-ally-muzzle-joint*))
+    (if (and (>= idx 0) (< idx (-> this node-list length)))
+        (matrix->trans (-> this node-list data idx bone transform) out)
+        (begin
+          (set-vector! out *sentinel-ally-muzzle-x* *sentinel-ally-muzzle-y* *sentinel-ally-muzzle-z* 1.0)
+          (vector-rotate-around-y! out out (quaternion-y-angle (-> this root quat)))
+          (vector+! out out (-> this root trans))
+          )
+        )
+    )
+  out
+  )
+
 (defun sentinel-ally-shoot ((this sentinel-ally) (owner process-drawable) (dir vector))
-  ;; one gun-yellow-shot (Jak's own Blaster shot) from just in front of the sentinel along dir
+  ;; one gun-yellow-shot (Jak's own Blaster shot) from the barrel (sentinel-ally-muzzle!) along dir
   (let ((params *sentinel-ally-params*)
         (start *sentinel-ally-start*)
         )
-    (vector-normalize-copy! start dir 8192.0)
-    (vector+! start start (-> this root trans))
+    (sentinel-ally-muzzle! this start)
     (set! (-> params ent) (the-as entity #f))
     (set! (-> params charge) 1.0)
     (set! (-> params options) (projectile-options po17))
@@ -242,6 +265,9 @@
             (if *sentinel-ally-debug*
                 (format 0 "sentinel: shoot~%")
                 )
+            ;; aim from the barrel to the target, not from the model origin
+            (sentinel-ally-muzzle! this *sentinel-ally-start*)
+            (vector-! aim (get-trans p 3) *sentinel-ally-start*)
             (sentinel-ally-shoot this owner aim)
             )
           )

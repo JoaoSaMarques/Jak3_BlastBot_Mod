@@ -716,7 +716,7 @@
 ;; DEBUG for the yellow/blue crash: *blast-bot-proj-debug* prints a line at each step of firing, so the last line before a crash
 ;; shows where it dies. *blast-bot-proj-po17* #f gives the shot empty projectile-options (the way the working red grenade
 ;; is spawned) instead of po17 (what Jak's gun uses).
-(define *blast-bot-proj-debug* #t)
+(define *blast-bot-proj-debug* #f)
 (define *blast-bot-proj-po17* #t)
 
 ;; Fills the projectile params the way gun-fire-yellow-1 / gun-fire-blue-1 do, but for the bot: the bot is the
@@ -755,6 +755,24 @@
     )
   )
 
+;; Homing Attacks cheat. The shot follows the TURRET's lock-on (blast-bot-update-aim): the same target, so the same rules, i.e. the
+;; same range (50 m, blast-bot-find-lock), the same on-screen + line-of-sight check, and the same valid-target filter, which
+;; includes crimson guards. No lock = the turret has nothing in range = the shot just flies straight, so homing never shoots
+;; at something the turret can't see or reach. While locked, the shot goes at the locked target, never at some other enemy.
+;; Call it right before a projectile's velocity is built from the unit direction `dir`. Does nothing while *blast-homing* is #f.
+(defun blast-homing-aim ((from vector) (dir vector) (owner blast-bot-player))
+  (when (and *blast-homing* owner (-> owner locked))
+    (let ((v (new 'stack-no-clear 'vector)))
+      (vector-! v (-> owner target-pos) from)      ;; target-pos = the locked enemy (set every frame by blast-bot-update-aim)
+      (when (< 1.0 (vector-length v))
+        (vector-normalize! v 1.0)
+        (vector-copy! dir v)
+        )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-yellow ((this blast-bot-player))
   (if *blast-bot-proj-debug* (format 0 "yellow: fire start~%"))
   (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
@@ -766,6 +784,7 @@
     (if *blast-bot-proj-debug* (format 0 "yellow: muzzle ok~%"))
     (let ((params (blast-bot-projectile-params this start (new 'stack-no-clear 'projectile-init-by-other-params))))
       (if *blast-bot-proj-debug* (format 0 "yellow: params ok~%"))
+      (blast-homing-aim start dir this)     ;; Homing Attacks cheat
       (vector-float*! (-> params vel) dir 819200.0)
       (let ((shot (spawn-projectile gun-yellow-shot params this *default-dead-pool*)))
         (if *blast-bot-proj-debug* (format 0 "yellow: spawned ~A~%" (if shot #t #f)))
@@ -796,6 +815,7 @@
          )
     (vector+*! start start dir 8192.0)
     (let ((params (blast-bot-projectile-params this start (new 'stack-no-clear 'projectile-init-by-other-params))))
+      (blast-homing-aim start dir this)     ;; Homing Attacks cheat
       (vector-float*! (-> params vel) dir 819200.0)
       (spawn-projectile gun-yellow-shot-2 params this *default-dead-pool*)
       )
@@ -811,8 +831,79 @@
   (none)
   )
 
+;; ---- Blaster Auto-Mode (secret shop: gun-upgrade-yellow-1) ----
+;; With the Blaster selected, HOLD R1 for *blast-bot-auto-toggle-time* seconds to switch auto-mode on (hold again to switch
+;; it off). While it is on the turret shoots Blaster shots at whatever it is locked on to (nearest visible enemy), and it
+;; KEEPS doing that whatever weapon / colour is selected afterwards, so the other weapons are free for you to fire by hand.
+;; The shots are free by default (no heat); set *blast-bot-auto-uses* to e.g. 40.0 to make each one cost 1/40 of the meter.
+(define *blast-bot-auto-unlocked* #f)    ;; set by blast-bot-secrets-apply (REPL: (set! *blast-bot-auto-unlocked* #t) to test)
+(define *blast-bot-auto-on* #f)
+(define *blast-bot-auto-gap* 0.3)          ;; seconds between auto shots
+(define *blast-bot-auto-uses* 0.0)         ;; 0 = auto shots do not heat the guns
+(define *blast-bot-auto-aim-dot* 0.985)    ;; the barrel must point this close to the target (cosine, 0.985 = about 10 degrees)
+(define *blast-bot-auto-toggle-time* 0.7)  ;; seconds of holding R1 that flip auto-mode
+(define *blast-bot-auto-time* (the-as time-frame 0))
+(define *blast-bot-auto-hold* (the-as time-frame 0))
+(define *blast-bot-auto-flipped* #f)
+
+(defun blast-bot-auto-toggle ()
+  ;; every frame from blast-bot-fire-input
+  (if (and *blast-bot-auto-unlocked*
+           *blast-bot-use-morphgun*
+           (= *blast-bot-gun-mode* 1)
+           (= *blast-bot-yellow-weapon* 1)
+           (cpad-hold? 0 r1)
+           )
+      (begin
+        (if (= *blast-bot-auto-hold* 0)
+            (set! *blast-bot-auto-hold* (current-time))
+            )
+        (when (and (not *blast-bot-auto-flipped*)
+                   (>= (- (current-time) *blast-bot-auto-hold*) (the int (* 300.0 *blast-bot-auto-toggle-time*)))
+                   )
+          (set! *blast-bot-auto-flipped* #t)
+          (set! *blast-bot-auto-on* (not *blast-bot-auto-on*))
+          (format 0 "Blast Bot: Blaster auto-mode ~A~%" (if *blast-bot-auto-on* "ON" "OFF"))
+          )
+        )
+      (begin
+        (set! *blast-bot-auto-hold* 0)
+        (set! *blast-bot-auto-flipped* #f)
+        )
+      )
+  (none)
+  )
+
+(defun blast-bot-auto-update ((this blast-bot-player))
+  ;; every frame from blast-bot-yellow-update, whatever weapon is selected
+  (when (and *blast-bot-auto-on* *blast-bot-auto-unlocked*)
+    (if *blast-bot-weapon-text*
+        (format *stdcon* "AUTO-MODE ON~%")
+        )
+    (when (and (-> this locked)
+               (time-elapsed? *blast-bot-auto-time* (the int (* 300.0 *blast-bot-auto-gap*)))
+               )
+      (let* ((m (-> this node-list data 6 bone transform))
+             (start (matrix->trans m (new 'stack-no-clear 'vector)))
+             (fwd (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> m fvec) 1.0))
+             (to (vector-! (new 'stack-no-clear 'vector) (-> this target-pos) start))
+             )
+        (vector-normalize! to 1.0)
+        (when (< *blast-bot-auto-aim-dot* (vector-dot to fwd))
+          (when (or (>= 0.0 *blast-bot-auto-uses*) (blast-bot-heat-try-use *blast-bot-auto-uses*))
+            (set-time! *blast-bot-auto-time*)
+            (blast-bot-fire-yellow this)
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-yellow-update ((this blast-bot-player))
   ;; every frame: keeps a Beam Reflexor burst going
+  (blast-bot-auto-update this)
   (when (and (< 0 *blast-bot-burst-left*)
              (time-elapsed? *blast-bot-burst-time* (the int (* 300.0 *blast-bot-reflexor-gap*)))
              )
@@ -864,6 +955,7 @@
          (spread (new 'stack-no-clear 'vector))
          )
     (vector+*! start start dir 8192.0)
+    (blast-homing-aim start dir this)       ;; Homing Attacks cheat
     ;; the same random cone gun-fire-blue-1 uses
     (let ((q (new 'stack-no-clear 'quaternion)))
       (quaternion-vector-angle! q dir (* 182.04445 (rand-vu-float-range 0.0 360.0)))
@@ -987,6 +1079,19 @@
   ;; blue
   (set! *blast-bot-blue-fast* (if (blast-bot-secret? gun-upgrade-blue-1) *blast-bot-blue-fast-upgraded* 0.05))
   (set! *roboguard-ally-count* (if (blast-bot-secret? gun-upgrade-blue-3) 2 1))
+  ;; yellow 1: Blaster auto-mode (the switch itself is blast-bot-auto-toggle). Like god mode these only ever turn ON, so the
+  ;; REPL can still force them for testing without buying anything.
+  (when (blast-bot-secret? gun-upgrade-yellow-1)
+    (set! *blast-bot-auto-unlocked* #t)
+    )
+  ;; blue 2: Arc Wielder chains between the companions (blastbot-ordnance.gc)
+  (when (blast-bot-secret? gun-upgrade-blue-2)
+    (set! *blast-arc-chain* #t)
+    )
+  ;; cheat: Homing Attacks
+  (when (blast-bot-secret? darkjak-tracking)
+    (set! *blast-homing* #t)
+    )
   ;; cheat
   (set! *blast-bot-unlimited-ammo* (blast-bot-secret? endless-ammo))
   ;; invulnerable: only ever turns god mode ON, so (set! *blast-bot-god-mode* #t) from the REPL still works without the purchase
@@ -1009,6 +1114,7 @@
 
 (defun blast-bot-fire-input ((this blast-bot-player))
   (blast-bot-secrets-apply)
+  (blast-bot-auto-toggle)
   (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2)
                    (!= *blast-bot-blue-weapon* 2) (!= *blast-bot-blue-weapon* 3))))
     (cond

@@ -38,7 +38,7 @@
 (define *roboguard-ally-punch-damage* 2.0)      ;; damage of the close-range punch
 (define *roboguard-ally-punch-reach* 28672.0)   ;; 7 m (+ the target's radius): how far the punch reaches
 (define *roboguard-ally-scan-range* 409600.0)   ;; 100 m: how far they look for enemies
-(define *roboguard-ally-life* 0.0)              ;; seconds before it blows up on its own. 0 = until it is destroyed
+(define *roboguard-ally-life* 30.0)             ;; seconds before it blows up on its own. 0 = until it is destroyed
 (define *roboguard-ally-credit-jak* #t)         ;; #t = their kills count as Jak's, same as the other allies
 (define *roboguard-ally-mesh-range* 61440.0)    ;; 15 m: a nav mesh must lie this close to the owner, or nothing is launched
 (define *roboguard-ally-child-prims* #t)        ;; #t = the body spheres become 'bot' like the spydroid's. #f = leave them stock
@@ -92,6 +92,7 @@
        (not (type? p sentinel-ally))
        (!= (handle->process (-> this owner-handle)) p)
        (not (focus-test? p inactive))
+       (not (blast-target-dead? p))
        (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
        (not (logtest? (process-mask crate civilian) (-> p mask)))
        (not (spydroid-ally-ignored-type? p))
@@ -256,24 +257,34 @@
   (none)
   )
 
-(defun roboguard-ally-update ((this roboguard-ally))
-  ;; once per frame at the end of enemy-common-post
+(defun roboguard-ally-expire? ((this roboguard-ally))
+  ;; End of life: the owner is gone (vanishes quietly), or *roboguard-ally-life* seconds are up (go-die = it EXPLODES the
+  ;; stock way). Returns #t when it acted. Called from roboguard-ally-update and, for a roboguard in idle (whose post skips
+  ;; enemy-common-post), from update-focus.
   (cond
     ((not (handle->process (-> this owner-handle)))
-     ;; the owner (the bot) is gone: vanish quietly
      (cleanup-for-death this)
      (deactivate this)
+     #t
      )
     ((and (< 0.0 *roboguard-ally-life*)
           (time-elapsed? (-> this spawn-time) (the int (* *roboguard-ally-life* 300.0)))
           )
      (set-time! (-> this spawn-time))
      (go-die this)
+     #t
      )
     (else
-      (roboguard-ally-retarget this)
+      #f
       )
     )
+  )
+
+(defun roboguard-ally-update ((this roboguard-ally))
+  ;; once per frame at the end of enemy-common-post
+  (if (not (roboguard-ally-expire? this))
+      (roboguard-ally-retarget this)
+      )
   (none)
   )
 
@@ -304,6 +315,10 @@ update-focus and ja-post), so the retarget lives here: every state's post reache
         (set! (-> this dbg-state) st)
         )
       )
+    ;; idle's post does not run enemy-common-post, so the lifetime check must happen here for a roboguard in idle
+    (if (and (-> this state) (= (-> this state name) 'idle))
+        (roboguard-ally-expire? this)
+        )
     result
     )
   )

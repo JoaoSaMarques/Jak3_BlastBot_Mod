@@ -319,6 +319,7 @@
        (not (focus-test? p inactive))
        (not (focus-test? p disable))
        (not (focus-test? p dead))
+       (not (blast-target-dead? p))
        (or (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
          (logtest? (process-mask vehicle) (-> p mask)))
        (not (logtest? (process-mask crate civilian) (-> p mask)))
@@ -2078,7 +2079,7 @@
     (+! (-> q start-pos y) 16384.0)
     (set-vector! (-> q move-dist) 0.0 -163840.0 0.0 1.0)
     (set! (-> q radius) 40.96)
-    (set! (-> q collide-with) (collide-spec backgnd obstacle hit-by-others-list))
+    (set! (-> q collide-with) (collide-spec backgnd obstacle pusher hit-by-others-list))   ;; pusher = platforms / elevators: without it the probe fell through them to the lava floor just below
     (set! (-> q ignore-process0) this)
     (set! (-> q ignore-process1) #f)
     (set! (-> q ignore-pat) (new 'static 'pat-surface))

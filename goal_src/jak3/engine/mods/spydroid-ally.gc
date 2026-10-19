@@ -138,6 +138,65 @@
     )
   )
 
+;; ---------------------------------------------------------------------------------------------------------------
+;; SHARED BY THE WHOLE BLAST BOT MOD (this file loads first, so every other file can use these)
+;; ---------------------------------------------------------------------------------------------------------------
+
+;; "Already dead" filter. The stock focus-status dead bit is set late (or never) for a lot of enemies, so a target that was
+;; already dying / exploding kept being picked. A target counts as dead when ANY of these is true:
+;;   - it is in one of the states in *blast-dead-states* (compared by name, like the ignore list)
+;;   - it is an enemy whose hit-points are 0 or less (*blast-dead-use-hp*; set to #f if some enemy type that should be
+;;     shootable is being skipped)
+;; *blast-dead-debug* #t prints the type + reason (at most once a second) whenever something is skipped as dead.
+(define *blast-dead-states* '(die die-falling die-now dying dead explode))
+(define *blast-dead-use-hp* #t)
+(define *blast-dead-debug* #f)
+(define *blast-dead-debug-time* (the-as time-frame 0))
+
+(defun blast-target-dead? ((p process-focusable))
+  (let ((dead #f)
+        (why 0)
+        )
+    (when p
+      (let ((st (-> p state)))
+        (when st
+          (let ((nm (-> st name))
+                (l (the-as object *blast-dead-states*))
+                )
+            (while (and (not (null? l)) (not dead))
+              (if (= (car (the-as pair l)) nm)
+                  (set! dead #t)
+                  )
+              (set! l (cdr (the-as pair l)))
+              )
+            )
+          )
+        )
+      (if dead
+          (set! why 1)
+          )
+      (when (and (not dead) *blast-dead-use-hp*)
+        (let ((e (as-type p enemy)))
+          (when (and e (>= 0.0 (-> e hit-points)))
+            (set! dead #t)
+            (set! why 2)
+            )
+          )
+        )
+      (when (and dead *blast-dead-debug* (time-elapsed? *blast-dead-debug-time* (seconds 1)))
+        (set-time! *blast-dead-debug-time*)
+        (format 0 "dead target skipped: ~A (~A)~%" (-> p type) (if (= why 1) "state" "hit-points"))
+        )
+      )
+    dead
+    )
+  )
+
+;; Homing attacks (the "Homing Attacks" cheat = game-secrets darkjak-tracking, set by blast-bot-secrets-apply).
+;; The flag lives here because this file loads first; the aiming itself (blast-homing-aim) is in blastbot_guns.gc, since
+;; it needs the blast-bot-player type and the turret's lock-on.
+(define *blast-homing* #f)
+
 (defun spydroid-ally-valid-target? ((this spydroid-ally) (p process-focusable))
   ;; same idea as blast-bot-valid-target? minus vehicles, plus "not Jak / not the owner / not another ally"
   (and p
@@ -146,6 +205,7 @@
        (not (type? p spydroid-ally))
        (!= (handle->process (-> this owner-handle)) p)
        (not (focus-test? p inactive))
+       (not (blast-target-dead? p))
        (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
        (not (logtest? (process-mask crate civilian) (-> p mask)))
        (not (spydroid-ally-ignored-type? p))
@@ -416,14 +476,17 @@
   (none)
   )
 
-(defun spydroid-ally-update ((this spydroid-ally))
-  ;; runs once per frame at the end of enemy-common-post
+(defun spydroid-ally-expire? ((this spydroid-ally))
+  ;; The droid's end of life: the owner (the bot) is gone, or *spydroid-ally-life* seconds are up. Returns #t when it acted.
+  ;; Called from spydroid-ally-update (every state that runs enemy-common-post) AND from update-focus when the droid is in
+  ;; idle: idle's post skips enemy-common-post, so a droid parked in idle never reached the timer and lived on for ever.
   (cond
     ((not (handle->process (-> this owner-handle)))
      ;; the owner (the bot) is gone: vanish quietly, same two calls the stock explode state ends with
      (set! (-> this no-blast) #t)
      (cleanup-for-death this)
      (deactivate this)
+     #t
      )
     ((and (< 0.0 *spydroid-ally-life*)
           (time-elapsed? (-> this spawn-time) (the int (* *spydroid-ally-life* 300.0)))
@@ -432,14 +495,24 @@
      ;; does not fire again every frame while the explode state plays out.
      (set-time! (-> this spawn-time))
      (go-die this)
+     #t
      )
     (else
-      (spydroid-ally-retarget this)
-      (spydroid-ally-headbutt-update this)
-      (spydroid-ally-separate this)
-      (spydroid-ally-watchdog this)
+      #f
       )
     )
+  )
+
+(defun spydroid-ally-update ((this spydroid-ally))
+  ;; runs once per frame at the end of enemy-common-post
+  (if (not (spydroid-ally-expire? this))
+      (begin
+        (spydroid-ally-retarget this)
+        (spydroid-ally-headbutt-update this)
+        (spydroid-ally-separate this)
+        (spydroid-ally-watchdog this)
+        )
+      )
   (none)
   )
 
@@ -481,6 +554,10 @@ once its aware value is above 1, which is what the retarget sets whenever an ene
               (handle->process (-> this focus handle))
               )
       )
+    ;; idle's post does not run enemy-common-post, so the lifetime check must happen here for a droid in idle
+    (if (and (-> this state) (= (-> this state name) 'idle))
+        (spydroid-ally-expire? this)
+        )
     result
     )
   )
