@@ -46,7 +46,7 @@
 ;; Find the names by standing next to the unwanted NPCs and running (blast-bot-whats-near) in the REPL: it prints "NEAR <type> mask #x...".
 (define *spydroid-ally-ignore-types* '(wlander-female wlander-male crimson-guard bombbot-bomb roboguard-ally))   ;; from the ally target: log. Add more type names here as they show up
 (define *spydroid-ally-scale* 1.0)                ;; model size multiplier (spydroid-orig is the small crab droid; the city droid is bigger). 1.0 = stock size
-(define *spydroid-ally-debug* #t)                ;; #t: print one droid's state / target every 2 s (set to #f from the REPL to silence)
+(define *spydroid-ally-debug* #f)                ;; #t: print one droid's state / target every 2 s (set to #f from the REPL to silence)
 (define *spydroid-ally-debug-time* (the-as time-frame 0))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;

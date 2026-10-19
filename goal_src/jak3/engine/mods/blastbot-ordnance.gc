@@ -57,7 +57,7 @@
 (define *blast-missile-streak-len* 16384.0)      ;; 4 m
 (define *blast-missile-streak-width* 1024.0)     ;; game units (4096 = 1 m), NOT metres: the laser pointer uses 1228.8
 (define *blast-ord-credit-jak* #t)               ;; #t: their kills count as Jak's (same idea as *sentinel-ally-credit-jak*)
-(define *blast-ord-debug* #t)                    ;; #t: print launch / explode lines (set to #f once it works)
+(define *blast-ord-debug* #f)                    ;; #t: print launch / explode lines (set to #f once it works)
 
 ;; ---- rotating lasers ----
 (define *blast-arc-beams* 4)                     ;; doc: 4 rotating lasers (the stock ship uses 2 to 4)

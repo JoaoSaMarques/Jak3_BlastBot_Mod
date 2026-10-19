@@ -178,7 +178,7 @@
          (y *ahud-y*)
          (ix (+ x 4))
          (iy (+ y 4))
-         (inner (- *ahud-box* 8))
+         (inner (- *ahud-box* 9))
          (show (and (> n 0) (>= cell 0)))
          )
     ;; hide everything of this kind first, then draw it when it is shown
@@ -193,7 +193,7 @@
         (case kind
           ((0)
            ;; red square
-           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 7) (+ iy 8) 16 16 255 40 40)
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 6) (+ iy 8) 16 16 255 40 40)
            )
           ((1)
            ;; yellow triangle: three rows, 5 / 12 / 20 wide
@@ -203,11 +203,11 @@
            )
           (else
             ;; blue X: four corner blocks and a centre block
-           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 4)  (+ iy 6)  6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 18) (+ iy 6)  6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 4)  (+ iy 20) 6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 18) (+ iy 20) 6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 10) (+ iy 12) 9 8 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 3)  (+ iy 6)  6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 17) (+ iy 6)  6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 3)  (+ iy 20) 6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 17) (+ iy 20) 6 6 60 120 255)
+           (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 9) (+ iy 12) 9 8 60 120 255)
             )
           )
         ;; the number: string KIND, centred under the box (x = 0 hides it)
