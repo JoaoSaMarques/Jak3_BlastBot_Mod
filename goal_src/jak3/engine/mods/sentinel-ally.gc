@@ -403,8 +403,14 @@
 
 (defun sentinel-ally-spawn ((owner process-drawable) (slot int))
   (let ((pos *sentinel-ally-pos*))
-    (vector-copy! pos (-> owner root trans))
-    (+! (-> pos y) *sentinel-ally-height*)
+    ;; start inside the bot's body: sentinel-ally-follow then flies them out to their hover spots
+    (if *blast-emerge-on*
+        (blast-emerge-origin! owner pos *sentinel-ally-emerge-height*)
+        (begin
+          (vector-copy! pos (-> owner root trans))
+          (+! (-> pos y) *sentinel-ally-height*)
+          )
+        )
     (let ((spawned (process-spawn sentinel-ally
                                   :init sentinel-ally-init-by-other owner pos slot
                                   :name "sentinel-ally"

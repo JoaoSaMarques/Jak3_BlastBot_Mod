@@ -59,6 +59,55 @@
 (define *spydroid-ally-fwd* (new 'global 'vector))
 (define *spydroid-ally-pos* (new 'global 'vector))
 
+;; ---- pop-out launch, shared by spydroid-ally / roboguard-ally / sentinel-ally ----
+;; The minions start inside the bot's body instead of at their final spot. Sentinels simply fly out from there;
+;; droids and roboguards hop along an arc to the spot they used to appear at.
+(define *blast-emerge-on* #t)           ;; #f = old behaviour (appear at the final spot)
+(define *blast-emerge-immune* 0.0)      ;; extra seconds of damage immunity after spawning (0 = off). Did not stop the leg damage, which is fixed in the bot's 'touched handler instead
+;; height above the bot's origin that each kind comes out at (the middle of the body)
+(define *spydroid-ally-emerge-height* 16384.0)   ;; 4 m
+(define *roboguard-ally-emerge-height* 16384.0)  ;; 4 m
+(define *sentinel-ally-emerge-height* 16384.0)   ;; 4 m
+(define *blast-emerge-time* 0.8)        ;; seconds a droid / roboguard takes to hop from the body to its spot
+(define *blast-emerge-hop* 12288.0)     ;; 3 m: height of the arc at the middle of the hop
+(define *blast-emerge-from* (new 'global 'vector))
+(define *blast-emerge-pos* (new 'global 'vector))
+
+(defun blast-emerge-origin! ((owner process-drawable) (out vector) (height float))
+  ;; the middle of the bot's body: its origin raised by height
+  (vector-copy! out (-> owner root trans))
+  (+! (-> out y) height)
+  out
+  )
+
+(defun blast-emerge-apply! ((root collide-shape-moving) (start time-frame) (fx float) (fy float) (fz float) (tx float) (ty float) (tz float))
+  ;; puts root on the hop arc for this moment. #t while still hopping, #f once it is over (root is then left where it is)
+  (let ((total (* *blast-emerge-time* 300.0))
+        (el (the float (- (current-time) start)))
+        )
+    (cond
+      ((>= el total)
+       #f
+       )
+      (else
+        (let ((k (/ el total))
+              (pos *blast-emerge-pos*)
+              )
+          (set-vector! pos
+                       (+ fx (* k (- tx fx)))
+                       (+ fy (* k (- ty fy)) (* 4.0 *blast-emerge-hop* k (- 1.0 k)))
+                       (+ fz (* k (- tz fz)))
+                       1.0
+                       )
+          (move-to-point! root pos)
+          (vector-reset! (-> root transv))
+          )
+        #t
+        )
+      )
+    )
+  )
+
 (deftype spydroid-ally (spydroid-orig)
   ((owner-handle  handle)
    (spawn-time    time-frame)
@@ -70,7 +119,40 @@
    (wd-x          float)      ;; watchdog: position at last check
    (wd-z          float)
    (wd-n          int32)      ;; watchdog: consecutive seconds without moving
+   (emerge-start  time-frame) ;; pop-out hop: when it began (0 = not hopping)
+   (emerge-fx     float)      ;; hop start (the bot's muzzle)
+   (emerge-fy     float)
+   (emerge-fz     float)
+   (emerge-tx     float)      ;; hop end (where it used to appear)
+   (emerge-ty     float)
+   (emerge-tz     float)
+   (immune-start  time-frame) ;; spawn immunity: when it began (0 = none)
+   (emerge-pen    uint64)     ;; penetrated-by to restore when the immunity ends
    )
+  )
+
+(defun spydroid-ally-emerge ((this spydroid-ally))
+  ;; runs every frame (post + update-focus, so it also covers idle): keeps it on its hop arc until the hop is over,
+  ;; and untouchable for *blast-emerge-immune* seconds after spawning
+  (when (nonzero? (-> this immune-start))
+    (cond
+      ((time-elapsed? (-> this immune-start) (the int (* *blast-emerge-immune* 300.0)))
+       (set! (-> this root penetrated-by) (the-as penetrate (-> this emerge-pen)))
+       (set! (-> this immune-start) 0)
+       )
+      (else
+        (set! (-> this root penetrated-by) (the-as penetrate 0))
+        )
+      )
+    )
+  (when (nonzero? (-> this emerge-start))
+    (if (not (blast-emerge-apply! (the-as collide-shape-moving (-> this root)) (-> this emerge-start)
+                                  (-> this emerge-fx) (-> this emerge-fy) (-> this emerge-fz)
+                                  (-> this emerge-tx) (-> this emerge-ty) (-> this emerge-tz)))
+        (set! (-> this emerge-start) 0)
+        )
+    )
+  (none)
   )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -505,6 +587,7 @@
 
 (defun spydroid-ally-update ((this spydroid-ally))
   ;; runs once per frame at the end of enemy-common-post
+  (spydroid-ally-emerge this)
   (if (not (spydroid-ally-expire? this))
       (begin
         (spydroid-ally-retarget this)
@@ -533,6 +616,7 @@ The stock idle state does NOT run enemy-common-post: its post only calls update-
 here, which every state's post reaches (enemy-common-post calls update-focus as well). The droid leaves idle by itself
 once its aware value is above 1, which is what the retarget sets whenever an enemy is found."
   (let ((result (call-parent-method this)))
+    (spydroid-ally-emerge this)
     (spydroid-ally-retarget this)
     (let ((st (if (-> this state) (-> this state name) #f)))
       (when (and *spydroid-ally-debug* (!= st (-> this dbg-state)))
@@ -622,6 +706,8 @@ hurt Jak / the bot, and the 'deadly' sphere is switched off (the headbutt damage
   (set-time! (-> this hit-time))
   (set! (-> this no-blast) #f)
   (set! (-> this dbg-state) #f)
+  (set! (-> this emerge-start) 0)
+  (set! (-> this immune-start) 0)
   (set-time! (-> this wd-time))
   (set! (-> this wd-x) (-> this root trans x))
   (set! (-> this wd-z) (-> this root trans z))
@@ -719,6 +805,27 @@ hurt Jak / the bot, and the 'deadly' sphere is switched off (the headbutt damage
     )
   )
 
+(defun spydroid-ally-emerge-start ((this spydroid-ally) (owner process-drawable))
+  ;; called right after it is spawned at its final spot: remember that spot, start the hop inside the bot's body
+  (when (< 0.0 *blast-emerge-immune*)
+    (set! (-> this emerge-pen) (the-as uint (-> this root penetrated-by)))
+    (set-time! (-> this immune-start))
+    )
+  (when *blast-emerge-on*
+    (let ((from (blast-emerge-origin! owner *blast-emerge-from* *spydroid-ally-emerge-height*)))
+      (set! (-> this emerge-fx) (-> from x))
+      (set! (-> this emerge-fy) (-> from y))
+      (set! (-> this emerge-fz) (-> from z))
+      (set! (-> this emerge-tx) (-> this root trans x))
+      (set! (-> this emerge-ty) (-> this root trans y))
+      (set! (-> this emerge-tz) (-> this root trans z))
+      (set-time! (-> this emerge-start))
+      )
+    )
+  (spydroid-ally-emerge this)
+  (none)
+  )
+
 (defun spydroid-ally-spawn ((owner process-drawable) (pos vector) (angle float))
   ;; enemy-init-by-other reads every field. art-level and entity MUST be #f, otherwise it
   ;; runs level-get / process-entity-set! on garbage. (params is a reused global, see the top of the file)
@@ -740,6 +847,7 @@ hurt Jak / the bot, and the 'deadly' sphere is switched off (the headbutt damage
           )
       (when spawned
         (set! (-> (the-as spydroid-ally (ppointer->process spawned)) owner-handle) (process->handle owner))
+        (spydroid-ally-emerge-start (the-as spydroid-ally (ppointer->process spawned)) owner)
         )
       (format 0 "ally: after process-spawn~%")
       (format 0 "ally: spawned process = ~A~%" (if spawned (ppointer->process spawned) #f))

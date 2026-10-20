@@ -67,7 +67,40 @@
    (spawn-time    time-frame)
    (scan-time     time-frame)
    (dbg-state     symbol)     ;; last state name printed by the state-change log
+   (emerge-start  time-frame) ;; pop-out hop: when it began (0 = not hopping)
+   (emerge-fx     float)      ;; hop start (the bot's muzzle)
+   (emerge-fy     float)
+   (emerge-fz     float)
+   (emerge-tx     float)      ;; hop end (where it used to appear)
+   (emerge-ty     float)
+   (emerge-tz     float)
+   (immune-start  time-frame) ;; spawn immunity: when it began (0 = none)
+   (emerge-pen    uint64)     ;; penetrated-by to restore when the immunity ends
    )
+  )
+
+(defun roboguard-ally-emerge ((this roboguard-ally))
+  ;; runs every frame (post + update-focus, so it also covers idle): keeps it on its hop arc until the hop is over,
+  ;; and untouchable for *blast-emerge-immune* seconds after spawning
+  (when (nonzero? (-> this immune-start))
+    (cond
+      ((time-elapsed? (-> this immune-start) (the int (* *blast-emerge-immune* 300.0)))
+       (set! (-> this root penetrated-by) (the-as penetrate (-> this emerge-pen)))
+       (set! (-> this immune-start) 0)
+       )
+      (else
+        (set! (-> this root penetrated-by) (the-as penetrate 0))
+        )
+      )
+    )
+  (when (nonzero? (-> this emerge-start))
+    (if (not (blast-emerge-apply! (the-as collide-shape-moving (-> this root)) (-> this emerge-start)
+                                  (-> this emerge-fx) (-> this emerge-fy) (-> this emerge-fz)
+                                  (-> this emerge-tx) (-> this emerge-ty) (-> this emerge-tz)))
+        (set! (-> this emerge-start) 0)
+        )
+    )
+  (none)
   )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -282,6 +315,7 @@
 
 (defun roboguard-ally-update ((this roboguard-ally))
   ;; once per frame at the end of enemy-common-post
+  (roboguard-ally-emerge this)
   (if (not (roboguard-ally-expire? this))
       (roboguard-ally-retarget this)
       )
@@ -303,6 +337,7 @@
   "Stock focus update, then the ally retarget. The stock idle state does not run enemy-common-post (its post only calls
 update-focus and ja-post), so the retarget lives here: every state's post reaches it."
   (let ((result (call-parent-method this)))
+    (roboguard-ally-emerge this)
     (roboguard-ally-retarget this)
     (let ((st (if (-> this state) (-> this state name) #f)))
       (when (and *roboguard-ally-debug* (!= st (-> this dbg-state)))
@@ -387,6 +422,8 @@ Jak or the bot, and the punch sphere stays off (the punch damage is sent by robo
   (set-time! (-> this spawn-time))
   (set-time! (-> this scan-time))
   (set! (-> this dbg-state) #f)
+  (set! (-> this emerge-start) 0)
+  (set! (-> this immune-start) 0)
   ;; stock roboguards stand where their level placed them; this one is spawned from code, so let it drop to the ground
   (logclear! (-> this enemy-flags) (enemy-flag no-initial-move-to-ground))
   (logclear! (-> this enemy-flags) (enemy-flag use-notice-distance))
@@ -619,6 +656,27 @@ Jak or the bot, and the punch sphere stays off (the punch damage is sent by robo
     )
   )
 
+(defun roboguard-ally-emerge-start ((this roboguard-ally) (owner process-drawable))
+  ;; called right after it is spawned at its final spot: remember that spot, start the hop inside the bot's body
+  (when (< 0.0 *blast-emerge-immune*)
+    (set! (-> this emerge-pen) (the-as uint (-> this root penetrated-by)))
+    (set-time! (-> this immune-start))
+    )
+  (when *blast-emerge-on*
+    (let ((from (blast-emerge-origin! owner *blast-emerge-from* *roboguard-ally-emerge-height*)))
+      (set! (-> this emerge-fx) (-> from x))
+      (set! (-> this emerge-fy) (-> from y))
+      (set! (-> this emerge-fz) (-> from z))
+      (set! (-> this emerge-tx) (-> this root trans x))
+      (set! (-> this emerge-ty) (-> this root trans y))
+      (set! (-> this emerge-tz) (-> this root trans z))
+      (set-time! (-> this emerge-start))
+      )
+    )
+  (roboguard-ally-emerge this)
+  (none)
+  )
+
 (defun roboguard-ally-spawn ((owner process-drawable) (pos vector) (angle float))
   ;; enemy-init-by-other reads every field; art-level and entity MUST be #f (params is a reused global)
   (let ((params *roboguard-ally-params*))
@@ -638,6 +696,7 @@ Jak or the bot, and the punch sphere stays off (the punch damage is sent by robo
           )
       (when spawned
         (set! (-> (the-as roboguard-ally (ppointer->process spawned)) owner-handle) (process->handle owner))
+        (roboguard-ally-emerge-start (the-as roboguard-ally (ppointer->process spawned)) owner)
         )
       (if *roboguard-ally-debug*
           (format 0 "roboguard ally: spawned ~A at ~f ~f ~f (m)~%"

@@ -168,6 +168,8 @@
 (define *blast-bot-ramp-time* 4.0)
 ;; R2 hover: how high (in game units, 4096 = 1m) the body floats
 (define *blast-bot-hover-height* 12288.0)
+(define *blast-bot-bunker-depth* 10240.0)   ;; how far the body dips while the spy droid is out (10240 = same dip as the jump crouch)
+(define *blast-bot-bunker-speed* 20480.0)   ;; how fast it dips (same speed as the jump crouch)
 ;; Circle shield size (the stock shield's hit sphere radius is 1m x this).
 ;; Raise it until the shield fully covers the legs, otherwise shots can hit the bot's own colliders first.
 (define *blast-bot-shield-size* 6.5)
@@ -315,6 +317,8 @@
   (or (type? p spydroid-ally)
       (type? p sentinel-ally)
       (type? p roboguard-ally)
+      ;; the L2 spy droid you steer (blastbot-spybot.gc loads after this file, so it is matched by type name)
+      (= (-> p type symbol) 'spy-bot-player)
       )
   )
 
@@ -410,7 +414,12 @@
       (let* ((phase (+ (-> this gait-phase) (blast-bot-foot-phase i)))
              (f0 (- phase (the float (the int phase))))
              ;; while crouching / recovering from a jump every foot stays planted
-             (f (if (or (= (-> this jump-mode) 1) (= (-> this jump-mode) 3)) 0.9 f0))
+             (f (if (or (= (-> this jump-mode) 1) (= (-> this jump-mode) 3)
+                        (and *blast-bot-spy-active* (= (-> this jump-mode) 0))   ;; bunkered down while the spy droid is out
+                        )
+                    0.9
+                    f0
+                    ))
              (cur (new 'stack-no-clear 'vector))
              (local (new 'stack-no-clear 'vector))
              (rel (new 'stack-no-clear 'vector))
@@ -1011,6 +1020,14 @@
           )
         )
       )
+    ;; bunker down while the spy droid is out: the same dip as the jump crouch (body down, feet planted, head nods
+    ;; forward), held until the droid is gone, then it stands back up
+    (when (= (-> this jump-mode) 0)
+      (if *blast-bot-spy-active*
+          (seek! (-> this crouch-depth) *blast-bot-bunker-depth* (* *blast-bot-bunker-speed* dt))
+          (seek! (-> this crouch-depth) 0.0 (* 14336.0 dt))
+          )
+      )
     (case (-> this jump-mode)
       ((0)
        (set! (-> this jump-fuel) (fmin 1.0 (+ (-> this jump-fuel) (* 0.4 dt))))
@@ -1136,7 +1153,7 @@
 (define *blast-bot-hud-gun-color* 0)      ;; 0 red, 1 yellow, 2 blue; written by blast-bot-gun-select
 (define *blast-bot-hud-gun-level* 1)      ;; 1..3
 (define *blast-bot-weapon-bar* #t)        ;; the selected-weapon bar above the heat bar
-(define *blast-bot-weapon-text* #t)       ;; the weapon name line in the top-left console
+(define *blast-bot-weapon-text* #f)       ;; master switch for ALL text in the top-left console (weapon name, auto mode, text meters). #f = none
 ;; set to #f to run the bot without the hud process (health still works) if the hud ever crashes the game
 (define *blast-bot-hud-on* #t)
 (define *blast-bot-hud-drawn* #f) ;; debug: one-shot flag for the first-draw log line
@@ -1361,7 +1378,7 @@
         )
       )
     )
-  (when (not *blast-bot-hud-on*)
+  (when (and *blast-bot-weapon-text* (not *blast-bot-hud-on*))
     ;; fallback while the hud process is off: text meters in the top-left console
     (let ((n (the int (+ 0.999 (* 20.0 (fmax 0.0 (fmin 1.0 *blast-bot-hud-health*)))))))
       (format *stdcon* "HEALTH [")
@@ -1799,7 +1816,7 @@
 (defun blast-bot-draw-shield-status ((this blast-bot-player))
   ;; Text meter while the shield is broken. Only used when the hud process is off (*blast-bot-hud-on* #f);
   ;; otherwise the shield bar next to the fuel bar shows this.
-  (when (and (not *blast-bot-hud-on*) (nonzero? (-> this shield-broken-until)))
+  (when (and *blast-bot-weapon-text* (not *blast-bot-hud-on*) (nonzero? (-> this shield-broken-until)))
     (let* ((total (* *blast-bot-shield-recharge* (the float (seconds 1))))
            (left (the float (- (-> this shield-broken-until) (current-time))))
            (n (the int (* 20.0 (- 1.0 (/ left total)))))
@@ -2239,6 +2256,8 @@
                   (!= proc *target*)
                   (!= proc (handle->process (-> self shield-handle)))
                   (not (logtest? (process-mask civilian) (-> proc mask)))
+                  ;; the bot's own minions (spy droids, roboguards, sentinels) are never hurt by its legs
+                  (not (blast-bot-ally? (the-as process-focusable proc)))
                   ;; let an attacker finish its swing/lunge: its hit lands first, the legs get it afterwards
                   (not (let ((en (as-type proc enemy)))
                          (and en (logtest? (-> en focus-status) (focus-status dangerous)))))

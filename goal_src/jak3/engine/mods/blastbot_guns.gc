@@ -245,18 +245,20 @@
 
 (defun blast-bot-heat-text ()
   ;; text meter in the top-left console, same style as the HEALTH / FUEL fallback meters
-  (let ((n (the int (* 20.0 (fmax 0.0 (fmin 1.0 *blast-bot-heat*))))))
-    (if *blast-bot-overheated*
-        (format *stdcon* "OVERHEAT [")
-        (format *stdcon* "HEAT     [")
-        )
-    (dotimes (i 20)
-      (if (< i n)
-          (format *stdcon* "#")
-          (format *stdcon* "-")
+  (when *blast-bot-weapon-text*
+    (let ((n (the int (* 20.0 (fmax 0.0 (fmin 1.0 *blast-bot-heat*))))))
+      (if *blast-bot-overheated*
+          (format *stdcon* "OVERHEAT [")
+          (format *stdcon* "HEAT     [")
           )
+      (dotimes (i 20)
+        (if (< i n)
+            (format *stdcon* "#")
+            (format *stdcon* "-")
+            )
+        )
+      (format *stdcon* "]~%")
       )
-    (format *stdcon* "]~%")
     )
   (none)
   )
