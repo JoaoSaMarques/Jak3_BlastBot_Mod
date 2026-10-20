@@ -134,15 +134,16 @@
   )
 
 ;; ---- Morphgun type switching (D-pad) ----
-;; 0 = red (gun-red-1), 1 = yellow (gun-yellow-1), 2 = blue (gun-blue-1). Dark is not supported: gun-dark-shot's
-;; startup state dissipates the shot unless Jak is in gun mode, and it reads node 13 of its parent.
-;; D-pad: up = red, down = yellow, left = blue. Edit blast-bot-gun-select below to remap.
+;; 0 = red (gun-red-1), 1 = yellow (gun-yellow-1), 2 = blue (gun-blue-1), 3 = purple (gun-dark-1). Jak's dark shot itself is not
+;; used (gun-dark-shot's startup state dissipates the shot unless Jak is in gun mode, and it reads node 13 of its parent): the
+;; purple weapons are rebuilt, like the others (Peace Maker = Errol's bomb, blastbot-ordnance.gc).
+;; D-pad: up = red, down = yellow, left = blue, right = purple. Edit blast-bot-gun-select below to remap.
 (define *blast-bot-gun-mode* 0)
 
 ;; ---- ownership (same test as want-to-gun? in target-gun.gc) ----
 
 (defun blast-bot-gun-feature ((color int) (level int))
-  ;; color: 0 red, 1 yellow, 2 blue.  level: 1..3
+  ;; color: 0 red, 1 yellow, 2 blue, 3 purple.  level: 1..3
   (case color
     ((0)
      (case level
@@ -158,11 +159,18 @@
        (else (game-feature gun-yellow-3))
        )
      )
+    ((2)
+     (case level
+       ((1) (game-feature gun-blue-1))
+       ((2) (game-feature gun-blue-2))
+       (else (game-feature gun-blue-3))
+       )
+     )
     (else
       (case level
-        ((1) (game-feature gun-blue-1))
-        ((2) (game-feature gun-blue-2))
-        (else (game-feature gun-blue-3))
+        ((1) (game-feature gun-dark-1))
+        ((2) (game-feature gun-dark-2))
+        (else (game-feature gun-dark-3))
         )
       )
     )
@@ -200,6 +208,7 @@
 (define *blast-bot-last-use* (the-as time-frame 0))
 (define *blast-bot-warn-time* (the-as time-frame 0))    ;; throttles the "overheated" message to once a second
 (define *blast-bot-unlimited-ammo* #f)    ;; cheat from the doc: weapons never overheat
+(define *blast-bomb-uses* 2.0)            ;; bombs from a cold start before overheating (doc: 4, now 2)
 
 (defun blast-bot-heat-update ((dt float))
   (if (time-elapsed? *blast-bot-last-use* (the int (* 300.0 *blast-bot-heat-cool-delay*)))
@@ -629,22 +638,71 @@
     )
   )
 
+;; ---- purple selection (same idea as red / yellow / blue) ----
+(define *blast-bot-purple-weapon* 1)      ;; 1 Peace Maker, 2 Mass Inverter, 3 Super Nova
+(define *blast-bot-purple-max* 1)         ;; highest purple level that is built (1 = Peace Maker, blastbot-ordnance.gc)
+
+(defun blast-bot-purple-fix ()
+  ;; keep *blast-bot-purple-weapon* on a built level Jak actually owns
+  (when (or (< *blast-bot-purple-max* *blast-bot-purple-weapon*)
+            (not (blast-bot-gun-level-owned? 3 *blast-bot-purple-weapon*))
+            )
+    (let ((found #f))
+      (dotimes (i *blast-bot-purple-max*)
+        (when (and (not found) (blast-bot-gun-level-owned? 3 (+ i 1)))
+          (set! *blast-bot-purple-weapon* (+ i 1))
+          (set! found #t)
+          )
+        )
+      )
+    (if (< *blast-bot-purple-max* *blast-bot-purple-weapon*)
+        (set! *blast-bot-purple-weapon* 1)
+        )
+    )
+  (none)
+  )
+
+(defun blast-bot-purple-cycle ()
+  ;; next owned (and built) purple weapon after the current one (wraps)
+  (let ((found #f))
+    (dotimes (i *blast-bot-purple-max*)
+      (let ((lvl (+ 1 (mod (+ *blast-bot-purple-weapon* i) *blast-bot-purple-max*))))
+        (when (and (not found) (blast-bot-gun-level-owned? 3 lvl))
+          (set! *blast-bot-purple-weapon* lvl)
+          (set! found #t)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-purple-name ((level int))
+  (case level
+    ((1) "Peace Maker")
+    ((2) "Mass Inverter")
+    (else "Super Nova")
+    )
+  )
+
 (defun blast-bot-gun-select ()
   (let ((old *blast-bot-gun-mode*)
         (old-red *blast-bot-red-weapon*)
         (old-yellow *blast-bot-yellow-weapon*)
         (old-blue *blast-bot-blue-weapon*)
+        (old-purple *blast-bot-purple-weapon*)
         (want -1)
         )
     (cond
       ((cpad-pressed? 0 up) (set! want 0))      ;; red
       ((cpad-pressed? 0 down) (set! want 1))    ;; yellow
       ((cpad-pressed? 0 left) (set! want 2))    ;; blue
+      ((cpad-pressed? 0 right) (set! want 3))   ;; purple
       )
     (when (>= want 0)
       (cond
         ((not (blast-bot-gun-owned? want))
-         (format 0 "Blast Bot: you do not own the ~A gun yet~%" (case want ((0) 'red) ((1) 'yellow) (else 'blue)))
+         (format 0 "Blast Bot: you do not own the ~A gun yet~%" (case want ((0) 'red) ((1) 'yellow) ((2) 'blue) (else 'purple)))
          )
         ((and (= want 0) (= *blast-bot-gun-mode* 0))
          ;; pressing red again while on red cycles through the red weapons you own
@@ -658,6 +716,10 @@
          ;; pressing blue again while on blue cycles through the blue weapons you own
          (blast-bot-blue-cycle)
          )
+        ((and (= want 3) (= *blast-bot-gun-mode* 3))
+         ;; pressing purple again while on purple cycles through the purple weapons you own
+         (blast-bot-purple-cycle)
+         )
         (else
           (set! *blast-bot-gun-mode* want)
           )
@@ -665,7 +727,7 @@
       )
     ;; the selected colour is no longer owned (first frame, or features changed): move to the first owned one
     (when (not (blast-bot-gun-owned? *blast-bot-gun-mode*))
-      (dotimes (i 3)
+      (dotimes (i 4)
         (when (and (not (blast-bot-gun-owned? *blast-bot-gun-mode*)) (blast-bot-gun-owned? i))
           (set! *blast-bot-gun-mode* i)
           )
@@ -674,8 +736,9 @@
     (blast-bot-red-fix)
     (blast-bot-yellow-fix)
     (blast-bot-blue-fix)
+    (blast-bot-purple-fix)
     (if (!= old *blast-bot-gun-mode*)
-        (format 0 "Blast Bot: gun ~A~%" (case *blast-bot-gun-mode* ((0) 'red) ((1) 'yellow) (else 'blue)))
+        (format 0 "Blast Bot: gun ~A~%" (case *blast-bot-gun-mode* ((0) 'red) ((1) 'yellow) ((2) 'blue) (else 'purple)))
         )
     (if (and (= *blast-bot-gun-mode* 0) (or (!= old *blast-bot-gun-mode*) (!= old-red *blast-bot-red-weapon*)))
         (format 0 "Blast Bot: red weapon ~A~%" (blast-bot-red-name *blast-bot-red-weapon*))
@@ -686,6 +749,9 @@
     (if (and (= *blast-bot-gun-mode* 2) (or (!= old *blast-bot-gun-mode*) (!= old-blue *blast-bot-blue-weapon*)))
         (format 0 "Blast Bot: blue weapon ~A~%" (blast-bot-blue-name *blast-bot-blue-weapon*))
         )
+    (if (and (= *blast-bot-gun-mode* 3) (or (!= old *blast-bot-gun-mode*) (!= old-purple *blast-bot-purple-weapon*)))
+        (format 0 "Blast Bot: purple weapon ~A~%" (blast-bot-purple-name *blast-bot-purple-weapon*))
+        )
     (if (!= old *blast-bot-gun-mode*)
         (set! *blast-bot-burst-left* 0)
         )
@@ -693,7 +759,8 @@
     (let ((lvl (case *blast-bot-gun-mode*
                  ((0) *blast-bot-red-weapon*)
                  ((1) *blast-bot-yellow-weapon*)
-                 (else *blast-bot-blue-weapon*)
+                 ((2) *blast-bot-blue-weapon*)
+                 (else *blast-bot-purple-weapon*)
                  )
                )
           )
@@ -701,12 +768,13 @@
       (set! *blast-bot-hud-gun-level* lvl)
       (when *blast-bot-weapon-text*
         (format *stdcon* "WEAPON ~A ~D/3: ~A~%"
-                (case *blast-bot-gun-mode* ((0) "RED") ((1) "YELLOW") (else "BLUE"))
+                (case *blast-bot-gun-mode* ((0) "RED") ((1) "YELLOW") ((2) "BLUE") (else "PURPLE"))
                 lvl
                 (case *blast-bot-gun-mode*
                   ((0) (blast-bot-red-name lvl))
                   ((1) (blast-bot-yellow-name lvl))
-                  (else (blast-bot-blue-name lvl))
+                  ((2) (blast-bot-blue-name lvl))
+                  (else (blast-bot-purple-name lvl))
                   )
                 )
         )
@@ -997,6 +1065,72 @@
   (none)
   )
 
+;; the last spot the turret was aiming at an enemy (kept while the Peace Maker is in hand); a bomb fired just after the lock is lost
+;; (target died, stepped out of sight) still goes there
+(define *blast-bomb-last-aim* (new 'global 'vector))
+(define *blast-bomb-last-aim-time* (the-as time-frame 0))   ;; 0 = none
+(define *blast-bomb-last-aim-keep* 1.0)                       ;; seconds the last aim spot stays valid
+
+(defun blast-bot-peacemaker-aim-track ((this blast-bot-player))
+  (when (-> this locked)
+    (vector-copy! *blast-bomb-last-aim* (-> this target-pos))
+    (set-time! *blast-bomb-last-aim-time*)
+    )
+  (none)
+  )
+
+(defun blast-bot-fire-peacemaker ((this blast-bot-player))
+  ;; Peace Maker: Errol's bomb, lobbed from the muzzle (blastbot-ordnance.gc). It lands where the turret was aiming when it fired: the
+  ;; locked enemy's spot, or the last spot it aimed at if the lock was lost a moment ago, or 30 m ahead with nothing to aim at.
+  ;; It only follows the enemy while it flies with the Homing Attacks cheat on (*blast-homing*).
+  (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
+                                     (-> this node-list data 6 bone transform)))
+         (start (matrix->trans muzzle-matrix (new 'stack-no-clear 'vector)))
+         (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> muzzle-matrix fvec) 1.0))
+         (target (if (-> this locked)
+                     (as-type (handle->process (-> this lock-handle)) process-focusable)
+                     (the-as process-focusable #f)
+                     ))
+         )
+    (vector+*! start start dir 8192.0)
+    (blast-bot-peacemaker-aim-track this)
+    (cond
+      ((and *blast-homing* target)
+       (set! *blast-bomb-has-fixed* #f)
+       (blast-bomb-launch this start dir target)
+       )
+      (else
+        (cond
+          ((-> this locked)
+           (vector-copy! *blast-bomb-fixed-dest* (-> this target-pos))
+           (set! *blast-bomb-has-fixed* #t)
+           )
+          ((and (!= *blast-bomb-last-aim-time* 0)
+                (not (time-elapsed? *blast-bomb-last-aim-time* (the int (* 300.0 *blast-bomb-last-aim-keep*)))))
+           (vector-copy! *blast-bomb-fixed-dest* *blast-bomb-last-aim*)
+           (set! *blast-bomb-has-fixed* #t)
+           )
+          (else (set! *blast-bomb-has-fixed* #f))
+          )
+        (blast-bomb-launch this start dir (the-as process-focusable #f))
+        (set! *blast-bomb-has-fixed* #f)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-fire-purple-arsenal ((this blast-bot-player))
+  (case *blast-bot-purple-weapon*
+    (else
+      (if (blast-bot-heat-try-use *blast-bomb-uses*)   ;; Peace Maker: two bombs before overheating
+          (blast-bot-fire-peacemaker this)
+          )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-shot ((this blast-bot-player))
   ;; morphgun only when the toggle is on AND Jak owns the selected colour; otherwise the old guard shot
   (if (and *blast-bot-use-morphgun* *target* (blast-bot-gun-owned? *blast-bot-gun-mode*))
@@ -1006,6 +1140,9 @@
          )
         ((2)
          (blast-bot-fire-blue-arsenal this)
+         )
+        ((3)
+         (blast-bot-fire-purple-arsenal this)
          )
         (else (blast-bot-fire-red-arsenal this))
         )
@@ -1035,7 +1172,7 @@
 ;; The secrets menu (*menu-secrets-array*) only sells bits of (-> *game-info* purchase-secrets). Nothing happens when a
 ;; bit is bought; whoever checks the bit does the work. These functions are the Blast Bot's checks. The menu entries
 ;; are the stock ones (same slot, same bit, same cost, same unlock mission), so the doc's upgrades map like this:
-;;   gun-upgrade-ammo-red/yellow/blue : heat meter doubled for that colour
+;;   gun-upgrade-ammo-red/yellow/blue/dark : heat meter doubled for that colour
 ;;   gun-upgrade-red-1  Scattergun      : 7 x 4 grenades
 ;;   gun-upgrade-red-2  Wave Concussor  : second, inner ring (16 total)
 ;;   gun-upgrade-red-3  Plasmite RPG    : +5 spydroids (10 -> 15 per shot); max alive is *blast-bot-spydroid-max-upgraded* (doc: 30, kept at 20 for now)
@@ -1043,6 +1180,7 @@
 ;;   gun-upgrade-yellow-3 Gyro Burster  : +1 sentinel (2 -> 3)
 ;;   gun-upgrade-blue-1 Vulcan Fury     : ramps to a faster fire rate
 ;;   gun-upgrade-blue-3 Needle Lazer    : +1 roboguard (1 -> 2)
+;;   gun-upgrade-dark-1 Peace Maker     : each bomb splits into 3 smaller bombs, no impact splash (blastbot-ordnance.gc)
 ;;   endless-ammo (cheat)               : weapons never overheat
 ;;   invulnerable (cheat)               : *blast-bot-god-mode* (blastbot-main-mod.gc), the bot ignores all damage
 (define *blast-bot-secrets-debug* #f)   ;; #t: print the upgrade set whenever it changes
@@ -1062,7 +1200,9 @@
         (case *blast-bot-gun-mode*
           ((0) (if (blast-bot-secret? gun-upgrade-ammo-red) 2.0 1.0))
           ((1) (if (blast-bot-secret? gun-upgrade-ammo-yellow) 2.0 1.0))
-          (else (if (blast-bot-secret? gun-upgrade-ammo-blue) 2.0 1.0))
+          ((2) (if (blast-bot-secret? gun-upgrade-ammo-blue) 2.0 1.0))
+          ((3) (if (blast-bot-secret? gun-upgrade-ammo-dark) 2.0 1.0))
+          (else 1.0)
           )
         )
   ;; red
@@ -1081,6 +1221,8 @@
   ;; blue
   (set! *blast-bot-blue-fast* (if (blast-bot-secret? gun-upgrade-blue-1) *blast-bot-blue-fast-upgraded* 0.05))
   (set! *roboguard-ally-count* (if (blast-bot-secret? gun-upgrade-blue-3) 2 1))
+  ;; purple 1: Peace Maker bombs split into 3 smaller ones without splash (blast-bomb-launch)
+  (set! *blast-bomb-split* (blast-bot-secret? gun-upgrade-dark-1))
   ;; yellow 1: Blaster auto-mode (the switch itself is blast-bot-auto-toggle). Like god mode these only ever turn ON, so the
   ;; REPL can still force them for testing without buying anything.
   (when (blast-bot-secret? gun-upgrade-yellow-1)
@@ -1114,11 +1256,129 @@
   (none)
   )
 
+;; ---- Peace Maker charge: hold R1 to charge, release to fire. Up to 2x the size and the damage of the bomb ----
+;; The heat builds while you hold: a bomb costs 1/*blast-bomb-uses* of the meter, and that cost is paid gradually over the
+;; charge (a quick tap pays the rest when you let go, so every bomb costs the same). No cooling while the button is down.
+(define *blast-bomb-charge-time* 1.5)     ;; seconds of holding for a full charge
+(define *blast-bomb-charge-start* (the-as time-frame 0))   ;; when the current charge began, 0 = not charging
+(define *blast-bomb-charge-heat* 0.0)     ;; heat already added by the current charge
+
+(defun blast-bot-purple-cost ()
+  (/ 1.0 (* *blast-bomb-uses* *blast-bot-heat-capacity*))
+  )
+
+(define *blast-bomb-charge-dark-parts* #f)   ;; #t: also launch the dark gun's own charge particles (part ids 258..261). Crashed the game, so off.
+
+(defun blast-bot-purple-charge-fx ((this blast-bot-player) (f float))
+  ;; the glowing ball at the muzzle, growing with the charge
+  (let* ((muzzle-matrix (matrix-copy! (new 'stack-no-clear 'matrix)
+                                     (-> this node-list data 6 bone transform)))
+         (pos (matrix->trans muzzle-matrix (new 'stack-no-clear 'vector)))
+         (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> muzzle-matrix fvec) 1.0))
+         )
+    (vector+*! pos pos dir 8192.0)
+    (blast-bomb-charge-ball pos dir f)
+    (when (and *blast-bomb-charge-dark-parts*
+               (-> *part-id-table* 258) (-> *part-id-table* 259) (-> *part-id-table* 260) (-> *part-id-table* 261))
+      (set! (-> *part-id-table* 260 init-specs 2 initial-valuef) (lerp 409.6 9216.0 f))
+      (set! (-> *part-id-table* 260 init-specs 8 initial-valuef) (lerp 0.0 32.0 f))
+      (set! (-> *part-id-table* 261 init-specs 2 initial-valuef) (lerp 409.6 32768.0 f))
+      (set! (-> *part-id-table* 261 init-specs 8 initial-valuef) (lerp 0.0 16.0 f))
+      (set! (-> *part-id-table* 259 init-specs 2 initial-valuef) (lerp 409.6 8192.0 f))
+      (set! (-> *part-id-table* 258 init-specs 1 initial-valuef) (lerp 0.1 1.0 f))
+      (set! (-> *part-id-table* 258 init-specs 2 initial-valuef) (lerp 409.6 3686.4 f))
+      (launch-particles (-> *part-id-table* 258) pos)
+      (launch-particles (-> *part-id-table* 259) pos)
+      (launch-particles (-> *part-id-table* 260) pos)
+      (launch-particles (-> *part-id-table* 261) pos)
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-purple-add-heat ((amount float))
+  ;; heat from the charge; reaching 1.0 overheats like any other shot
+  (when (and (not *blast-bot-unlimited-ammo*) (< 0.0 amount))
+    (+! *blast-bot-heat* amount)
+    (set-time! *blast-bot-last-use*)
+    (when (>= *blast-bot-heat* 0.999)
+      (set! *blast-bot-heat* 1.0)
+      (set! *blast-bot-overheated* #t)
+      (format 0 "Blast Bot: OVERHEAT~%")
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-purple-release ((this blast-bot-player) (f float))
+  ;; let go (or overheated): pay what the charge has not paid yet, then throw the bomb at 1x..2x
+  (set! *blast-bomb-charge-start* 0)
+  (blast-bot-purple-add-heat (- (blast-bot-purple-cost) *blast-bomb-charge-heat*))
+  (set! *blast-bomb-charge-heat* 0.0)
+  (set! (-> this next-shot) (+ (current-time) (seconds 0.2)))
+  (set! *blast-bomb-charge* (+ 1.0 f))
+  (blast-bot-fire-peacemaker this)
+  (set! *blast-bomb-charge* 1.0)
+  (set! (-> this shield-open-until) (+ (current-time) (seconds 0.15)))
+  (none)
+  )
+
+(defun blast-bot-purple-charge-update ((this blast-bot-player))
+  (blast-bot-peacemaker-aim-track this)
+  (let* ((held (the float (- (current-time) *blast-bomb-charge-start*)))
+         (f (if (= *blast-bomb-charge-start* 0)
+                0.0
+                (fmax 0.0 (fmin 1.0 (/ held (* 300.0 *blast-bomb-charge-time*))))
+                ))
+         )
+    (cond
+      ((cpad-hold? 0 r1)
+       (cond
+         ((= *blast-bomb-charge-start* 0)
+          ;; start charging, unless the weapon is locked
+          (cond
+            ((and *blast-bot-overheated* (not *blast-bot-unlimited-ammo*))
+             (when (time-elapsed? *blast-bot-warn-time* (seconds 1))
+               (set-time! *blast-bot-warn-time*)
+               (format 0 "Blast Bot: overheated~%")
+               )
+             )
+            ((>= (+ (current-time) (seconds -0.02)) (-> this next-shot))
+             (set! *blast-bomb-charge-start* (current-time))
+             (set! *blast-bomb-charge-heat* 0.0)
+             )
+            )
+          )
+         (else
+           ;; charging: the ball grows and the meter fills
+           (blast-bot-purple-charge-fx this f)
+           (let ((want (* (blast-bot-purple-cost) f)))
+             (blast-bot-purple-add-heat (- want *blast-bomb-charge-heat*))
+             (set! *blast-bomb-charge-heat* want)
+             )
+           (set-time! *blast-bot-last-use*)
+           (format *stdcon* "PEACE MAKER CHARGE ~D%~%" (the int (* 100.0 f)))
+           (when *blast-bot-overheated*
+             (blast-bot-purple-release this f)      ;; the meter is full: it goes off now
+             )
+           )
+         )
+       )
+      ((!= *blast-bomb-charge-start* 0)
+       (blast-bot-purple-release this f)
+       )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-input ((this blast-bot-player))
   (blast-bot-secrets-apply)
   (blast-bot-auto-toggle)
   (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2)
-                   (!= *blast-bot-blue-weapon* 2) (!= *blast-bot-blue-weapon* 3))))
+                   (!= *blast-bot-blue-weapon* 2) (!= *blast-bot-blue-weapon* 3)))
+        (purple (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 3) (blast-bot-gun-owned? 3)))
+        )
     (cond
       ((not (cpad-hold? 0 r1))
        (set! *blast-bot-hold-start* 0)
@@ -1128,7 +1388,12 @@
        )
       )
     (set! blue (and blue (cpad-hold? 0 r1)))
-    (when (and (or blue (cpad-pressed? 0 r1))
+    (if purple
+        (blast-bot-purple-charge-update this)
+        (set! *blast-bomb-charge-start* 0)
+        )
+    (when (and (not purple)
+               (or blue (cpad-pressed? 0 r1))
                (>= (+ (current-time) (seconds -0.02)) (-> this next-shot)))
       (set! (-> this next-shot) (+ (current-time) (if blue (blast-bot-blue-interval) (seconds 0.2))))
       (blast-bot-fire-shot this)

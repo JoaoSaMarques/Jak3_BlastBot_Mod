@@ -20,6 +20,7 @@
 ;; enemies / metalheads / KG robots only. Civilians, crates, Jak, the bot, the allies and every type listed in
 ;; *spydroid-ally-ignore-types* (crimson-guard, the wastelanders, ...) are never aimed at and never damaged, not even by the
 ;; blast of a missile that explodes next to them. Add a type name to that list and it applies to everything here too.
+;; The exception is the Peace Maker bomb (blast-bomb-valid-target?): it hurts the same things the red / yellow / blue shots do.
 ;;
 ;; Needs, in game.gd:
 ;;   "blastbot-ordnance.o"      after sentinel-ally.o, before mod-common-functions.o
@@ -1020,5 +1021,577 @@
 (defun blast-arc-stop ()
   ;; REPL: switches the lasers off
   (set! *blast-arc-active* #f)
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Peace Maker (purple 1): Errol's shockwave bomb
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; factory-boss-setup.gc is only loaded in Errol's level, so the bomb is rebuilt here (same pattern as the missile):
+;;   - blast-peace-bomb : lobbed in an arc from the bot's muzzle to the enemy the turret is locked on to (it keeps tracking that
+;;                        enemy while it flies). Nothing locked: it lands *blast-bomb-free-dist* ahead on the ground.
+;;                        Explodes when it lands, or earlier if it hits a wall.
+;;   - blast-peace-wave : the big shockwave. Errol's own numbers: a ring that grows as 2048 * frames^0.85 (about 40 m after 0.6 s)
+;;                        and hurts everything it passes over close to the ground, so a jump clears it. It is drawn as a purple
+;;                        lightning ring with the beam part (2059), like the Arc Wielder. The impact itself also hurts everything
+;;                        within *blast-bomb-radius*. Every enemy is hurt at most once per bomb.
+;; Targets: the same things the red / yellow / blue shots hurt (blast-bomb-valid-target?). Fired by blast-bot-fire-peacemaker (blastbot_guns.gc).
+
+(define *blast-bomb-damage* 3.0)                 ;; doc: 3
+;; Peace Maker upgrade (gun-upgrade-dark-1, set by blast-bot-secrets-apply): 3 smaller bombs, no impact splash, only their shockwave
+(define *blast-bomb-split* #f)
+(define *blast-bomb-fixed-dest* (new 'global 'vector))   ;; where an untracked bomb lands (set by blast-bot-fire-peacemaker)
+(define *blast-bomb-has-fixed* #f)                        ;; #t: use *blast-bomb-fixed-dest*; #f: land *blast-bomb-free-dist* ahead
+(define *blast-bomb-charge* 1.0)                 ;; 1.0 uncharged .. 2.0 fully charged: multiplies the size and the damage (set by blast-bot-purple-charge-update)
+(define *blast-bomb-offset* (new 'global 'vector))   ;; scratch: landing offset handed to the bomb being spawned
+(define *blast-bomb-split-spread* 16384.0)       ;; 4 m between the three landing points
+(define *blast-bomb-split-scale* 0.5)            ;; shockwave radius (and bomb size) of each small bomb
+(define *blast-bomb-split-damage* 1.0)           ;; damage per small bomb (3 of them: 3 in total, like the single bomb)
+(define *blast-bomb-vehicle-factor* 1.3333)      ;; doc: 4 against vehicles
+(define *blast-bomb-speed* 102400.0)             ;; 25 m/s: sets the flight time (distance / speed)
+(define *blast-bomb-min-time* 0.5)               ;; seconds, shortest flight
+(define *blast-bomb-max-time* 2.0)               ;; seconds, longest flight
+(define *blast-bomb-arc-min* 8192.0)             ;; 2 m: height of the lob at its top, for a short throw
+(define *blast-bomb-arc-per-dist* 0.12)          ;; plus this much per unit of distance
+(define *blast-bomb-arc-max* 32768.0)            ;; 8 m: highest lob
+(define *blast-bomb-free-dist* 122880.0)         ;; 30 m: where it lands when nothing is locked
+(define *blast-bomb-radius* 8192.0)              ;; 2 m (+ the enemy's size): the impact blast
+(define *blast-bomb-wave-max* 163840.0)          ;; 40 m: the shockwave dies at this radius
+(define *blast-bomb-wave-k* 2048.0)              ;; Errol's growth: radius = k * frames^pow
+(define *blast-bomb-wave-pow* 0.85)
+(define *blast-bomb-wave-up* 12288.0)            ;; 3 m: enemies higher than this above the impact are not hit by the ring
+(define *blast-bomb-wave-down* 8192.0)           ;; 2 m: ... or lower than this below it
+(define *blast-bomb-ring-segs* 36)               ;; segments of the drawn ring
+(define *blast-bomb-ring-jitter* 1536.0)         ;; 0.375 m: how far the ring crackles
+(define *blast-bomb-glow-width* 3072.0)          ;; game units (4096 = 1 m)
+(define *blast-bomb-core-width* 768.0)
+(define *blast-bomb-ball-len* 8192.0)            ;; 2 m: the glowing ball of the bomb
+(define *blast-bomb-ball-width* 4096.0)
+(define *blast-bomb-streak-len* 24576.0)         ;; 6 m: the trail behind it
+(define *blast-bomb-streak-width* 1228.8)
+;; purple (0..255)
+(define *blast-bomb-glow-r* 150.0)
+(define *blast-bomb-glow-g* 20.0)
+(define *blast-bomb-glow-b* 255.0)
+(define *blast-bomb-glow-a* 110.0)
+(define *blast-bomb-core-r* 235.0)
+(define *blast-bomb-core-g* 200.0)
+(define *blast-bomb-core-b* 255.0)
+(define *blast-bomb-core-a* 255.0)
+
+(define *blast-bomb-from* (new 'global 'vector))
+(define *blast-bomb-dest* (new 'global 'vector))
+(define *blast-bomb-new* (new 'global 'vector))
+(define *blast-bomb-move* (new 'global 'vector))
+(define *blast-bomb-hitpos* (new 'global 'vector))
+(define *blast-bomb-btail* (new 'global 'vector))
+(define *blast-bomb-bvec* (new 'global 'vector))
+(define *blast-bomb-prev* (new 'global 'vector))
+(define *blast-bomb-cur* (new 'global 'vector))
+(define *blast-bomb-seg* (new 'global 'vector))
+(define *blast-bomb-box* (new 'global 'vector))
+(define *blast-bomb-hits* (new 'global 'array 'collide-shape 128))
+
+;; ---- the shockwave ----
+
+(deftype blast-peace-wave (process-drawable)
+  ((owner-handle   handle)
+   (spawn-time     time-frame)
+   (center         vector  :inline)   ;; where the bomb landed
+   (last-r         float)             ;; ring radius last frame
+   (wave-id        uint32)            ;; one attack id for the whole bomb
+   (hit-count      int32)
+   (hits           uint64  24)        ;; handles of the enemies already hurt by this bomb
+   (scale          float)             ;; 1.0 normal, smaller for the split bombs (shockwave max radius)
+   (damage         float)
+   )
+  (:state-methods
+    active
+    die
+    )
+  )
+
+;; Who the Peace Maker hurts: the same things the red, yellow and blue shots hurt. Those are stock projectiles that damage whatever they
+;; touch, so unlike the missiles / Arc Wielder (blast-ord-valid-target?: enemies only, minus *spydroid-ally-ignore-types*) this one
+;; has no mask or type filter: enemies, guards, crimson guards, wastelanders, crates, civilians... Only Jak, the bot, the allies and
+;; things that are already dead or switched off are left out.
+(define *blast-bomb-hit-civilians* #t)    ;; #f: civilians are spared
+
+(defun blast-bomb-valid-target? ((owner process) (p process-focusable))
+  (and p
+       (!= p *target*)
+       (!= p owner)
+       (not (type? p spydroid-ally))
+       (not (type? p sentinel-ally))
+       (not (focus-test? p inactive))
+       (not (blast-target-dead? p))
+       (or *blast-bomb-hit-civilians* (not (logtest? (process-mask civilian) (-> p mask))))
+       )
+  )
+
+(defun blast-bomb-hurt ((this blast-peace-wave) (p process-focusable))
+  ;; damages p, once per bomb
+  (let ((key (the-as uint64 (process->handle p)))
+        (seen #f)
+        )
+    (dotimes (i (-> this hit-count))
+      (if (= (-> this hits i) key)
+          (set! seen #t)
+          )
+      )
+    (when (and (not seen) (< (-> this hit-count) 24))
+      (set! (-> this hits (-> this hit-count)) key)
+      (+! (-> this hit-count) 1)
+      (send-event
+        p
+        'attack
+        #f
+        (static-attack-info ((id (-> this wave-id))
+                             (damage (-> this damage))
+                             (vehicle-damage-factor *blast-bomb-vehicle-factor*)
+                             (vehicle-impulse-factor 1.0)
+                             (mode 'explode)
+                             (attacker (blast-ord-attacker (handle->process (-> this owner-handle))))
+                             )
+                            )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bomb-blast ((this blast-peace-wave))
+  ;; the impact: every valid enemy within *blast-bomb-radius* (+ its own size)
+  (let ((box *blast-bomb-box*)
+        (hits *blast-bomb-hits*)
+        (owner (handle->process (-> this owner-handle)))
+        )
+    (vector-copy! box (-> this center))
+    (set! (-> box w) (* 2.0 *blast-bomb-radius* (-> this scale)))
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (and (blast-bomb-valid-target? owner p)
+                       (< (vector-vector-distance (-> this center) (get-trans p 3)) (+ (* *blast-bomb-radius* (-> this scale)) 4096.0))
+                       )
+              (blast-bomb-hurt this p)
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bomb-wave-scan ((this blast-peace-wave) (r0 float) (r1 float))
+  ;; hurts every valid enemy the ring passed over while it grew from r0 to r1 (flat distance from the centre, near the ground)
+  (let ((box *blast-bomb-box*)
+        (hits *blast-bomb-hits*)
+        (owner (handle->process (-> this owner-handle)))
+        )
+    (vector-copy! box (-> this center))
+    (set! (-> box w) (+ r1 16384.0))
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (blast-bomb-valid-target? owner p)
+              (let* ((pt (-> p root trans))
+                     (dx (- (-> pt x) (-> this center x)))
+                     (dz (- (-> pt z) (-> this center z)))
+                     (d (sqrtf (+ (* dx dx) (* dz dz))))
+                     (dy (- (-> pt y) (-> this center y)))
+                     (rad (fmax 2048.0 (fmin 16384.0 (if (-> p root root-prim)
+                                                         (-> p root root-prim prim-core world-sphere w)
+                                                         4096.0
+                                                         ))))
+                     )
+                (if (and (< (- r0 rad) d) (< d (+ r1 rad)) (< dy *blast-bomb-wave-up*) (< (- *blast-bomb-wave-down*) dy))
+                    (blast-bomb-hurt this p)
+                    )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bomb-draw-ring ((this blast-peace-wave) (r float))
+  ;; two crackling rings (low and a little higher) of short beam segments, glow + core
+  (let ((prev *blast-bomb-prev*)
+        (cur *blast-bomb-cur*)
+        (seg *blast-bomb-seg*)
+        (n *blast-bomb-ring-segs*)
+        )
+    (dotimes (row 2)
+      (let ((y (+ (-> this center y) 2048.0 (* 6144.0 (the float row)))))
+        (dotimes (i (+ n 1))
+          (let* ((a (* (/ 65536.0 (the float n)) (the float i)))
+                 (rr (+ r (* *blast-bomb-ring-jitter* (rand-vu-float-range -1.0 1.0))))
+                 )
+            (set-vector! cur
+                         (+ (-> this center x) (* rr (sin a)))
+                         (+ y (* 0.5 *blast-bomb-ring-jitter* (rand-vu-float-range -1.0 1.0)))
+                         (+ (-> this center z) (* rr (cos a)))
+                         1.0)
+            (when (> i 0)
+              (vector-! seg cur prev)
+              (let ((sl (vector-length seg)))
+                (blast-arc-style *blast-bomb-glow-r* *blast-bomb-glow-g* *blast-bomb-glow-b* *blast-bomb-glow-width* *blast-bomb-glow-a* sl)
+                (draw-beam (-> *part-id-table* 2059) prev seg #t)
+                (blast-arc-style *blast-bomb-core-r* *blast-bomb-core-g* *blast-bomb-core-b* *blast-bomb-core-width* *blast-bomb-core-a* sl)
+                (draw-beam (-> *part-id-table* 2059) prev seg #t)
+                )
+              )
+            (vector-copy! prev cur)
+            )
+          )
+        )
+      )
+    (blast-arc-style-restore)
+    )
+  (none)
+  )
+
+(defun blast-bomb-wave-update ((this blast-peace-wave))
+  ;; once per frame from the active state's :trans
+  (let* ((f (fmax 1.0 (the float (- (current-time) (-> this spawn-time)))))
+         (r (* *blast-bomb-wave-k* (pow f *blast-bomb-wave-pow*)))
+         )
+    (cond
+      ((< (* *blast-bomb-wave-max* (-> this scale)) r)
+       (go (method-of-object this die))
+       )
+      (else
+        (blast-bomb-wave-scan this (-> this last-r) r)
+        (set! (-> this last-r) r)
+        (blast-bomb-draw-ring this r)
+        )
+      )
+    )
+  (none)
+  )
+
+(defstate active (blast-peace-wave)
+  :virtual #t
+  :enter (behavior ()
+    (set-time! (-> self state-time))
+    )
+  :trans (behavior ()
+    (blast-bomb-wave-update self)
+    )
+  :code sleep-code
+  )
+
+(defstate die (blast-peace-wave)
+  :virtual #t
+  :code (behavior ()
+    (deactivate self)
+    )
+  )
+
+(defbehavior blast-peace-wave-init-by-other blast-peace-wave ((owner process-drawable) (pos vector) (scale float) (dmg float) (splash symbol))
+  (set! (-> self root) (new 'process 'trsqv))
+  (vector-copy! (-> self root trans) pos)
+  (vector-copy! (-> self center) pos)
+  (set! (-> self owner-handle) (process->handle owner))
+  (set-time! (-> self spawn-time))
+  (set! (-> self last-r) 0.0)
+  (set! (-> self wave-id) (new-attack-id))
+  (set! (-> self hit-count) 0)
+  (set! (-> self scale) scale)
+  (set! (-> self damage) dmg)
+  (if splash
+      (blast-bomb-blast self)
+      )
+  (go-virtual active)
+  )
+
+(defun blast-peace-wave-spawn ((owner process-drawable) (pos vector) (scale float) (dmg float) (splash symbol))
+  (process-spawn blast-peace-wave
+                 :init blast-peace-wave-init-by-other owner pos scale dmg splash
+                 :name "blast-peace-wave"
+                 :to *entity-pool*
+                 )
+  (none)
+  )
+
+;; ---- the bomb ----
+
+(deftype blast-peace-bomb (process-drawable)
+  ((owner-handle   handle)      ;; the bot that threw it
+   (target-handle  handle)      ;; the enemy it is thrown at
+   (spawn-time     time-frame)
+   (from-pos       vector  :inline)
+   (dest-pos       vector  :inline)   ;; where it lands (follows the target)
+   (last-pos       vector  :inline)
+   (flight-time    float)       ;; seconds
+   (arc-height     float)
+   (has-target     symbol)
+   (offset         vector  :inline)   ;; split bombs: landing point offset from the target
+   (scale          float)
+   (damage         float)
+   (splash         symbol)            ;; #t: the impact also hurts everything near it
+   )
+  (:state-methods
+    active
+    die
+    )
+  )
+
+(defun blast-bomb-explode ((this blast-peace-bomb) (pos vector))
+  ;; the dark shot's own burst (same group the missiles use) + the shockwave
+  (vector-copy! (-> *launch-matrix* trans) pos)
+  (if (logtest? (-> group-gun-dark-shot-hit flags) (sp-group-flag sp13))
+      (part-tracker-spawn part-tracker-subsampler :to *entity-pool* :group group-gun-dark-shot-hit)
+      (part-tracker-spawn part-tracker :to *entity-pool* :group group-gun-dark-shot-hit)
+      )
+  (blast-peace-wave-spawn (as-type (handle->process (-> this owner-handle)) process-drawable) pos (-> this scale) (-> this damage) (-> this splash))
+  (if *blast-ord-debug*
+      (format 0 "peace maker: bomb landed~%")
+      )
+  (go (method-of-object this die))
+  (none)
+  )
+
+(defun blast-bomb-draw ((this blast-peace-bomb))
+  ;; the glowing ball + a trail behind it
+  (let ((tail *blast-bomb-btail*)
+        (vec *blast-bomb-bvec*)
+        (seg *blast-bomb-seg*)
+        (pos (-> this root trans))
+        ;; drawn size = the charge (1..2), the same as the charge ball. The split bombs' scale also has the smaller shockwave in it.
+        (sc (if (-> this splash) (-> this scale) (/ (-> this scale) *blast-bomb-split-scale*)))
+        )
+    (vector-! seg pos (-> this last-pos))
+    (when (< 1.0 (vector-length seg))
+      (vector-normalize! seg 1.0)
+      ;; trail
+      (vector+float*! tail pos seg (- *blast-bomb-streak-len*))
+      (vector-float*! vec seg *blast-bomb-streak-len*)
+      (blast-arc-style *blast-bomb-glow-r* *blast-bomb-glow-g* *blast-bomb-glow-b* *blast-bomb-streak-width* *blast-bomb-glow-a* *blast-bomb-streak-len*)
+      (draw-beam (-> *part-id-table* 2059) tail vec #t)
+      ;; ball: a short, fat glow with a bright core
+      (vector+float*! tail pos seg (- (* sc *blast-bomb-ball-len*)))
+      (vector-float*! vec seg (* sc *blast-bomb-ball-len*))
+      (blast-arc-style *blast-bomb-glow-r* *blast-bomb-glow-g* *blast-bomb-glow-b* (* sc *blast-bomb-ball-width*) *blast-bomb-glow-a* (* sc *blast-bomb-ball-len*))
+      (draw-beam (-> *part-id-table* 2059) tail vec #t)
+      (blast-arc-style *blast-bomb-core-r* *blast-bomb-core-g* *blast-bomb-core-b* (* 0.4 (* sc *blast-bomb-ball-width*)) *blast-bomb-core-a* (* sc *blast-bomb-ball-len*))
+      (draw-beam (-> *part-id-table* 2059) tail vec #t)
+      )
+    (blast-arc-style-restore)
+    )
+  (none)
+  )
+
+;; the Peace Maker's charge ball at the muzzle: the bomb's own glowing ball (same beams and colours), x1..x2 with the charge
+;; (f = 0..1). The bombs you throw (split ones too) are drawn at exactly this size; only the split bombs' shockwave is smaller.
+(defun blast-bomb-charge-ball ((pos vector) (dir vector) (f float))
+  (let ((tail *blast-bomb-btail*)
+        (vec *blast-bomb-bvec*)
+        (sc (* (+ 1.0 f) (rand-vu-float-range 0.95 1.05)))
+        )
+    (vector+float*! tail pos dir (- (* sc *blast-bomb-ball-len*)))
+    (vector-float*! vec dir (* sc *blast-bomb-ball-len*))
+    (blast-arc-style *blast-bomb-glow-r* *blast-bomb-glow-g* *blast-bomb-glow-b* (* sc *blast-bomb-ball-width*) *blast-bomb-glow-a* (* sc *blast-bomb-ball-len*))
+    (draw-beam (-> *part-id-table* 2059) tail vec #t)
+    (blast-arc-style *blast-bomb-core-r* *blast-bomb-core-g* *blast-bomb-core-b* (* 0.4 (* sc *blast-bomb-ball-width*)) *blast-bomb-core-a* (* sc *blast-bomb-ball-len*))
+    (draw-beam (-> *part-id-table* 2059) tail vec #t)
+    (blast-arc-style-restore)
+    )
+  (none)
+  )
+
+(defun blast-bomb-update ((this blast-peace-bomb))
+  ;; once per frame from the active state's :trans: moves the bomb along its arc, follows the target, explodes
+  (let* ((age (/ (the float (- (current-time) (-> this spawn-time))) 300.0))
+         (u (fmin 1.0 (/ age (fmax 0.1 (-> this flight-time)))))
+         (pos (-> this root trans))
+         (np *blast-bomb-new*)
+         (mv *blast-bomb-move*)
+         )
+    (when (-> this has-target)
+      (let ((p (as-type (handle->process (-> this target-handle)) process-focusable)))
+        (when (and p (not (logtest? (-> p focus-status) (focus-status disable dead))))
+          (vector+! (-> this dest-pos) (-> p root trans) (-> this offset))
+          )
+        )
+      )
+    (vector-copy! (-> this last-pos) pos)
+    (set-vector! np
+                 (+ (-> this from-pos x) (* u (- (-> this dest-pos x) (-> this from-pos x))))
+                 (+ (-> this from-pos y) (* u (- (-> this dest-pos y) (-> this from-pos y))) (* 4.0 (-> this arc-height) u (- 1.0 u)))
+                 (+ (-> this from-pos z) (* u (- (-> this dest-pos z) (-> this from-pos z))))
+                 1.0)
+    (vector-! mv np pos)
+    (let ((hit (if (< 0.12 age)
+                   (blast-arc-probe this pos mv)
+                   -1.0
+                   )
+               )
+          )
+      (cond
+        ((>= hit 0.0)
+         ;; flew into a wall / the ground early
+         (vector+float*! *blast-bomb-hitpos* pos mv hit)
+         (blast-bomb-explode this *blast-bomb-hitpos*)
+         )
+        (else
+          (vector-copy! pos np)
+          (blast-bomb-draw this)
+          (if (>= u 1.0)
+              (blast-bomb-explode this pos)
+              )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defstate active (blast-peace-bomb)
+  :virtual #t
+  :enter (behavior ()
+    (set-time! (-> self state-time))
+    )
+  :trans (behavior ()
+    (blast-bomb-update self)
+    )
+  :code sleep-code
+  )
+
+(defstate die (blast-peace-bomb)
+  :virtual #t
+  :code (behavior ()
+    (deactivate self)
+    )
+  )
+
+(defbehavior blast-peace-bomb-init-by-other blast-peace-bomb ((owner process-drawable) (from vector) (dest vector) (target process-focusable) (tm float) (h float))
+  ;; spawn args are limited (process-spawn adds 2): the landing offset (xyz) and the bomb scale (w) come in through *blast-bomb-offset*
+  (set! (-> self root) (new 'process 'trsqv))
+  (vector-copy! (-> self root trans) from)
+  (vector-copy! (-> self from-pos) from)
+  (vector-copy! (-> self last-pos) from)
+  (vector-copy! (-> self dest-pos) dest)
+  (set! (-> self owner-handle) (process->handle owner))
+  (set! (-> self flight-time) tm)
+  (set! (-> self arc-height) h)
+  (vector-copy! (-> self offset) *blast-bomb-offset*)
+  (set! (-> self scale) (-> *blast-bomb-offset* w))
+  ;; y = 1 for the normal bomb (impact splash), 0 for a Peace Maker split bomb; a charged bomb (up to x2) is bigger and hits harder
+  (set! (-> self splash) (< 0.5 (-> *blast-bomb-offset* y)))
+  (set! (-> self damage) (* *blast-bomb-charge* (if (-> self splash) *blast-bomb-damage* *blast-bomb-split-damage*)))
+  (cond
+    (target
+      (set! (-> self has-target) #t)
+      (set! (-> self target-handle) (process->handle target))
+      )
+    (else
+      (set! (-> self has-target) #f)
+      (set! (-> self target-handle) (the-as handle #f))
+      )
+    )
+  (set-time! (-> self spawn-time))
+  (go-virtual active)
+  )
+
+(defun blast-bomb-launch-one ((owner process-drawable) (start vector) (dir vector) (target process-focusable) (ox float) (oz float) (scale float) (splash symbol))
+  ;; one bomb. ox / oz = where it lands relative to the target (or to the free landing point)
+  (let ((from *blast-bomb-from*)
+        (dest *blast-bomb-dest*)
+        (tmp *blast-bomb-move*)
+        )
+    (vector-copy! from start)
+    (cond
+      (target
+        (vector-copy! dest (-> target root trans))
+        )
+      (*blast-bomb-has-fixed*
+        ;; no homing: it lands where the turret was aiming when it fired and does not follow anything
+        (vector-copy! dest *blast-bomb-fixed-dest*)
+        )
+      (else
+        ;; nothing locked: land ahead of the barrel, on the ground under the bot
+        (vector-copy! tmp dir)
+        (set! (-> tmp y) 0.0)
+        (if (< (vector-length tmp) 0.01)
+            (set-vector! tmp 0.0 0.0 1.0 1.0)
+            (vector-normalize! tmp 1.0)
+            )
+        (vector+float*! dest start tmp *blast-bomb-free-dist*)
+        (set! (-> dest y) (if (< *blast-arc-ground-y* (- (-> start y) 409600.0))
+                              (- (-> start y) 8192.0)
+                              *blast-arc-ground-y*
+                              ))
+        )
+      )
+    (+! (-> dest x) ox)
+    (+! (-> dest z) oz)
+    (set-vector! *blast-bomb-offset* ox (if splash 1.0 0.0) oz scale)
+    (let* ((dx (- (-> dest x) (-> from x)))
+           (dz (- (-> dest z) (-> from z)))
+           (dist (sqrtf (+ (* dx dx) (* dz dz))))
+           (tm (fmax *blast-bomb-min-time* (fmin *blast-bomb-max-time* (/ dist *blast-bomb-speed*))))
+           (h (fmin *blast-bomb-arc-max* (+ *blast-bomb-arc-min* (* dist *blast-bomb-arc-per-dist*))))
+           )
+      (process-spawn blast-peace-bomb
+                     :init blast-peace-bomb-init-by-other owner from dest target tm h
+                     :name "blast-peace-bomb"
+                     :to *entity-pool*
+                     )
+      (if *blast-ord-debug*
+          (format 0 "peace maker: bomb thrown, ~A, flight ~f s~%" (if target "at a target" "free") tm)
+          )
+      )
+    )
+  (none)
+  )
+
+;; Peace Maker. Normal: one bomb with impact splash + shockwave. Upgrade (gun-upgrade-dark-1): three smaller bombs side by side,
+;; no impact splash, each with its own (smaller) shockwave.
+(defun blast-bomb-launch ((owner process-drawable) (start vector) (dir vector) (target process-focusable))
+  (cond
+    (*blast-bomb-split*
+      (let* ((fx (-> dir x))
+             (fz (-> dir z))
+             (fl (sqrtf (+ (* fx fx) (* fz fz))))
+             (px (if (< fl 0.01) 1.0 (/ (- fz) fl)))   ;; sideways, flat
+             (pz (if (< fl 0.01) 0.0 (/ fx fl)))
+             (sp *blast-bomb-split-spread*)
+             )
+        (dotimes (i 3)
+          (let ((k (the float (+ i -1))))
+            (blast-bomb-launch-one owner start dir target (* k sp px) (* k sp pz) (* *blast-bomb-split-scale* *blast-bomb-charge*) #f)
+            )
+          )
+        )
+      )
+    (else
+      (blast-bomb-launch-one owner start dir target 0.0 0.0 *blast-bomb-charge* #t)
+      )
+    )
+  (none)
+  )
+
+(defun blast-bomb-clear ()
+  ;; REPL: removes every bomb and shockwave
+  (let ((p (-> *entity-pool* child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (proc (the-as process (-> p 0)))
+            )
+        (if (or (type? proc blast-peace-bomb) (type? proc blast-peace-wave))
+            (deactivate proc)
+            )
+        (set! p next)
+        )
+      )
+    )
   (none)
   )

@@ -29,7 +29,7 @@
                   )
               )
              ((= gp-0 27)
-              (set! (-> self control unknown-word04) (the-as uint jcakb-gun-red-fire-2-ja))
+              (set! (-> self control unknown-word04) (the-as uint jakb-gun-red-fire-2-ja))
               )
              ((or (= gp-0 35) (= gp-0 27) (= gp-0 36) (= gp-0 37))
               (set! (-> self control unknown-word04) (the-as uint jakb-gun-dark-fire-ja))
