@@ -11,7 +11,7 @@
 ;; mod-common-functions.gc is back to the stock mod template.
 ;;
 ;; Needs, in game.gd, in this order:
-;;   spydroid-ally.o, sentinel-ally.o, roboguard-ally.o, blastbot-ordnance.o, blastbot-allyhud.o   (all before)
+;;   spydroid-ally.o, sentinel-ally.o, roboguard-ally.o, bombbot-ally.o, blastbot-ordnance.o, blastbot-allyhud.o   (all before)
 ;;   mod-common-functions.o
 ;;   blastbot-main-mod.o        <- this file
 ;;   blastbot_guns.o            (needs the blast-bot-player type from here)
@@ -312,11 +312,12 @@
 ;; ---- targets, stomps, camera shake ----
 
 (defun blast-bot-ally? ((p process-focusable))
-  ;; #t for the bot's own minions (Plasmite RPG spydroids, Gyro Burster sentinels, roboguards). The turret never locks
+  ;; #t for the bot's own minions (Plasmite RPG spydroids, Gyro Burster sentinels, roboguards, the Mass Inverter bombbot). The turret never locks
   ;; on to them, and stomps / the dash never hurt them.
   (or (type? p spydroid-ally)
       (type? p sentinel-ally)
       (type? p roboguard-ally)
+      (type? p bombbot-ally)
       ;; the L2 spy droid you steer (blastbot-spybot.gc loads after this file, so it is matched by type name)
       (= (-> p type symbol) 'spy-bot-player)
       )

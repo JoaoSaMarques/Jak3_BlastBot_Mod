@@ -502,6 +502,7 @@
   "roboguard.o" ;; added - stock roboguard code, needed by roboguard-ally (normally only in SEA / FACC / FACD). Before sentinel-ally.o: the sentinel's explosion uses group-kg-explosion
   "sentinel-ally.o" ;; added - sentinel turrets for the Gyro Burster (must be after spydroid-ally.o, before mod-common-functions.o)
   "roboguard-ally.o" ;; added - allied roboguard for the Needle Lazer (must be after roboguard.o, before blastbot-ordnance.o)
+  "bombbot-ally.o" ;; added - allied bombbot for the Mass Inverter (must be after roboguard-ally.o and bombbot.o, before blastbot-ordnance.o)
   "blastbot-ordnance.o" ;; added - Gyro Burster missiles + Arc Wielder rotating lasers (must be after sentinel-ally.o, before mod-common-functions.o)
   "blastbot-allyhud.o" ;; added - minion count boxes for the Blast Bot HUD (after the three ally files, before blastbot-main-mod.o)
   "mod-common-functions.o" ;; added

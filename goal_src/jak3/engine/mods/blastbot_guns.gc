@@ -640,7 +640,7 @@
 
 ;; ---- purple selection (same idea as red / yellow / blue) ----
 (define *blast-bot-purple-weapon* 1)      ;; 1 Peace Maker, 2 Mass Inverter, 3 Super Nova
-(define *blast-bot-purple-max* 1)         ;; highest purple level that is built (1 = Peace Maker, blastbot-ordnance.gc)
+(define *blast-bot-purple-max* 2)         ;; highest purple level that is built (1 = Peace Maker, blastbot-ordnance.gc; 2 = Mass Inverter, bombbot-ally.gc)
 
 (defun blast-bot-purple-fix ()
   ;; keep *blast-bot-purple-weapon* on a built level Jak actually owns
@@ -1122,6 +1122,13 @@
 
 (defun blast-bot-fire-purple-arsenal ((this blast-bot-player))
   (case *blast-bot-purple-weapon*
+    ((2)
+     ;; Mass Inverter: an allied bombbot (bombbot-ally.gc) drops out of the sky next to you. One use before overheating; nothing is
+     ;; spent while one is already alive.
+     (when (and (< (bombbot-ally-count) *bombbot-ally-max*) (blast-bot-heat-try-use 1.0))
+       (bombbot-ally-launch this)
+       )
+     )
     (else
       (if (blast-bot-heat-try-use *blast-bomb-uses*)   ;; Peace Maker: two bombs before overheating
           (blast-bot-fire-peacemaker this)
@@ -1377,7 +1384,8 @@
   (blast-bot-auto-toggle)
   (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2)
                    (!= *blast-bot-blue-weapon* 2) (!= *blast-bot-blue-weapon* 3)))
-        (purple (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 3) (blast-bot-gun-owned? 3)))
+        (purple (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 3) (blast-bot-gun-owned? 3)
+                     (= *blast-bot-purple-weapon* 1)))   ;; the charge-and-release path is the Peace Maker's only; Mass Inverter is one press per shot (blast-bot-fire-purple-arsenal)
         )
     (cond
       ((not (cpad-hold? 0 r1))

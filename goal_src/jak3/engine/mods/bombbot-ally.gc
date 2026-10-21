@@ -1,0 +1,1501 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: bombbot-ally.gc
+;; name in dgo: bombbot-ally
+;; dgos: GAME
+
+;; Allied bombbot for the Blast Bot's Mass Inverter (purple weapon 2). Doc: spawn an allied blast bot, one use before
+;; overheating, damage 2 (x5), health 100.
+;;
+;; SELF-CONTAINED: this does NOT use bombbot.gc (which drags in the whole city mission code). It is built the way the
+;; player's bot is (blastbot-main-mod.gc): a small process-focusable that wears the stock bombbot model (art group
+;; bombbot-ag, already in common_art_groups), with its own 4-leg IK walker, its own turret callbacks and its own movement.
+;; No nav mesh is needed, so it also works in the open desert. It reuses:
+;;   guard-projectile.o (spawn-guard-projectile, what the player bot's own cannon fires)
+;;   shield-sphere.o / debris-free explosion groups (group-kg-explosion, group-kg-huge-explosion), same as the player bot
+;;
+;; What it does:
+;;   1. launch  : bombbot-ally-launch drops it from the SKY (*bombbot-ally-drop-height* above a spot 15 m to one side of
+;;                the owner). It falls, lands (screen shake, explosion effect, a stomp that hurts enemies near the landing)
+;;                and walks on from there. It never comes out of the bot.
+;;   2. leash   : stays 10 - 20 m from the owner. Inside that ring it stands and shoots; outside it walks back (runs when
+;;                far behind). Lost (too far for a few seconds, stuck, or fell off the world) = dropped from the sky again.
+;;   3. shooting: never targets Jak, the bot or the other allies; picks the nearest enemy, the turret turns to it and it
+;;                fires bursts of *bombbot-ally-burst* (5) shots once the barrel points at the target. Kills count as Jak's.
+;;   4. health  : 100. Enemy fire hurts it (attacks credited to Jak or to the allies never do). Its death explosion only
+;;                hurts enemies.
+;;
+;; Needs, in game.gd (after roboguard-ally.o, before blastbot-ordnance.o):   "bombbot-ally.o"
+;; NO bombbot.o / bombbot-h.o / mission-squad-control-h.o needed.
+;; Add  bombbot-ally  to *spydroid-ally-ignore-types* (spydroid-ally.gc) so the spydroids, missiles and lasers never aim at it.
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Knobs (set from the REPL)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *bombbot-ally-max* 1)                    ;; never more than this many alive at once (doc: one allied blast bot)
+(define *bombbot-ally-hp* 100.0)                 ;; doc: 100
+(define *bombbot-ally-burst* 5)                  ;; shots per burst (doc: x5)
+(define *bombbot-ally-shot-gap* 0.2)             ;; seconds between two shots of a burst
+(define *bombbot-ally-burst-pause* 1.5)          ;; seconds between two bursts
+(define *bombbot-ally-shot-speed* 819200.0)      ;; 200 m/s, same as the player bot's cannon
+(define *bombbot-ally-range* 245760.0)           ;; 60 m: it only fires at enemies closer than this
+(define *bombbot-ally-scan-range* 409600.0)      ;; 100 m: how far it looks for enemies
+(define *bombbot-ally-aim-cos* 0.997)            ;; the barrel must point this close at the target before it fires (4.4 degrees)
+(define *bombbot-ally-life* 60.0)                ;; seconds before it blows itself up. 0 = until it is destroyed
+(define *bombbot-ally-credit-jak* #t)            ;; #t = its kills count as Jak's (mission kill counters)
+(define *bombbot-ally-boom-damage* 4.0)          ;; damage of its death explosion (enemies only)
+(define *bombbot-ally-invuln-time* 0.3)          ;; seconds after a hit during which it cannot be hurt again
+
+;; leash around the owner
+(define *bombbot-ally-leash-min* 24576.0)        ;; 6 m: closer than this to the owner and it walks away again
+(define *bombbot-ally-leash-max* 57344.0)        ;; 14 m: farther than this and it walks back
+(define *bombbot-ally-leash-home* 40960.0)       ;; 10 m: the distance it walks to when it has to move
+(define *bombbot-ally-walk-speed* 24576.0)       ;; 6 m/s
+(define *bombbot-ally-run-speed* 49152.0)        ;; 12 m/s, used when it is more than 1.5x the maximum leash away
+(define *bombbot-ally-turn-rate* 21845.0)        ;; body turn rate, units/s (21845 = 120 degrees/s)
+(define *bombbot-ally-redrop-dist* 409600.0)     ;; 100 m: lost for *bombbot-ally-redrop-time* seconds = dropped from the sky again
+(define *bombbot-ally-redrop-time* 4.0)
+(define *bombbot-ally-stuck-time* 3.0)           ;; seconds of trying to walk without getting anywhere = dropped again
+(define *bombbot-ally-patrol-time* 2.0)           ;; seconds the owner must have been moving before the ally stops patrolling and sticks close
+(define *bombbot-ally-patrol-radius* 163840.0)   ;; 40 m: while the owner stands still (or just started moving) it chases enemies this close to the owner
+(define *bombbot-ally-chase-dist* 102400.0)      ;; 25 m: it stops walking toward its target once it is this close
+(define *bombbot-ally-max-slope-ny* 0.5)         ;; surfaces whose normal.y is below this block it (0.7 = 45 deg, 0.5 = 60 deg): lower = it climbs steeper ramps
+(define *bombbot-ally-chase-height* 32768.0)     ;; 8 m: it only walks after targets about this close to its own height (no nav mesh, it can't find the ramp up to a bridge)
+(define *bombbot-ally-height-weight* 3.0)        ;; target choice: 1 m of height difference counts like this many metres of distance
+(define *bombbot-ally-wall-radius* 14336.0)      ;; wall sweep sphere (same as the player bot)
+(define *bombbot-ally-wall-height* 20480.0)
+(define *bombbot-ally-leg-delay* 0.1)            ;; seconds between the two legs of a diagonal pair
+
+;; the drop
+(define *bombbot-ally-spawn-dist* 61440.0)       ;; 15 m from the owner
+(define *bombbot-ally-spawn-angle* (degrees 40.0)) ;; off to the side of the way the owner faces
+(define *bombbot-ally-drop-height* 307200.0)     ;; 75 m above the owner's feet
+(define *bombbot-ally-fall-accel* 245760.0)      ;; 60 m/s^2
+(define *bombbot-ally-fall-max* 245760.0)        ;; 60 m/s terminal speed
+(define *bombbot-ally-fall-timeout* 6.0)         ;; seconds: no ground found by then = it is put on the owner's level
+(define *bombbot-ally-land-radius* 49152.0)      ;; 12 m: enemies this close to the landing are stomped
+(define *bombbot-ally-land-damage* 4.0)
+
+(define *bombbot-ally-laser-on* #t)              ;; laser pointer like the player bot's (blue = nothing, red = on an actor / the target)
+(define *bombbot-ally-laser-width* 1228.8)
+(define *bombbot-ally-laser-width-rand* 819.2)
+(define *bombbot-ally-debug* #t)                 ;; #t: print launches, landings, target changes (set to #f once it works)
+
+;; Own 1-slot dead-pool: a plain dead-pool never compacts, so the ally is never MOVED in memory (same reason the player bot
+;; spawns from *16k-dead-pool*). The bot holds the single 16k slot, so the ally needs its own.
+;; If this line fails to compile, copy the exact (define *16k-dead-pool* (new 'global 'dead-pool ...)) line from the kernel
+;; source and change the name + slot count to 1.
+(define *bombbot-ally-pool* (new 'global 'dead-pool 1 #x4000 "bombbot-ally-pool"))
+(define *bombbot-ally-last-addr* 0)              ;; DIAG: logs every time the process address changes
+
+;; Scratch memory lives on the global heap, never on the stack
+(define *bombbot-ally-find-box* (new 'global 'vector))
+(define *bombbot-ally-find-hits* (new 'global 'array 'collide-shape 128))
+(define *bombbot-ally-land-box* (new 'global 'vector))
+(define *bombbot-ally-land-hits* (new 'global 'array 'collide-shape 64))
+(define *bombbot-ally-pos* (new 'global 'vector))
+(define *bombbot-ally-vec* (new 'global 'vector))
+(define *bombbot-ally-muzzle* (new 'global 'vector))
+(define *bombbot-ally-dir* (new 'global 'vector))
+(define *bombbot-ally-end* (new 'global 'vector))
+
+;; elbow joint + hand distance of each leg (same numbers as the player bot and *bombbot-ik-limb-setup*)
+(define *bombbot-ally-elbows* (new 'static 'boxed-array :type int32 19 13 15 17))
+(define *bombbot-ally-hand-dist* (new 'static 'boxed-array :type float 14880.768 -14880.768 14880.768 -14880.768))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Type
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defskelgroup skel-bombbot-ally bombbot bombbot-lod0-jg bombbot-idle-ja
+              ((bombbot-lod0-mg (meters 999999)))
+              :bounds (static-spherem 0 0 0 12)
+              :shadow bombbot-shadow-mg
+              :texture-level 10
+              )
+
+(deftype bombbot-ally (process-focusable)
+  ((owner-handle   handle)       ;; the player's bot (or whatever launched it)
+   (target-handle  handle)       ;; the enemy it is shooting at
+   (spawn-time     time-frame)
+   (scan-time      time-frame)
+   (phase          int32)        ;; 0 = falling from the sky, 1 = on the ground
+   (fall-vy        float)        ;; vertical speed while falling (negative = down)
+   (fall-start     time-frame)
+   (fall-fallback  float)        ;; y it is put on if no ground is found
+   (ground-y       float)
+   (burst-left     int32)        ;; shots left in the current burst
+   (next-shoot     time-frame)
+   (lost-time      time-frame)   ;; since when it has been too far from the owner (0 = not lost)
+   (stuck-time     time-frame)   ;; since when it has been trying to walk without getting anywhere (0 = not stuck)
+   (owner-pos      vector :inline) ;; where the followed thing was last frame
+   (owner-move-start time-frame) ;; since when the followed thing has been moving (0 = standing still)
+   (goal           vector :inline) ;; where the leash wants it to walk
+   (goal-speed     float)        ;; how fast (0 = stand)
+   (speed          float)        ;; 0..1, how fast it really moves (drives the gait)
+   (health         float)
+   (max-health     float)
+   (hit-until      time-frame)
+   (last-hit-id    uint32)
+   ;; legs (simplified copy of the player bot's)
+   (joint-ik       joint-mod-ik 4)
+   (foot-pos       vector 4 :inline)
+   (foot-next      vector 4 :inline)
+   (foot-speed     vector 4 :inline)
+   (foot-moving    symbol 4)
+   (last-trans     vector :inline)
+   (linear-speed   vector :inline)
+   (last-yaw       float)
+   (yaw-velocity   float)
+   (gait-phase     float)
+   (tilt-x         float)
+   (tilt-z         float)
+   ;; turret
+   (target-pos     vector :inline)
+   (top-quat       quaternion :inline)
+   (angle-turret   float)
+   (angle-gun      float)
+   (gun-rotation-speed float)
+   (locked         symbol)
+   )
+  (:state-methods
+    active
+    die
+    )
+  )
+
+;; IMPORTANT: processes in the dead-pool heap get MOVED in memory when the heap compacts. Same fix as the player bot's relocate.
+(defmethod relocate ((this bombbot-ally) (offset int))
+  (dotimes (v1-0 4)
+    (if (nonzero? (-> this joint-ik v1-0))
+        (&+! (-> this joint-ik v1-0) offset)
+        )
+    )
+  (let ((result (call-parent-method this offset)))
+    ;; the joint callbacks keep a raw pointer to the bot in param1: re-point them
+    (when (nonzero? (-> this node-list))
+      (set! (-> this node-list data 4 param1) this)
+      (set! (-> this node-list data 5 param1) this)
+      (set! (-> this node-list data 6 param1) this)
+      )
+    result
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Legs (simplified from blast-bot-update-legs: no jump / hover / crouch)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun bombbot-ally-foot-phase ((i int))
+  (let ((d (/ *bombbot-ally-leg-delay* 0.8)))
+    (case i
+      ((0) 0.0)
+      ((2) d)
+      ((3) 0.5)
+      (else (+ 0.5 d))
+      )
+    )
+  )
+
+(defun bombbot-ally-foot-local ((out vector) (i int))
+  (set-vector! out
+               (if (< i 2) 11878.4 -11878.4)
+               0.0
+               (if (or (= i 0) (= i 3)) 10240.0 -10240.0)
+               1.0)
+  out
+  )
+
+(defun bombbot-ally-init-legs ((this bombbot-ally))
+  (dotimes (i 4)
+    (set! (-> this joint-ik i)
+          (new 'process 'joint-mod-ik this (-> *bombbot-ally-elbows* i) (-> *bombbot-ally-hand-dist* i)))
+    (set! (-> this joint-ik i elbow-pole-vector-axis) (the-as uint 2))
+    (set! (-> this joint-ik i elbow-rotation-axis) (the-as uint 0))
+    (logior! (-> this joint-ik i flags) (joint-mod-ik-flags elbow-rot-neg))
+    (enable-set! (-> this joint-ik i) #t)
+    )
+  (logior! (-> this joint-ik 1 flags) (joint-mod-ik-flags elbow-trans-neg))
+  (logior! (-> this joint-ik 3 flags) (joint-mod-ik-flags elbow-trans-neg))
+  (dotimes (i 4)
+    (let ((local (new 'stack-no-clear 'vector))
+          (world (new 'stack-no-clear 'vector))
+          )
+      (bombbot-ally-foot-local local i)
+      (vector-orient-by-quat! world local (-> this root quat))
+      (vector+! world world (-> this root trans))
+      (vector-copy! (-> this foot-pos i) world)
+      (vector-copy! (-> this foot-next i) world)
+      )
+    (vector-reset! (-> this foot-speed i))
+    (set! (-> this foot-moving i) #f)
+    )
+  (vector-copy! (-> this last-trans) (-> this root trans))
+  (vector-reset! (-> this linear-speed))
+  (set! (-> this last-yaw) (quaternion-y-angle (-> this root quat)))
+  (set! (-> this yaw-velocity) 0.0)
+  (set! (-> this gait-phase) 0.0)
+  (set! (-> this tilt-x) 0.0)
+  (set! (-> this tilt-z) 0.0)
+  (none)
+  )
+
+(defun bombbot-ally-replant-feet ((this bombbot-ally))
+  ;; stands all four feet under the body (after landing / re-dropping)
+  (dotimes (i 4)
+    (let ((local (new 'stack-no-clear 'vector))
+          (world (new 'stack-no-clear 'vector))
+          )
+      (bombbot-ally-foot-local local i)
+      (vector-orient-by-quat! world local (-> this root quat))
+      (vector+! world world (-> this root trans))
+      (set! (-> world y) (-> this root trans y))
+      (vector-copy! (-> this foot-pos i) world)
+      (vector-copy! (-> this foot-next i) world)
+      )
+    (vector-reset! (-> this foot-speed i))
+    (set! (-> this foot-moving i) #f)
+    )
+  (vector-copy! (-> this last-trans) (-> this root trans))
+  (vector-reset! (-> this linear-speed))
+  (none)
+  )
+
+(defun bombbot-ally-update-legs ((this bombbot-ally))
+  ;; Once per frame from :post BEFORE ja-post.
+  (let ((q (new 'stack-no-clear 'collide-query))
+        (fps (/ 1.0 (seconds-per-frame)))
+        (swing 0.4)
+        (tx 0.0)
+        (tz 0.0)
+        )
+    (vector-! (-> this linear-speed) (-> this root trans) (-> this last-trans))
+    (vector-copy! (-> this last-trans) (-> this root trans))
+    (set! (-> this linear-speed y) 0.0)
+    (let ((yaw (quaternion-y-angle (-> this root quat))))
+      (set! (-> this yaw-velocity) (deg- yaw (-> this last-yaw)))
+      (set! (-> this last-yaw) yaw)
+      )
+    ;; the gait clock always runs (like the player bot): standing still, the legs keep stepping in place
+    (+! (-> this gait-phase) (* (seconds-per-frame) 1.25))
+    (when (>= (-> this gait-phase) 1.0)
+      (set! (-> this gait-phase) (- (-> this gait-phase) 1.0))
+      )
+    ;; collect nearby ground triangles once, then probe per foot
+    (let ((ext (new 'stack-no-clear 'vector)))
+      (set-vector! ext 40960.0 24576.0 40960.0 1.0)
+      (vector-! (-> q bbox min) (-> this root trans) ext)
+      (vector+! (-> q bbox max) (-> this root trans) ext)
+      )
+    (set! (-> q collide-with) (collide-spec backgnd pusher))
+    (set! (-> q ignore-process0) #f)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat)
+          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (fill-using-bounding-box *collide-cache* q)
+    (dotimes (i 4)
+      (let* ((phase (+ (-> this gait-phase) (bombbot-ally-foot-phase i)))
+             (f0 (- phase (the float (the int phase))))
+             (f f0)
+             (cur (new 'stack-no-clear 'vector))
+             (local (new 'stack-no-clear 'vector))
+             (rel (new 'stack-no-clear 'vector))
+             (rest (new 'stack-no-clear 'vector))
+             (diff (new 'stack-no-clear 'vector))
+             )
+        (bombbot-ally-foot-local local i)
+        (vector-orient-by-quat! rel local (-> this root quat))
+        (vector+! rest rel (-> this root trans))
+        (cond
+          ((zero? (-> this phase))
+           ;; falling: the legs hang below the body
+           (set! (-> this foot-moving i) #f)
+           (vector-copy! cur rest)
+           (set! (-> cur y) (- (-> this root trans y) 6144.0))
+           (vector-copy! (-> this foot-pos i) cur)
+           )
+          ((>= swing f)
+           ;; foot is in the air: aim ahead of the body, snap that spot to the ground
+           (let ((spin (new 'stack-no-clear 'vector))
+                 (want (new 'stack-no-clear 'vector))
+                 (tgt (new 'stack-no-clear 'vector))
+                 (frac (/ f swing))
+                 )
+             (set-vector! spin 0.0 (sin (* (-> this yaw-velocity) fps)) 0.0 1.0)
+             (vector-cross! want spin rel)
+             (vector+*! want want (-> this linear-speed) fps)
+             (vector-! diff want (-> this foot-speed i))
+             (vector+*! (-> this foot-speed i) (-> this foot-speed i) diff (* 4.0 (seconds-per-frame)))
+             (when (< 36864.0 (vector-length (-> this foot-speed i)))
+               (vector-normalize! (-> this foot-speed i) 36864.0)
+               )
+             (vector-float*! diff (-> this foot-speed i) (+ 0.2 (- swing f)))
+             (when (< 8192.0 (vector-length diff))
+               (vector-normalize! diff 8192.0)
+               )
+             (vector+! tgt rest diff)
+             (vector-! diff tgt (-> this root trans))
+             (set! (-> diff y) 0.0)
+             (let ((len (vector-length diff)))
+               (when (< len 9000.0)
+                 (if (< 1.0 len)
+                     (vector-float*! diff diff (/ 9000.0 len))
+                     (vector-copy! diff rel)
+                     )
+                 (set! (-> tgt x) (+ (-> this root trans x) (-> diff x)))
+                 (set! (-> tgt z) (+ (-> this root trans z) (-> diff z)))
+                 )
+               )
+             (vector+*! (-> q start-pos) tgt *y-vector* 16384.0)
+             (vector-float*! (-> q move-dist) *y-vector* -40960.0)
+             (set! (-> q radius) 40.96)
+             (set! (-> q collide-with) (collide-spec backgnd pusher))
+             (set! (-> q action-mask) (collide-action solid))
+             (let ((hit (if (< 0 (-> *collide-cache* num-tris))
+                            (probe-using-line-sphere *collide-cache* q)
+                            -1.0
+                            )
+                        )
+                   )
+               (if (>= hit 0.0)
+                   (vector+*! tgt (-> q start-pos) (-> q move-dist) hit)
+                   (set! (-> tgt y) (-> this foot-pos i y))
+                   )
+               )
+             (set! (-> tgt y) (fmax (+ -24576.0 (-> this root trans y))
+                                    (fmin (+ 12288.0 (-> this root trans y)) (-> tgt y))))
+             (set! (-> tgt w) 1.0)
+             (vector-copy! (-> this foot-next i) tgt)
+             (set! (-> this foot-moving i) #t)
+             (let ((speed-frac (fmin 1.0 (/ (vector-length (-> this foot-speed i)) 49152.0)))
+                   (lift (sin (* 32768.0 frac)))
+                   )
+               (vector-! diff (-> this foot-next i) (-> this foot-pos i))
+               (vector+*! cur (-> this foot-pos i) diff frac)
+               (+! (-> cur y) (* lift (+ 1024.0 (* 3072.0 speed-frac))))
+               (set! tx (- tx (* lift (/ (-> local x) 15683.3))))
+               (set! tz (- tz (* lift (/ (-> local z) 15683.3))))
+               )
+             )
+           )
+          (else
+            ;; foot is planted
+            (when (-> this foot-moving i)
+              (vector-copy! (-> this foot-pos i) (-> this foot-next i))
+              (set! (-> this foot-moving i) #f)
+              )
+            (vector-! diff (-> this foot-pos i) rest)
+            (set! (-> diff y) 0.0)
+            (when (< 14336.0 (vector-length diff))
+              (vector-normalize! diff 14336.0)
+              (set! (-> this foot-pos i x) (+ (-> rest x) (-> diff x)))
+              (set! (-> this foot-pos i z) (+ (-> rest z) (-> diff z)))
+              )
+            (vector-! diff (-> this foot-pos i) (-> this root trans))
+            (set! (-> diff y) 0.0)
+            (let ((len (vector-length diff)))
+              (when (< len 9000.0)
+                (if (< 1.0 len)
+                    (vector-float*! diff diff (/ 9000.0 len))
+                    (vector-copy! diff rel)
+                    )
+                (set! (-> this foot-pos i x) (+ (-> this root trans x) (-> diff x)))
+                (set! (-> this foot-pos i z) (+ (-> this root trans z) (-> diff z)))
+                )
+              )
+            (set! (-> this foot-pos i y) (fmax (+ -24576.0 (-> this root trans y))
+                                               (fmin (+ 12288.0 (-> this root trans y)) (-> this foot-pos i y))))
+            (vector-copy! cur (-> this foot-pos i))
+            )
+          )
+        (set! (-> cur w) 1.0)
+        (enable-set! (-> this joint-ik i) #t)
+        (set-ik-target! (-> this joint-ik i) cur)
+        )
+      )
+    ;; head tilt (about 4 degrees per lifted leg)
+    (let ((k (fmin 1.0 (* 12.0 (seconds-per-frame))))
+          (moving (fmin 1.0 (-> this speed)))
+          )
+      (+! (-> this tilt-x) (* k (- (* 0.07 tx moving) (-> this tilt-x))))
+      (+! (-> this tilt-z) (* k (- (* 0.07 tz moving) (-> this tilt-z))))
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Turret (joint 4 = head, 5 = gun swivel, 6 = gun; simplified from the player bot)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun bombbot-ally-tilt-quat! ((out quaternion) (tx float) (tz float))
+  (let ((mag (sqrtf (+ (* tx tx) (* tz tz)))))
+    (if (< mag 0.0001)
+        (quaternion-copy! out *unity-quaternion*)
+        (let ((axis (new 'stack-no-clear 'vector)))
+          (set-vector! axis tz 0.0 (- tx) 1.0)
+          (vector-normalize! axis 1.0)
+          (quaternion-vector-angle! out axis (* 10430.378 mag))
+          )
+        )
+    )
+  out
+  )
+
+(defun bombbot-ally-head-callback ((arg0 cspace) (arg1 transformq))
+  (let ((this (the-as bombbot-ally (-> arg0 param1)))
+        (tilt-q (new 'stack-no-clear 'quaternion))
+        )
+    (bombbot-ally-tilt-quat! tilt-q (-> this tilt-x) (-> this tilt-z))
+    (quaternion-copy! (-> this top-quat) tilt-q)
+    (quaternion-copy! (-> arg1 quat) (-> this top-quat))
+    )
+  (cspace<-parented-transformq-joint! arg0 arg1)
+  0
+  (none)
+  )
+
+(defun bombbot-ally-gun-swivel-callback ((arg0 cspace) (arg1 transformq))
+  (cspace<-parented-transformq-joint! arg0 arg1)
+  (let ((this (the-as bombbot-ally (-> arg0 param1)))
+        (pos (new 'stack-no-clear 'vector))
+        (dir (new 'stack-no-clear 'vector))
+        (ang (new 'stack-no-clear 'vector))
+        (rot (new 'stack-no-clear 'quaternion))
+        )
+    (matrix->trans (-> arg0 bone transform) pos)
+    (vector-! dir (-> this target-pos) pos)
+    (rot-zxy-from-vector! ang dir)
+    (set! (-> this angle-turret)
+          (deg-seek (-> this angle-turret) (-> ang y) (* 36408.89 (seconds-per-frame))))
+    (quaternion-vector-angle! rot *up-vector* (-> this angle-turret))
+    (quaternion->matrix (-> arg0 bone transform) rot)
+    (vector-copy! (-> arg0 bone transform trans) pos)
+    )
+  0
+  (none)
+  )
+
+(defun bombbot-ally-gun-callback ((arg0 cspace) (arg1 transformq))
+  (cspace<-parented-transformq-joint! arg0 arg1)
+  (let ((this (the-as bombbot-ally (-> arg0 param1)))
+        (pos (new 'stack-no-clear 'vector))
+        (dir (new 'stack-no-clear 'vector))
+        (cur (new 'stack-no-clear 'vector))
+        (want (new 'stack-no-clear 'vector))
+        )
+    (matrix->trans (-> arg0 bone transform) pos)
+    (vector-! dir (-> this target-pos) pos)
+    (rot-zxy-from-vector! cur (-> arg0 bone transform fvec))
+    (rot-zxy-from-vector! want dir)
+    (let ((pitch (if (-> this locked)
+                     (fmax -4551.1113 (fmin 4551.1113 (deg- (-> want x) (-> cur x))))
+                     0.0
+                     )
+                 )
+          )
+      (set! (-> this angle-gun)
+            (deg-seek (-> this angle-gun) pitch (* (-> this gun-rotation-speed) (seconds-per-frame))))
+      )
+    (quaternion-vector-angle! (-> arg1 quat) *x-vector* (-> this angle-gun))
+    )
+  (cspace<-parented-transformq-joint! arg0 arg1)
+  0
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Targeting
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun bombbot-ally-target-score ((this bombbot-ally) (p process-focusable))
+  ;; lower = better: distance, plus a penalty for being on another level (bridge above, pit below)
+  (+ (vector-vector-xz-distance (-> this root trans) (-> p root trans))
+     (* *bombbot-ally-height-weight* (fabs (- (-> p root trans y) (-> this root trans y))))
+     )
+  )
+
+(defun bombbot-ally-valid-target? ((this bombbot-ally) (p process-focusable))
+  (and p
+       (!= this p)
+       (!= p *target*)
+       (not (type? p bombbot-ally))
+       (not (type? p roboguard-ally))
+       (not (type? p spydroid-ally))
+       (not (type? p sentinel-ally))
+       (!= (-> p type symbol) 'blast-bot-player)
+       (!= (-> p type symbol) 'spy-bot-player)
+       (!= (handle->process (-> this owner-handle)) p)
+       (not (focus-test? p inactive))
+       (not (blast-target-dead? p))
+       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
+       (not (logtest? (process-mask crate civilian) (-> p mask)))
+       (not (spydroid-ally-ignored-type? p))
+       (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
+       )
+  )
+
+(defun bombbot-ally-find-target ((this bombbot-ally))
+  (let ((best (the-as process-focusable #f))
+        (best-dist 0.0)
+        (box *bombbot-ally-find-box*)
+        (hits *bombbot-ally-find-hits*)
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) *bombbot-ally-scan-range*)
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (bombbot-ally-valid-target? this p)
+              (let ((d (bombbot-ally-target-score this p)))
+                (when (or (not best) (< d best-dist))
+                  (set! best p)
+                  (set! best-dist d)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    best
+    )
+  )
+
+(defun bombbot-ally-retarget ((this bombbot-ally))
+  (let ((cur (as-type (handle->process (-> this target-handle)) process-focusable)))
+    (if (not (bombbot-ally-valid-target? this cur))
+        (set! cur #f)
+        )
+    (when (time-elapsed? (-> this scan-time) (seconds 0.4))
+      (set-time! (-> this scan-time))
+      (let ((best (bombbot-ally-find-target this)))
+        (cond
+          ((not cur)
+           (set! cur best)
+           )
+          ((and best
+                (!= best cur)
+                (< (* 1.5 (bombbot-ally-target-score this best))
+                   (bombbot-ally-target-score this cur)
+                   )
+                )
+           (set! cur best)
+           )
+          )
+        )
+      )
+    (when (and *bombbot-ally-debug* cur (!= (process->handle cur) (-> this target-handle)))
+      (format 0 "bombbot ally: target ~A~%" (-> cur type))
+      )
+    (set! (-> this target-handle) (if cur
+                                      (process->handle cur)
+                                      (the-as handle #f)
+                                      )
+          )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Ground, walls, the drop
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun bombbot-ally-ground-y ((this bombbot-ally))
+  ;; height of the ground under the bot (probing down from 2 m above it, up to 100 m), or -1e9 if none is found
+  (let ((q (new 'stack-no-clear 'collide-query)))
+    (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 8192.0)
+    (vector-float*! (-> q move-dist) *y-vector* -409600.0)
+    (set! (-> q radius) 40.96)
+    (set! (-> q collide-with) (collide-spec backgnd pusher))
+    (set! (-> q ignore-process0) this)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat)
+          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q action-mask) (collide-action solid))
+    (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+      (if (>= hit 0.0)
+          (+ (-> q start-pos y) (* hit (-> q move-dist y)))
+          -1000000000.0
+          )
+      )
+    )
+  )
+
+(defun bombbot-ally-move-xz ((this bombbot-ally) (dx float) (dz float))
+  ;; Moves the bot horizontally by (dx, dz); steep surfaces stop it and it slides along them (same sweep as the player bot).
+  ;; Returns the fraction of the intended distance that was actually moved.
+  (let* ((q (new 'stack-no-clear 'collide-query))
+         (move (new 'stack-no-clear 'vector))
+         (n (new 'stack-no-clear 'vector))
+         (ext (new 'stack-no-clear 'vector))
+         (start (new 'stack-no-clear 'vector))
+         (before-x (-> this root trans x))
+         (before-z (-> this root trans z))
+         (intended (sqrtf (+ (* dx dx) (* dz dz))))
+         )
+    (set-vector! move dx 0.0 dz 1.0)
+    (when (< 1.0 intended)
+      (set-vector! ext 40960.0 32768.0 40960.0 1.0)
+      (set-vector! start (-> this root trans x) (+ (-> this root trans y) *bombbot-ally-wall-height*) (-> this root trans z) 1.0)
+      (vector-! (-> q bbox min) start ext)
+      (vector+! (-> q bbox max) start ext)
+      (set! (-> q collide-with) (collide-spec backgnd pusher))
+      (set! (-> q ignore-process0) this)
+      (set! (-> q ignore-process1) #f)
+      (set! (-> q ignore-pat)
+            (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+      (fill-using-bounding-box *collide-cache* q)
+      (dotimes (iter 2)
+        (when (< 1.0 (vector-length move))
+          (set-vector! start (-> this root trans x) (+ (-> this root trans y) *bombbot-ally-wall-height*) (-> this root trans z) 1.0)
+          (vector-copy! (-> q start-pos) start)
+          (vector-copy! (-> q move-dist) move)
+          (set! (-> q radius) *bombbot-ally-wall-radius*)
+          (set! (-> q collide-with) (collide-spec backgnd pusher))
+          (set! (-> q action-mask) (collide-action solid))
+          (let ((hit (if (< 0 (-> *collide-cache* num-tris))
+                         (probe-using-line-sphere *collide-cache* q)
+                         -1.0
+                         )
+                     )
+                )
+            (cond
+              ((and (>= hit 0.0) (< (fabs (-> q best-other-tri normal y)) *bombbot-ally-max-slope-ny*))
+               (let ((frac0 (fmax 0.0 (- hit 0.03))))
+                 (+! (-> this root trans x) (* (-> move x) frac0))
+                 (+! (-> this root trans z) (* (-> move z) frac0))
+                 )
+               (vector-copy! n (-> q best-other-tri normal))
+               (set! (-> n y) 0.0)
+               (if (< 0.01 (vector-length n))
+                   (vector-normalize! n 1.0)
+                   (set-vector! n 0.0 0.0 0.0 1.0)
+                   )
+               (vector-float*! move move (- 1.0 hit))
+               (let ((d (vector-dot move n)))
+                 (when (< d 0.0)
+                   (vector+*! move move n (- d))
+                   )
+                 )
+               (set! (-> move y) 0.0)
+               )
+              (else
+                (+! (-> this root trans x) (-> move x))
+                (+! (-> this root trans z) (-> move z))
+                (vector-reset! move)
+                )
+              )
+            )
+          )
+        )
+      )
+    (let ((ddx (- (-> this root trans x) before-x))
+          (ddz (- (-> this root trans z) before-z))
+          )
+      (if (< 1.0 intended)
+          (/ (sqrtf (+ (* ddx ddx) (* ddz ddz))) intended)
+          1.0
+          )
+      )
+    )
+  )
+
+(defun bombbot-ally-spot ((owner process-drawable) (out vector))
+  ;; a spot *bombbot-ally-spawn-dist* from the owner, off to the side of the way it faces, *bombbot-ally-drop-height* up
+  (let ((face (quaternion-y-angle (-> owner root quat))))
+    (set-vector! out 0.0 0.0 *bombbot-ally-spawn-dist* 1.0)
+    (vector-rotate-around-y! out out (+ face *bombbot-ally-spawn-angle*))
+    (vector+! out out (-> owner root trans))
+    (+! (-> out y) *bombbot-ally-drop-height*)
+    )
+  out
+  )
+
+(defun bombbot-ally-stomp ((this bombbot-ally))
+  ;; the landing: every enemy within *bombbot-ally-land-radius* takes one hit (one attack id for the whole stomp)
+  (let ((box *bombbot-ally-land-box*)
+        (hits *bombbot-ally-land-hits*)
+        (atk-id (new-attack-id))
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) *bombbot-ally-land-radius*)
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (and (bombbot-ally-valid-target? this p)
+                       (< (vector-vector-xz-distance (-> this root trans) (-> p root trans))
+                          (+ *bombbot-ally-land-radius* (-> p root nav-radius)))
+                       )
+              (send-event p 'attack #f
+                          (static-attack-info ((id atk-id)
+                                               (damage *bombbot-ally-land-damage*)
+                                               (vehicle-damage-factor 1.0)
+                                               (vehicle-impulse-factor 1.0)
+                                               (mode 'shock)
+                                               (attacker (if (and *target* *bombbot-ally-credit-jak*)
+                                                             (process->handle *target*)
+                                                             (process->handle this)
+                                                             ))
+                                               )
+                                              )
+                          )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-land ((this bombbot-ally) (gy float))
+  ;; touch down at height gy: plant the feet, shake the screen, explode a little, stomp
+  (set! (-> this root trans y) gy)
+  (set! (-> this ground-y) gy)
+  (set! (-> this fall-vy) 0.0)
+  (set! (-> this phase) 1)
+  (bombbot-ally-replant-feet this)
+  (vector-copy! (-> this goal) (-> this root trans))
+  (set! (-> this goal-speed) 0.0)
+  (set! (-> this lost-time) 0)
+  (set! (-> this stuck-time) 0)
+  (activate! *camera-smush-control* 1024.0 37 120 1.0 0.99 (-> this clock))
+  (sound-play "bb-impact" :position (-> this root trans))
+  ;; same big visual-only explosion as the player bot's death (the stomp below does the damage)
+  (when (and group-kg-huge-explosion (nonzero? group-kg-huge-explosion))
+    (let ((gp (new 'stack-no-clear 'explosion-init-params)))
+      (vector-copy! (-> gp spawn-point) (-> this root trans))
+      (+! (-> gp spawn-point y) 12288.0)
+      (quaternion-identity! (-> gp spawn-quat))
+      (set! (-> gp radius) 61440.0)
+      (set! (-> gp scale) 1.0)
+      (set! (-> gp group) group-kg-huge-explosion)
+      (set! (-> gp collide-with) (collide-spec))
+      (set! (-> gp damage) 0.0)
+      (set! (-> gp damage-scale) 1.0)
+      (set! (-> gp vehicle-damage-factor) 1.0)
+      (set! (-> gp vehicle-impulse-factor) 1.0)
+      (set! (-> gp ignore-proc) (process->handle #f))
+      (explosion-spawn gp this)
+      )
+    )
+  (bombbot-ally-stomp this)
+  (when *bombbot-ally-debug*
+    (format 0 "bombbot ally: landed at ~M ~M ~M~%" (-> this root trans x) (-> this root trans y) (-> this root trans z))
+    )
+  (none)
+  )
+
+(defun bombbot-ally-fall ((this bombbot-ally))
+  ;; once per frame while phase 0: free fall
+  (let ((dt (seconds-per-frame)))
+    (+! (-> this fall-vy) (* -1.0 *bombbot-ally-fall-accel* dt))
+    (if (< (-> this fall-vy) (- *bombbot-ally-fall-max*))
+        (set! (-> this fall-vy) (- *bombbot-ally-fall-max*))
+        )
+    (+! (-> this root trans y) (* (-> this fall-vy) dt))
+    )
+  (let ((gy (bombbot-ally-ground-y this)))
+    (cond
+      ((and (< -900000000.0 gy) (<= (-> this root trans y) gy))
+       (bombbot-ally-land this gy)
+       )
+      ((time-elapsed? (-> this fall-start) (the int (* 300.0 *bombbot-ally-fall-timeout*)))
+       ;; nothing to land on (hole, no collision): put it on the owner's level
+       (bombbot-ally-land this (-> this fall-fallback))
+       )
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-start-drop ((this bombbot-ally) (owner process-drawable))
+  ;; (re)starts the fall from the sky next to the owner
+  (bombbot-ally-spot owner *bombbot-ally-pos*)
+  (vector-copy! (-> this root trans) *bombbot-ally-pos*)
+  (set! (-> this phase) 0)
+  (set! (-> this fall-vy) 0.0)
+  (set-time! (-> this fall-start))
+  (set! (-> this fall-fallback) (-> owner root trans y))
+  (set! (-> this burst-left) 0)
+  (set! (-> this lost-time) 0)
+  (set! (-> this stuck-time) 0)
+  (set! (-> this speed) 0.0)
+  (bombbot-ally-replant-feet this)
+  (when *bombbot-ally-debug*
+    (format 0 "bombbot ally: dropping from the sky at ~M ~M ~M~%" (-> this root trans x) (-> this root trans y) (-> this root trans z))
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Leash and walking
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun bombbot-ally-track-owner ((this bombbot-ally) (owner process-drawable))
+  ;; remembers since when the owner has been moving (about 2 m/s or more); 0 = standing still
+  (let ((moved (vector-vector-xz-distance (-> this owner-pos) (-> owner root trans))))
+    (vector-copy! (-> this owner-pos) (-> owner root trans))
+    (cond
+      ((< (* 8192.0 (seconds-per-frame)) moved)
+       (if (zero? (-> this owner-move-start))
+           (set-time! (-> this owner-move-start))
+           )
+       )
+      (else
+        (set! (-> this owner-move-start) 0)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-leash ((this bombbot-ally) (owner process-drawable))
+  ;; Sets goal / goal-speed. 10 - 20 m from the owner it stands. Otherwise it walks to a spot *bombbot-ally-leash-home*
+  ;; from the owner on its own side, running if it is far behind. Lost for a while = dropped from the sky again.
+  (bombbot-ally-track-owner this owner)
+  (let* ((d (vector-vector-xz-distance (-> this root trans) (-> owner root trans)))
+         (goal (-> this goal))
+         (dir *bombbot-ally-vec*)
+         ;; patrol: the owner stands still, or has only been moving for a moment
+         (patrol (not (and (nonzero? (-> this owner-move-start))
+                           (time-elapsed? (-> this owner-move-start) (the int (* 300.0 *bombbot-ally-patrol-time*)))
+                           )))
+         (tgt (as-type (handle->process (-> this target-handle)) process-focusable))
+         )
+    (cond
+      ((and patrol
+            tgt
+            (< (vector-vector-xz-distance (-> tgt root trans) (-> owner root trans)) *bombbot-ally-patrol-radius*)
+            (< (fabs (- (-> tgt root trans y) (-> this root trans y))) *bombbot-ally-chase-height*)
+            )
+       ;; chase: walk toward the target until it is in comfortable range, then stand and shoot
+       (let ((td (vector-vector-xz-distance (-> this root trans) (-> tgt root trans))))
+         (cond
+           ((> td *bombbot-ally-chase-dist*)
+            (set! (-> goal x) (-> tgt root trans x))
+            (set! (-> goal y) (-> this root trans y))
+            (set! (-> goal z) (-> tgt root trans z))
+            (set! (-> this goal-speed) (if (> td (* 1.5 *bombbot-ally-chase-dist*))
+                                           *bombbot-ally-run-speed*
+                                           *bombbot-ally-walk-speed*
+                                           )
+                  )
+            )
+           (else
+             (vector-copy! goal (-> this root trans))
+             (set! (-> this goal-speed) 0.0)
+             )
+           )
+         )
+       )
+      ((and (> d *bombbot-ally-leash-min*) (< d *bombbot-ally-leash-max*))
+       (vector-copy! goal (-> this root trans))
+       (set! (-> this goal-speed) 0.0)
+       )
+      (else
+        (vector-! dir (-> this root trans) (-> owner root trans))
+        (set! (-> dir y) 0.0)
+        (if (< (vector-length dir) 1024.0)
+            (begin
+              (set-vector! dir 0.0 0.0 -1.0 1.0)
+              (vector-rotate-around-y! dir dir (quaternion-y-angle (-> owner root quat)))
+              )
+            (vector-normalize! dir 1.0)
+            )
+        (vector+*! goal (-> owner root trans) dir *bombbot-ally-leash-home*)
+        (set! (-> goal y) (-> this root trans y))
+        (set! (-> this goal-speed) (if (> d (* 1.5 *bombbot-ally-leash-max*))
+                                       *bombbot-ally-run-speed*
+                                       *bombbot-ally-walk-speed*
+                                       )
+              )
+        )
+      )
+    (cond
+      ((or (> d *bombbot-ally-redrop-dist*)
+           (< (-> this root trans y) (- (-> owner root trans y) 245760.0))
+           )
+       (cond
+         ((zero? (-> this lost-time))
+          (set-time! (-> this lost-time))
+          )
+         ((time-elapsed? (-> this lost-time) (the int (* 300.0 *bombbot-ally-redrop-time*)))
+          (bombbot-ally-start-drop this owner)
+          )
+         )
+       )
+      (else
+        (set! (-> this lost-time) 0)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-walk ((this bombbot-ally) (owner process-drawable))
+  ;; walks toward the goal, follows the ground, turns the body
+  (let* ((dt (seconds-per-frame))
+         (goal (-> this goal))
+         (dx (- (-> goal x) (-> this root trans x)))
+         (dz (- (-> goal z) (-> this root trans z)))
+         (d (sqrtf (+ (* dx dx) (* dz dz))))
+         (spd (-> this goal-speed))
+         (moved 0.0)
+         )
+    (when (and (< 0.0 spd) (< 2048.0 d))
+      (let ((want (atan dx dz))
+            (cur (quaternion-y-angle (-> this root quat)))
+            )
+        (quaternion-vector-angle! (-> this root quat) *up-vector*
+                                  (deg-seek cur want (* *bombbot-ally-turn-rate* dt)))
+        ;; walk once it roughly faces the way (within 60 degrees)
+        (when (< (fabs (deg-diff cur want)) 10922.0)
+          (let* ((step (fmin d (* spd dt)))
+                 (frac (bombbot-ally-move-xz this (* step (/ dx d)) (* step (/ dz d))))
+                 )
+            (set! moved (* step frac))
+            )
+          )
+        )
+      ;; stuck: it wants to walk but gets nowhere for a while
+      (cond
+        ((< moved (* 0.1 spd dt))
+         (cond
+           ((zero? (-> this stuck-time))
+            (set-time! (-> this stuck-time))
+            )
+           ((time-elapsed? (-> this stuck-time) (the int (* 300.0 *bombbot-ally-stuck-time*)))
+            (bombbot-ally-start-drop this owner)
+            )
+           )
+         )
+        (else
+          (set! (-> this stuck-time) 0)
+          )
+        )
+      )
+    (when (>= 2048.0 d)
+      (set! (-> this stuck-time) 0)
+      )
+    (set! (-> this speed) (fmin 1.0 (/ (/ moved dt) 49152.0)))
+    ;; body height follows the ground (climbs fast, settles gently, like the player bot)
+    (let ((gy (bombbot-ally-ground-y this)))
+      (if (< -900000000.0 gy)
+          (set! (-> this ground-y) gy)
+          )
+      )
+    (if (< (-> this root trans y) (-> this ground-y))
+        (seek! (-> this root trans y) (-> this ground-y) (* 61440.0 dt))
+        (seek! (-> this root trans y) (-> this ground-y) (* 40960.0 dt))
+        )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Shooting
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun bombbot-ally-shoot ((this bombbot-ally))
+  ;; the same cannon shot the player bot fires (spawn-guard-projectile), from the turret's barrel
+  (let* ((m (-> this node-list data 6 bone transform))
+         (start *bombbot-ally-muzzle*)
+         (end *bombbot-ally-end*)
+         )
+    (matrix->trans m start)
+    (vector+*! start start (-> m fvec) 8192.0)
+    (vector-normalize-copy! *bombbot-ally-dir* (-> m fvec) 614400.0)
+    (vector+! end start *bombbot-ally-dir*)
+    (let ((shot (spawn-guard-projectile this start end *bombbot-ally-shot-speed* (the-as vector #f))))
+      ;; spawn-guard-projectile leaves owner-handle empty: make Jak the owner so the kills count as his
+      (when (and shot *target* *bombbot-ally-credit-jak*)
+        (set! (-> (the-as guard-shot (ppointer->process shot)) owner-handle) (process->handle *target*))
+        )
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-aim-and-fire ((this bombbot-ally))
+  ;; points the turret at the target (the gun callbacks read target-pos) and fires bursts once the barrel is on it
+  (let ((p (as-type (handle->process (-> this target-handle)) process-focusable)))
+    (cond
+      (p
+        (set! (-> this locked) #t)
+        (let ((tp (get-trans p 3)))
+          (vector-copy! (-> this target-pos) tp)
+          (let ((m (-> this node-list data 6 bone transform))
+                (dist (vector-vector-xz-distance (-> this root trans) tp))
+                )
+            (matrix->trans m *bombbot-ally-muzzle*)
+            (vector-! *bombbot-ally-dir* tp *bombbot-ally-muzzle*)
+            (vector-normalize! *bombbot-ally-dir* 1.0)
+            (when (and (< dist *bombbot-ally-range*)
+                       (< *bombbot-ally-aim-cos* (vector-dot *bombbot-ally-dir* (-> m fvec)))
+                       (>= (current-time) (-> this next-shoot))
+                       )
+              (when (<= (-> this burst-left) 0)
+                (set! (-> this burst-left) *bombbot-ally-burst*)
+                )
+              (bombbot-ally-shoot this)
+              (+! (-> this burst-left) -1)
+              (set! (-> this next-shoot)
+                    (+ (current-time)
+                       (the int (* 300.0 (if (<= (-> this burst-left) 0)
+                                             *bombbot-ally-burst-pause*
+                                             *bombbot-ally-shot-gap*
+                                             )))
+                       )
+                    )
+              )
+            )
+          )
+        )
+      (else
+        ;; nothing to shoot at: the barrel looks straight ahead
+        (set! (-> this locked) #f)
+        (set! (-> this burst-left) 0)
+        (vector-z-quaternion! *bombbot-ally-dir* (-> this root quat))
+        (vector+*! (-> this target-pos) (-> this root trans) *bombbot-ally-dir* 204800.0)
+        (+! (-> this target-pos y) 12288.0)
+        )
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Per-frame update and damage
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; Laser pointer: same beam and particles as the player bot (parts 2059-2062 are defined in blastbot-main-mod.gc)
+(defun bombbot-ally-draw-laser ((this bombbot-ally))
+  (when (and *bombbot-ally-laser-on* (= (-> this phase) 1))
+    (let ((q (new 'stack-no-clear 'collide-query))
+          (start (new 'stack-no-clear 'vector))
+          (beam (new 'stack-no-clear 'vector))
+          (hit-pos (new 'stack-no-clear 'vector))
+          (red 0.0)
+          )
+      (let ((m (matrix-copy! (new 'stack-no-clear 'matrix) (-> this node-list data 6 bone transform))))
+        (matrix->trans m start)
+        (vector+*! start start (-> m fvec) 8192.0)
+        (vector-normalize-copy! beam (-> m fvec) 819200.0)
+        )
+      (vector-copy! (-> q start-pos) start)
+      (vector-copy! (-> q move-dist) beam)
+      (set! (-> q radius) 40.96)
+      (set! (-> q collide-with) (collide-spec backgnd enemy bot civilian hit-by-others-list))
+      (set! (-> q ignore-process0) this)
+      (set! (-> q ignore-process1) #f)
+      (set! (-> q ignore-pat)
+            (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+      (set! (-> q action-mask) (collide-action solid))
+      (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+        (when (>= hit 0.0)
+          (vector+float*! hit-pos (-> q start-pos) (-> q move-dist) hit)
+          (vector-float*! beam beam hit)
+          (let ((prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim))
+                (back (vector-normalize! (vector-! (new 'stack-no-clear 'vector) (-> q start-pos) hit-pos) 1638.4))
+                )
+            (vector+! hit-pos hit-pos back)
+            (when (and (-> this locked) (< (vector-vector-distance hit-pos (-> this target-pos)) 20480.0))
+              (set! red 1.0)
+              )
+            (cond
+              ((or prim (< 0.5 red))
+               (set! red 1.0)
+               (launch-particles (-> *part-id-table* 2061) hit-pos)
+               (launch-particles (-> *part-id-table* 2060) hit-pos)
+               )
+              (else
+                (launch-particles (-> *part-id-table* 2062) hit-pos)
+                )
+              )
+            )
+          )
+        )
+      (set! (-> *part-id-table* 2059 init-specs 5 initial-valuef) (* 255.0 red))
+      (set! (-> *part-id-table* 2059 init-specs 7 initial-valuef) (* 255.0 (- 1.0 red)))
+      (set! (-> *part-id-table* 2059 init-specs 3 initial-valuef) *bombbot-ally-laser-width*)
+      (set! (-> *part-id-table* 2059 init-specs 3 random-rangef) *bombbot-ally-laser-width-rand*)
+      (draw-beam (-> *part-id-table* 2059) start beam #t)
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-follow-target ((owner process-drawable))
+  ;; While the L2 spy-bot is being piloted the big bot idles, so follow the spy-bot instead of the owner
+  (let ((p (-> *entity-pool* child))
+        (found owner)
+        )
+    (while p
+      (when (= (-> (the-as process (-> p 0)) type symbol) 'spy-bot-player)
+        (let ((sp (as-type (the-as process (-> p 0)) process-drawable)))
+          (if sp
+              (set! found sp)
+              )
+          )
+        )
+      (set! p (-> p 0 brother))
+      )
+    found
+    )
+  )
+
+(defun bombbot-ally-update ((this bombbot-ally))
+  (let ((addr (the-as int this)))
+    (when (!= addr *bombbot-ally-last-addr*)
+      (format 0 "bombbot ally: process now at #x~X~%" addr)
+      (set! *bombbot-ally-last-addr* addr)
+      )
+    )
+  (let ((owner (as-type (handle->process (-> this owner-handle)) process-drawable)))
+    (cond
+      ((not owner)
+       ;; the owner is gone: leave quietly
+       (deactivate this)
+       )
+      ((and (< 0.0 *bombbot-ally-life*)
+            (time-elapsed? (-> this spawn-time) (the int (* *bombbot-ally-life* 300.0)))
+            )
+       ;; time is up: it blows itself up
+       (set! (-> this health) 0.0)
+       )
+      ((zero? (-> this phase))
+       (bombbot-ally-fall this)
+       )
+      (else
+        (bombbot-ally-retarget this)
+        (bombbot-ally-aim-and-fire this)
+        (let ((follow (bombbot-ally-follow-target owner)))
+          (bombbot-ally-leash this follow)
+          (bombbot-ally-walk this follow)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-attack-result ((this bombbot-ally) (proc process) (block event-message-block))
+  ;; Returns 0 = not for us (friendly / still in the sky), 1 = absorbed (invulnerable window), 2 = hurt, 3 = destroyed
+  (let ((info (the-as attack-info (-> block param 1)))
+        (amount 1.0)
+        (id (the-as uint 0))
+        (friendly #f)
+        )
+    (when (and (-> block param 1) (logtest? (-> info mask) (attack-mask damage)))
+      (set! amount (-> info damage))
+      )
+    (when (and (-> block param 1) (logtest? (-> info mask) (attack-mask id)))
+      (set! id (-> info id))
+      )
+    (when (or (= proc this) (and *target* (= proc *target*)))
+      (set! friendly #t)
+      )
+    ;; hits credited to Jak or to the bot (the bot's own attacks, the allies' attacks and splash)
+    (when (and (-> block param 1) *target* (logtest? (-> info mask) (attack-mask attacker))
+               (or (= (handle->process (-> info attacker)) *target*)
+                   (= (handle->process (-> info attacker)) this)))
+      (set! friendly #t)
+      )
+    (let ((pj (as-type proc projectile)))
+      (when (and pj (or (= (handle->process (-> pj ignore-handle)) this)
+                        (= (handle->process (-> pj owner-handle)) this)
+                        (and *target* (= (handle->process (-> pj owner-handle)) *target*))))
+        (set! friendly #t)
+        )
+      )
+    (when (as-type proc shield-sphere)
+      (set! friendly #t)
+      )
+    (cond
+      ((or friendly (zero? (-> this phase))) 0)
+      ((or (< (current-time) (-> this hit-until))
+           (and (nonzero? id) (= id (-> this last-hit-id)))
+           )
+       1
+       )
+      (else
+        (set! (-> this last-hit-id) id)
+        (set! (-> this hit-until)
+              (+ (current-time) (the int (* *bombbot-ally-invuln-time* (the float (seconds 1)))))
+              )
+        (set! (-> this health) (fmax 0.0 (- (-> this health) amount)))
+        (when *bombbot-ally-debug*
+          (format 0 "bombbot ally: hit for ~f, health ~f / ~f~%" amount (-> this health) (-> this max-health))
+          )
+        (if (<= (-> this health) 0.0)
+            3
+            2
+            )
+        )
+      )
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; States
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defstate active (bombbot-ally)
+  :virtual #t
+  :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
+    (case message
+      (('attack 'attack-invinc)
+       (!= (bombbot-ally-attack-result self proc block) 0)
+       )
+      (else
+        #f
+        )
+      )
+    )
+  :trans (behavior ()
+    (when (<= (-> self health) 0.0)
+      (go-virtual die)
+      )
+    (bombbot-ally-update self)
+    )
+  :code (behavior ()
+    (until #f
+      (ja-no-eval :group! (-> self draw art-group data 3) :num! (seek!) :frame-num 0.0)
+      (until (ja-done? 0)
+        (suspend)
+        (ja :num! (seek!))
+        )
+      )
+    #f
+    )
+  :post (behavior ()
+    (bombbot-ally-update-legs self)
+    (ja-post)
+    (update-transforms (-> self root))
+    (bombbot-ally-draw-laser self)
+    )
+  )
+
+(defstate die (bombbot-ally)
+  :virtual #t
+  :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
+    #f
+    )
+  :enter (behavior ()
+    (format 0 "bombbot ally: destroyed~%")
+    ;; nothing can hit the wreck, and it is not drawn any more
+    (let ((prim (-> self root root-prim)))
+      (set! (-> prim prim-core collide-as) (collide-spec))
+      (set! (-> prim prim-core collide-with) (collide-spec))
+      )
+    (logior! (-> self draw status) (draw-control-status no-draw))
+    (activate! *camera-smush-control* 1024.0 37 210 1.0 0.995 (-> self clock))
+    ;; the big explosion: hurts enemies only, never Jak, the bot or the other allies
+    (when (and group-kg-huge-explosion (nonzero? group-kg-huge-explosion))
+      (let ((gp (new 'stack-no-clear 'explosion-init-params)))
+        (vector-copy! (-> gp spawn-point) (-> self root trans))
+        (+! (-> gp spawn-point y) 12288.0)
+        (quaternion-identity! (-> gp spawn-quat))
+        (set! (-> gp radius) 61440.0)
+        (set! (-> gp scale) 1.0)
+        (set! (-> gp group) group-kg-huge-explosion)
+        (set! (-> gp collide-with) (collide-spec crate enemy obstacle))
+        (set! (-> gp damage) *bombbot-ally-boom-damage*)
+        (set! (-> gp damage-scale) 1.0)
+        (set! (-> gp vehicle-damage-factor) 1.0)
+        (set! (-> gp vehicle-impulse-factor) 1.0)
+        (set! (-> gp ignore-proc) (if *target*
+                                      (process->handle *target*)
+                                      (process->handle #f)
+                                      )
+              )
+        (explosion-spawn gp self)
+        )
+      )
+    )
+  :code (behavior ()
+    ;; the explosion is our child process: wait for it (max 5 s) before the bot goes away
+    (let ((t0 (current-time)))
+      (until (or (not (-> self child)) (>= (current-time) (+ t0 (seconds 5))))
+        (suspend)
+        )
+      )
+    (deactivate self)
+    )
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Init and spawning
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defbehavior bombbot-ally-init-by-other bombbot-ally ((owner process-drawable) (pos vector) (angle float))
+  ;; give the unused stack back to the process heap BEFORE any (new 'process ...) allocation (same as the player bot)
+  (stack-size-set! (-> self main-thread) 512)
+  ;; collision: same constructor the player bot's aggro shape uses (hit-by-others list: enemy shots find it there).
+  ;; One sphere group, no collide-with at all: nothing of it ever pushes or touches anything, it can only be hit.
+  (let ((root (new 'process 'collide-shape-moving self (collide-list-enum hit-by-others))))
+    (set! (-> root dynam) (copy *standard-dynamics* 'process))
+    (set! (-> root reaction) cshape-reaction-default)
+    (set! (-> root no-reaction)
+          (the-as (function collide-shape-moving collide-query vector vector object) nothing)
+          )
+    (let ((group (new 'process 'collide-shape-prim-group root (the-as uint 2) 0)))
+      (set! (-> root total-prims) (the-as uint 3))
+      (set! (-> group prim-core collide-as) (collide-spec jak))
+      (set! (-> group prim-core collide-with) (collide-spec))
+      (set! (-> group prim-core action) (collide-action solid no-standon))
+      (set-vector! (-> group local-sphere) 0.0 12288.0 0.0 40960.0)
+      (set! (-> root root-prim) group)
+      )
+    (let ((body (new 'process 'collide-shape-prim-sphere root (the-as uint 0))))
+      (set! (-> body prim-core collide-as) (collide-spec jak))
+      (set! (-> body prim-core collide-with) (collide-spec))
+      (set! (-> body prim-core action) (collide-action solid no-standon))
+      (set! (-> body transform-index) 3)
+      (set-vector! (-> body local-sphere) 0.0 8192.0 0.0 24576.0)
+      )
+    (let ((head (new 'process 'collide-shape-prim-sphere root (the-as uint 0))))
+      (set! (-> head prim-core collide-as) (collide-spec jak))
+      (set! (-> head prim-core collide-with) (collide-spec))
+      (set! (-> head prim-core action) (collide-action solid no-standon))
+      (set! (-> head transform-index) 4)
+      (set-vector! (-> head local-sphere) 0.0 4096.0 0.0 16384.0)
+      )
+    (set! (-> root nav-radius) 22528.0)
+    (set! (-> root penetrated-by) (the-as penetrate -1))
+    (set! (-> root backup-collide-as) (-> root root-prim prim-core collide-as))
+    (set! (-> root backup-collide-with) (-> root root-prim prim-core collide-with))
+    (set! (-> self root) root)
+    ;; process-focusable.water is zeroed memory, which GOAL treats as truthy
+    (set! (-> self water) (the-as water-control #f))
+    )
+  (vector-copy! (-> self root trans) pos)
+  (quaternion-identity! (-> self root quat))
+  (quaternion-rotate-y! (-> self root quat) (-> self root quat) angle)
+  (vector-identity! (-> self root scale))
+  (initialize-skeleton self skel-bombbot-ally (the-as pair 0))
+  (set! (-> self draw light-index) (the-as uint 10))
+  (bombbot-ally-init-legs self)
+  ;; turret
+  (quaternion-copy! (-> self top-quat) *unity-quaternion*)
+  (set! (-> self angle-turret) 0.0)
+  (set! (-> self angle-gun) 0.0)
+  (set! (-> self gun-rotation-speed) 7281.778)
+  (set! (-> self locked) #f)
+  (vector-z-quaternion! *bombbot-ally-dir* (-> self root quat))
+  (vector+*! (-> self target-pos) (-> self root trans) *bombbot-ally-dir* 204800.0)
+  (let ((n4 (-> self node-list data 4))
+        (n5 (-> self node-list data 5))
+        (n6 (-> self node-list data 6))
+        )
+    (set! (-> n4 param0) bombbot-ally-head-callback)
+    (set! (-> n4 param1) self)
+    (set! (-> n5 param0) bombbot-ally-gun-swivel-callback)
+    (set! (-> n5 param1) self)
+    (set! (-> n6 param0) bombbot-ally-gun-callback)
+    (set! (-> n6 param1) self)
+    )
+  ;; state
+  (set! (-> self owner-handle) (process->handle owner))
+  (set! (-> self target-handle) (the-as handle #f))
+  (set-time! (-> self spawn-time))
+  (set-time! (-> self scan-time))
+  (set! (-> self phase) 0)
+  (set! (-> self fall-vy) 0.0)
+  (set-time! (-> self fall-start))
+  (set! (-> self fall-fallback) (-> owner root trans y))
+  (set! (-> self ground-y) (-> owner root trans y))
+  (set! (-> self burst-left) 0)
+  (set! (-> self next-shoot) 0)
+  (set! (-> self lost-time) 0)
+  (set! (-> self stuck-time) 0)
+  (vector-copy! (-> self owner-pos) (-> owner root trans))
+  (set! (-> self owner-move-start) 0)
+  (set! (-> self hit-until) 0)
+  (set! (-> self last-hit-id) (the-as uint 0))
+  (vector-copy! (-> self goal) (-> self root trans))
+  (set! (-> self goal-speed) 0.0)
+  (set! (-> self speed) 0.0)
+  (set! (-> self max-health) *bombbot-ally-hp*)
+  (set! (-> self health) *bombbot-ally-hp*)
+  (go-virtual active)
+  )
+
+(defun bombbot-ally-count ()
+  ;; how many are alive (spawned under *entity-pool*, so walk its children)
+  (let ((n 0)
+        (p (-> *entity-pool* child))
+        )
+    (while p
+      (if (type? (-> p 0) bombbot-ally)
+          (+! n 1)
+          )
+      (set! p (-> p 0 brother))
+      )
+    n
+    )
+  )
+
+(defun bombbot-ally-clear ()
+  ;; REPL: removes every allied bombbot, quietly
+  (let ((p (-> *entity-pool* child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (proc (the-as process (-> p 0)))
+            )
+        (if (type? proc bombbot-ally)
+            (deactivate proc)
+            )
+        (set! p next)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun bombbot-ally-launch ((owner process-drawable))
+  ;; Mass Inverter: drops ONE allied bombbot from the sky next to the owner. Returns how many were spawned.
+  (let ((alive (bombbot-ally-count)))
+    (cond
+      ((>= alive *bombbot-ally-max*)
+       (format 0 "Bombbot ally: already ~D alive, nothing launched~%" alive)
+       0
+       )
+      (else
+        (bombbot-ally-spot owner *bombbot-ally-pos*)
+        (let ((spawned (process-spawn bombbot-ally
+                                      :init bombbot-ally-init-by-other owner *bombbot-ally-pos*
+                                      (quaternion-y-angle (-> owner root quat))
+                                      :from (if (-> *bombbot-ally-pool* child) *bombbot-ally-pool* *default-dead-pool*)
+                                      :to *entity-pool*
+                                      :stack-size #x4000
+                                      :name "bombbot-ally"
+                                      )
+                       )
+              )
+          (format 0 "Bombbot ally: launched ~A at ~M ~M ~M~%"
+                  (if spawned (ppointer->process spawned) #f)
+                  (-> *bombbot-ally-pos* x) (-> *bombbot-ally-pos* y) (-> *bombbot-ally-pos* z))
+          (if spawned 1 0)
+          )
+        )
+      )
+    )
+  )
+
+;; REPL: (bombbot-ally-test) launches one next to Jak (no bot needed), (bombbot-ally-clear) removes it
+(defun bombbot-ally-test ()
+  (if *target*
+      (bombbot-ally-launch *target*)
+      0
+      )
+  )
+
+;; load check: this line must show in the console while the game boots
+(format 0 "bombbot-ally.gc loaded~%")
