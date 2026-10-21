@@ -13,10 +13,11 @@
 ;;   - the top-left of the screen shows one square box per kind that has at least one minion alive:
 ;;         [red square]  10     [yellow triangle]  2     [blue X]  4
 ;;     the boxes sit next to each other and close up when a kind is empty; the number is centred under its box.
-;;   - there is NO second hud process: the boxes are drawn by the bot's own hud (blast-bot-hud in blastbot-main-mod.gc),
-;;     which hands itself to ahud-draw-boxes below. They use its sprites 15..29 and its text strings 0..2.
+;;   - the boxes are drawn by their OWN small hud process (blast-ally-hud, below), a child of the bot, so they have all 30 hud
+;;     sprites and 4 text strings to themselves. blast-ally-hud-update spawns it. blast-bot-hud still calls ahud-draw-boxes
+;;     with its own sprites 15..29, which is now a no-op (it only draws on a blast-ally-hud), so blastbot-main-mod.gc needs NO change.
 ;;
-;; Needs, in game.gd:  "blastbot-allyhud.o"  after spydroid-ally.o, sentinel-ally.o, roboguard-ally.o
+;; Needs, in game.gd:  "blastbot-allyhud.o"  after spydroid-ally.o, sentinel-ally.o, roboguard-ally.o, bombbot-ally.o
 ;; and before blastbot-main-mod.o (which calls blast-ally-hud-update and ahud-draw-boxes).
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -42,6 +43,7 @@
 (define *ahud-tag-h-sd* 10240.0)         ;; height of the v's tip above a spydroid's origin (2.5 m)
 (define *ahud-tag-h-st* 4096.0)        ;; ... a sentinel (1.0 m)
 (define *ahud-tag-h-rg* 20480.0)        ;; ... a roboguard (5.0 m)
+(define *ahud-tag-h-bb* 32768.0)        ;; ... the allied bombbot (8 m)
 (define *ahud-tag-color* (new 'static 'rgba :g #xff :a #x80))
 (define *ahud-tag-tip* (new 'global 'vector))
 (define *ahud-tag-a* (new 'global 'vector))
@@ -51,6 +53,14 @@
 (define *ahud-n-sd* 0)                  ;; spydroids
 (define *ahud-n-st* 0)                  ;; sentinels
 (define *ahud-n-rg* 0)                  ;; roboguards
+(define *ahud-n-bb* 0)                  ;; allied bombbots
+
+;; the hud process that draws the boxes (spawned by blast-ally-hud-update)
+(deftype blast-ally-hud (hud)
+  ()
+  )
+(define *ahud-hud-handle* (the-as handle #f))
+(define *ahud-hud-retry* (the-as time-frame 0))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; One coloured rectangle on a hud sprite
@@ -125,11 +135,18 @@
   (let ((sd 0)
         (st 0)
         (rg 0)
+        (bb 0)
         (c (-> *entity-pool* child))
         )
     (while c
       (let ((proc (the-as process (-> c 0))))
         (cond
+          ((type? proc bombbot-ally)
+           (when (ahud-alive? proc)
+             (+! bb 1)
+             (ahud-tag! proc *ahud-tag-h-bb* owner)
+             )
+           )
           ((type? proc roboguard-ally)
            (when (ahud-alive? proc)
              (+! rg 1)
@@ -153,13 +170,14 @@
       (set! c (-> c 0 brother))
       )
     (when (and *ahud-debug*
-               (or (!= sd *ahud-n-sd*) (!= st *ahud-n-st*) (!= rg *ahud-n-rg*))
+               (or (!= sd *ahud-n-sd*) (!= st *ahud-n-st*) (!= rg *ahud-n-rg*) (!= bb *ahud-n-bb*))
                )
-      (format 0 "Ally HUD: spydroids ~D, sentinels ~D, roboguards ~D~%" sd st rg)
+      (format 0 "Ally HUD: spydroids ~D, sentinels ~D, roboguards ~D, bombbots ~D~%" sd st rg bb)
       )
     (set! *ahud-n-sd* sd)
     (set! *ahud-n-st* st)
     (set! *ahud-n-rg* rg)
+    (set! *ahud-n-bb* bb)
     )
   0
   )
@@ -169,11 +187,11 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun ahud-box! ((this hud) (first int) (kind int) (n int) (cell int))
-  ;; Box of one kind. Sprites used (relative to FIRST): spydroid 0-2, sentinel 3-7, roboguard 8-14.
+  ;; Box of one kind. Sprites used (relative to FIRST): spydroid 0-6, sentinel 7-11, roboguard 12-14, bombbot 15-21.
   ;; Every box: light border, dark inside, the icon in the middle (drawn for a 32 x 32 inside, the default box size),
   ;; the number centred right under the box.
-  (let* ((s (case kind ((0) 0) ((1) 3) (else 8)))
-         (count (case kind ((0) 3) ((1) 5) (else 7)))
+  (let* ((s (case kind ((0) 0) ((1) 7) ((2) 12) (else 15)))
+         (count (case kind ((0) 7) ((1) 5) ((2) 3) (else 7)))
          (x (+ *ahud-x* (* cell (+ *ahud-gap*))))
          (y *ahud-y*)
          (ix (+ x 4))
@@ -192,8 +210,12 @@
         (ahud-rect! (-> this sprites (+ first s 1)) ix iy inner inner 20 20 24)
         (case kind
           ((0)
-           ;; red square
-           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 6) (+ iy 8) 16 16 255 40 40)
+           ;; red circle: 7 x 7 cells of 3 hud pixels (21 x 21, centred in the 31 x 31 inside), rows 3 / 5 / 7 / 7 / 7 / 5 / 3 cells wide
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 10) (+ iy 5)  8 3 255 40 40)
+           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 7)  (+ iy 8)  15 3 255 40 40)
+           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 4)  (+ iy 11) 22 9 255 40 40)
+           (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 7)  (+ iy 20) 15 3 255 40 40)
+           (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 10) (+ iy 23) 8 3 255 40 40)
            )
           ((1)
            ;; yellow triangle: three rows, 5 / 12 / 20 wide
@@ -201,13 +223,17 @@
            (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 8)  (+ iy 12) 12 6 255 220 0)
            (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 5) (+ iy 18) 20 8 255 220 0)
            )
+          ((2)
+           ;; blue square
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 6) (+ iy 8) 16 16 60 120 255)
+           )
           (else
-            ;; blue X: four corner blocks and a centre block
-           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 3)  (+ iy 6)  6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 17) (+ iy 6)  6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 3)  (+ iy 20) 6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 17) (+ iy 20) 6 6 60 120 255)
-           (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 9) (+ iy 12) 9 8 60 120 255)
+            ;; purple X: four corner blocks and a centre block
+           (ahud-rect! (-> this sprites (+ first s 2)) (+ ix 3)  (+ iy 6)  6 6 170 60 255)
+           (ahud-rect! (-> this sprites (+ first s 3)) (+ ix 17) (+ iy 6)  6 6 170 60 255)
+           (ahud-rect! (-> this sprites (+ first s 4)) (+ ix 3)  (+ iy 20) 6 6 170 60 255)
+           (ahud-rect! (-> this sprites (+ first s 5)) (+ ix 17) (+ iy 20) 6 6 170 60 255)
+           (ahud-rect! (-> this sprites (+ first s 6)) (+ ix 9) (+ iy 12) 9 8 170 60 255)
             )
           )
         ;; the number: string KIND, centred under the box (x = 0 hides it)
@@ -230,8 +256,12 @@
   )
 
 (defun ahud-draw-boxes ((this hud) (first int))
-  ;; FIRST = the first of the 15 sprites the boxes may use (strings 0, 1, 2 are used for the numbers)
+  ;; FIRST = the first sprite the boxes may use (strings 0-3 are used for the numbers). Only the blast-ally-hud draws them:
+  ;; blast-bot-hud still calls this with 15, which does nothing.
   (let ((cell 0))
+    (when (not (type? this blast-ally-hud))
+      (return 0)
+      )
     (when (not *ahud-enabled*)
       (set! cell -1)   ;; hides everything
       )
@@ -244,8 +274,56 @@
       (+! cell 1)
       )
     (ahud-box! this first 2 *ahud-n-rg* cell)
+    (when (and (>= cell 0) (> *ahud-n-rg* 0))
+      (+! cell 1)
+      )
+    (ahud-box! this first 3 *ahud-n-bb* cell)
     )
   0
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; The hud process that draws the boxes
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defmethod draw ((this blast-ally-hud))
+  (ahud-draw-boxes this 0)
+  ((method-of-type hud draw) this)
+  0
+  (none)
+  )
+
+(defmethod update-values! ((this blast-ally-hud))
+  (logclear! (-> this flags) (hud-flags disable))
+  ((method-of-type hud update-values!) this)
+  0
+  (none)
+  )
+
+(defmethod init-callback ((this blast-ally-hud))
+  ;; same setup as blast-bot-hud, but on the stock health hud's gui channel (hud-lower-left-1): that hud is hidden while you sit in the bot,
+  ;; and two huds on one channel can't both show (the second one stays 'pending'), so it must not share the bot hud's channel.
+  ;; white sprites hidden (scale 0), strings 0-3 = the counts (pos x 0 = hidden)
+  (set! (-> this level) (level-get-target-inside *level*))
+  (set! (-> this gui-id)
+        (add-process *gui-control* this (gui-channel hud-lower-left-1) (gui-action hidden) (-> this name) 81920.0 0)
+        )
+  (logior! (-> this flags) (hud-flags show))
+  (dotimes (i 30)
+    (set! (-> this sprites i tid) (the-as texture-id (get-texture common-white common)))
+    (set! (-> this sprites i flags) (hud-sprite-flags))
+    (set! (-> this sprites i scale-x) 0.0)
+    (set! (-> this sprites i scale-y) 0.0)
+    )
+  (dotimes (i 4)
+    (alloc-string-if-needed this i)
+    (set! (-> this strings i scale) *ahud-text-scale*)
+    (set! (-> this strings i color) (font-color white))
+    (set! (-> this strings i flags) (font-flags shadow kerning large))
+    (set! (-> this strings i pos x) 0)
+    )
+  0
+  (none)
   )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -253,9 +331,18 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun blast-ally-hud-update ((owner process))
-  (if *ahud-enabled*
-      (ahud-count-allies owner)
+  (when *ahud-enabled*
+    (ahud-count-allies owner)
+    ;; spawn the box hud as a child of the bot (it goes away with the bot)
+    (when (and (not (handle->process *ahud-hud-handle*))
+               (>= (current-time) *ahud-hud-retry*)
+               )
+      (set! *ahud-hud-retry* (+ (current-time) (seconds 1)))
+      (set! *ahud-hud-handle*
+            (ppointer->handle (process-spawn blast-ally-hud :init hud-init-by-other :name "blast-ally-hud" :to owner))
+            )
       )
+    )
   0
   )
 

@@ -60,7 +60,7 @@
 (define *bombbot-ally-stuck-time* 3.0)           ;; seconds of trying to walk without getting anywhere = dropped again
 (define *bombbot-ally-patrol-time* 2.0)           ;; seconds the owner must have been moving before the ally stops patrolling and sticks close
 (define *bombbot-ally-patrol-radius* 163840.0)   ;; 40 m: while the owner stands still (or just started moving) it chases enemies this close to the owner
-(define *bombbot-ally-chase-dist* 102400.0)      ;; 25 m: it stops walking toward its target once it is this close
+(define *bombbot-ally-chase-dist* 81920.0)      ;; 20 m: it stops walking toward its target once it is this close
 (define *bombbot-ally-max-slope-ny* 0.5)         ;; surfaces whose normal.y is below this block it (0.7 = 45 deg, 0.5 = 60 deg): lower = it climbs steeper ramps
 (define *bombbot-ally-chase-height* 32768.0)     ;; 8 m: it only walks after targets about this close to its own height (no nav mesh, it can't find the ramp up to a bridge)
 (define *bombbot-ally-height-weight* 3.0)        ;; target choice: 1 m of height difference counts like this many metres of distance
