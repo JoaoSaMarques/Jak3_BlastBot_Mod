@@ -21,6 +21,125 @@
     ;; Begin function defintions.
     ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+    ;; Always-bot: the blast bot comes back every time Jak spawns (new game, loading a file, death) and waits until Jak is free
+    ;; (no cutscene / death) plus a short delay. L1 + Triangle still removes it until the next spawn.
+    (define *blast-bot-always* #t)             ;; #f = back to manual (L1 + R3 only)
+    (define *blast-bot-spawn-delay* 1.5)       ;; seconds after Jak appears before the bot is spawned
+    (define *blast-bot-seen-target* 0)         ;; pid of the Jak (target process) seen last
+    (define *blast-bot-spawn-pending* #f)
+    (define *blast-bot-spawn-stamp* 0)
+    (define *blast-bot-spawn-tries* 0)         ;; auto-spawn attempts for the current Jak
+    (define *blast-bot-spawn-check* 0)         ;; time of the last auto-spawn, 0 = nothing to verify
+    (define *blast-bot-wait-log* 0)
+
+    (define *blast-bot-auto-default-pool* #t)  ;; #t = the 16k slot is permanently busy here, so auto-spawn uses the default pool like L1 + R3 does
+    (define *blast-bot-holder-logs* 0)
+
+    (define-extern blast-bot-log-16k-holders (function process-tree int))
+
+    (defun blast-bot-log-16k-holders ((tree process-tree))
+      ;; diagnostic: walks the whole process tree and prints every process that came from the fixed 16k pool
+      (let ((p (-> tree child)))
+        (while p
+          (let ((next (-> p 0 brother))
+                (proc (the-as process (-> p 0)))
+                )
+            (when (and (type? proc process) (= (-> proc pool) *16k-dead-pool*))
+              (format 0 "Blast Bot: 16k slot holder: ~A~%" proc)
+              )
+            (blast-bot-log-16k-holders (-> p 0))
+            (set! p next)
+            )
+          )
+        )
+      0
+      )
+
+    (defun blast-bot-spawn-pending! ()
+      (set! *blast-bot-spawn-pending* #t)
+      (set! *blast-bot-spawn-stamp* (the-as int (current-time)))
+      (set! *blast-bot-spawn-check* 0)
+      0
+      )
+
+    (defun blast-bot-spawn-watch ()
+      (when (and *blast-bot-always* *target*)
+        ;; every spawn is a new target process, so a new handle means Jak just (re)spawned
+        ;; compare the 32-bit process id: a handle is 64-bit and a global symbol only keeps 32 bits, so it never matched
+        (let ((h (the-as int (-> *target* pid))))
+          (when (!= h *blast-bot-seen-target*)
+            (set! *blast-bot-seen-target* h)
+            (set! *blast-bot-spawn-tries* 0)
+            (format 0 "Blast Bot: new Jak seen, auto-spawn armed~%")
+            (blast-bot-spawn-pending!)
+            )
+          )
+        (when (and *blast-bot-spawn-pending*
+                   (time-elapsed? *blast-bot-spawn-stamp* (the int (* *blast-bot-spawn-delay* 300.0)))
+                   )
+          (let ((st (blast-bot-jak-state)))
+            (cond
+              ;; not free yet (dead, cutscene grab, death/respawn state, cutscene stream): say why, every 2 seconds
+              ((or (focus-test? *target* dead)
+                   (not st)                      ;; Jak has no state yet (still being set up)
+                   (= st 'target-title)          ;; title screen / menu: it has its own Jak, never spawn there
+                   (blast-bot-jak-busy? st)
+                   (-> *art-control* active-stream)
+                   ;; the fixed 16k pool slot is busy (loading / menu): spawning now would put the bot in the default pool,
+                   ;; which compacts during loads and moves the bot in memory (that crashed the game)
+                   (and (not *blast-bot-auto-default-pool*) (not (-> *16k-dead-pool* child)))
+                   )
+               ;; the delay only starts counting once Jak is actually free
+               (set! *blast-bot-spawn-stamp* (the-as int (current-time)))
+               (when (time-elapsed? *blast-bot-wait-log* (seconds 2.0))
+                 (set! *blast-bot-wait-log* (the-as int (current-time)))
+                 (format 0 "Blast Bot: auto-spawn waiting (Jak ~A, grabbed ~A, stream ~A, 16k slot free ~A)~%"
+                         st
+                         (if (focus-test? *target* grabbed) #t #f)
+                         (if (-> *art-control* active-stream) #t #f)
+                         (if (-> *16k-dead-pool* child) #t #f)
+                         )
+                 (when (and (not (-> *16k-dead-pool* child)) (< *blast-bot-holder-logs* 2))
+                   (set! *blast-bot-holder-logs* (+ *blast-bot-holder-logs* 1))
+                   (blast-bot-log-16k-holders *active-pool*)
+                   )
+                 )
+               )
+              (else
+                (set! *blast-bot-spawn-pending* #f)
+                (set! *blast-bot-spawn-tries* (+ *blast-bot-spawn-tries* 1))
+                (format 0 "Blast Bot: auto-spawn try ~D (old bot present: ~A, Jak ~A)~%"
+                        *blast-bot-spawn-tries* (if (blast-bot-find) #t #f) st)
+                ;; no blast-bot-find guard: an old bot can outlive a load/death (it lives in the entity pool) and would
+                ;; block the spawn. spawn-my-bombbot removes every previous bot itself.
+                (spawn-my-bombbot)
+                (set! *blast-bot-spawn-check* (the-as int (current-time)))
+                )
+              )
+            )
+          )
+        ;; 1.5 s after an auto-spawn: is the bot still alive? if not (killed by the level load, failed init), try again
+        (when (and (nonzero? *blast-bot-spawn-check*)
+                   (time-elapsed? *blast-bot-spawn-check* (seconds 1.5))
+                   )
+          (set! *blast-bot-spawn-check* 0)
+          (cond
+            ((blast-bot-find)
+             (format 0 "Blast Bot: auto-spawn ok~%")
+             )
+            ((< *blast-bot-spawn-tries* 5)
+             (format 0 "Blast Bot: bot is gone after auto-spawn, retrying~%")
+             (blast-bot-spawn-pending!)
+             )
+            (else
+              (format 0 "Blast Bot: auto-spawn gave up~%")
+              )
+            )
+          )
+        )
+      0
+      )
+
     (defun runs-every-frame ()
       ;; (increase-power-cell-by-one) This is a call to increase-power-cell-by-one defined in mod-common-functions.gc
 
@@ -46,6 +165,8 @@
         (despawn-my-bombbot)
         )
       (blast-bot-despawn-update)
+
+      (blast-bot-spawn-watch)
 
       (when *debug-segment*
         (orb-placer-maintenance)
@@ -101,6 +222,7 @@
 
     (defun runs-on-jak-spawn ()
       ;; Code here runs every time jak spawns (loading a file new game or death)   
+      (blast-bot-spawn-pending!)
       (none)
       )
 

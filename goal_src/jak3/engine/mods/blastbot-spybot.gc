@@ -34,6 +34,7 @@
 (define *spybot-gravity* 163840.0)     ;; 40 m/s^2
 (define *spybot-spawn-dist* 0.0)       ;; spawns this far in front of the blast bot (0 = right at its centre)
 (define *spybot-invuln-time* 3.0)      ;; purple 3 secret: seconds of invulnerability after becoming a spy-bot
+(define *spybot-pickup-radius* 5120.0)  ;; pickup magnet: orbs / health etc. within this radius of the droid (1.25 m) are collected
 (define *spybot-nova-fallback* 3.0)    ;; Super Nova: the droid keeps Jak until the new bot is there; if none shows up this long after the respawn time, it releases him
 
 (define-extern spybot-end (function symbol none))
@@ -449,10 +450,52 @@
 ;; State
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Pickups
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun spybot-touch ((this spy-bot-player))
+  ;; Same call the blast bot makes (blast-bot-touch): generates 'touched events for the droid's prims, including the
+  ;; pickup sphere added in the init.
+  (let ((params (new 'stack-no-clear 'overlaps-others-params)))
+    (set! (-> params options) (overlaps-others-options))
+    (set! (-> params collide-with-filter) (the-as collide-spec #xffffffff))
+    (set! (-> params tlist) *touching-list*)
+    (find-overlapping-shapes (-> this root) params)
+    )
+  (none)
+  )
+
 (defstate active (spy-bot-player)
   :virtual #t
   :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
     (case message
+      (('touched)
+       ;; the pickup sphere overlapped something: collectables only (enemies are the headbutt's business). Like the bot's
+       ;; legs, hit it and let it decide: a pickup answers 'attack by sending 'get-pickup back (handled below).
+       (if (type? proc collectable) (format 0 "Spy bot: touched pickup ~A~%" proc)) ;; DIAG: remove once collecting works
+       (when (and proc
+                  (!= proc self)
+                  (type? proc collectable)
+                  (> (-> block num-params) 0)
+                  )
+         (send-event proc 'attack (-> block param 0)
+                     (static-attack-info :mask (penetrate-using)
+                                         ((id (new-attack-id))
+                                          (damage 1.0)
+                                          (mode 'explode)
+                                          (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
+                                          )))
+         )
+       #t
+       )
+      (('get-pickup)
+       ;; orbs / health are collected by touching them; Jak owns the inventory, so hand it to him (same as the bot)
+       (if *target*
+           (send-event *target* 'get-pickup (-> block param 0) (-> block param 1))
+           #f
+           )
+       )
       (('attack 'attack-invinc)
        ;; enemy shots / swings: one hit point per 0.5 s at most (none while the purple 3 invulnerability runs)
        (when (and proc
@@ -472,6 +515,7 @@
     )
   :trans (behavior ()
     (spybot-update)
+    (spybot-touch self)
     )
   :code sleep-code
   :post (behavior ()
@@ -493,10 +537,12 @@
           (the-as (function collide-shape-moving collide-query vector vector object) nothing)
           )
     (set! (-> cs penetrated-by) (the-as penetrate -1))
-    (let ((grp (new 'process 'collide-shape-prim-group cs (the-as uint 1) 0)))
-      (set! (-> cs total-prims) (the-as uint 2))
+    (let ((grp (new 'process 'collide-shape-prim-group cs (the-as uint 2) 0)))
+      (set! (-> cs total-prims) (the-as uint 3))
       (set! (-> grp prim-core collide-as) (collide-spec bot))
-      (set! (-> grp prim-core collide-with) (collide-spec backgnd obstacle hit-by-others-list))
+      ;; the group's collide-with gates its children: the engine only tests the pickup sphere against things the GROUP
+      ;; may collide with, and pickups are not backgnd/obstacle/hit-by-others. The bot's group is #xffffffff for the same reason.
+      (set! (-> grp prim-core collide-with) (the-as collide-spec #xffffffff))
       (set! (-> grp prim-core action) (collide-action solid))
       (set! (-> grp transform-index) 3)
       (set-vector! (-> grp local-sphere) 0.0 0.0 0.0 4300.8)
@@ -509,11 +555,24 @@
       (set! (-> sph transform-index) 3)
       (set-vector! (-> sph local-sphere) 0.0 0.0 0.0 3686.4)
       )
+    ;; pickup sphere: same recipe as the bot's leg spheres (collide-as jak so pickups react to it, touches actors only)
+    (let ((pk (new 'process 'collide-shape-prim-sphere cs (the-as uint 1))))
+      (set! (-> pk prim-core collide-as) (collide-spec jak))
+      (set! (-> pk prim-core collide-with) (the-as collide-spec #xffffffff))
+      (logclear! (-> pk prim-core collide-with) (collide-spec backgnd))
+      (set! (-> pk prim-core action) (collide-action solid no-standon))
+      (set! (-> pk transform-index) 3)
+      (set-vector! (-> pk local-sphere) 0.0 0.0 0.0 *spybot-pickup-radius*)
+      )
     (set! (-> cs nav-radius) 4096.0)
     (let ((v1 (-> cs root-prim)))
       (set! (-> cs backup-collide-as) (-> v1 prim-core collide-as))
       (set! (-> cs backup-collide-with) (-> v1 prim-core collide-with))
       )
+    ;; same as the blast bot's root: without these the engine never sends 'touched to the droid (and 'touch to the pickup),
+    ;; so the pickup sphere overlaps orbs but nothing is ever collected
+    (set! (-> cs event-self) 'touched)
+    (set! (-> cs event-other) 'touch)
     (set! (-> self root) cs)
     ;; process-focusable.water is zeroed memory, which GOAL treats as truthy: make it a real #f (same fix as the bot)
     (set! (-> self water) (the-as water-control #f))

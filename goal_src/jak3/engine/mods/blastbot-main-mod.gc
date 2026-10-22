@@ -1923,6 +1923,30 @@
 (define *blast-bot-grab-since* 0)
 (define *blast-bot-grab-timeout* (seconds 2.0))
 
+;; A cutscene has a scene-player process from the moment it is requested (while it loads, with no stream playing yet, and all
+;; the way to its end). The grab timeout and the regrab must never touch Jak while one exists: ending his grab or putting
+;; him back in the bot mid-load breaks the scene and leaves a black screen.
+(define-extern blast-bot-scene-in? (function process-tree symbol))
+(defun blast-bot-scene-in? ((tree process-tree))
+  (let ((p (-> tree child))
+        (found #f)
+        )
+    (while (and p (not found))
+      (let ((next (-> p 0 brother)))
+        (if (or (type? (-> p 0) scene-player) (blast-bot-scene-in? (-> p 0)))
+            (set! found #t)
+            )
+        (set! p next)
+        )
+      )
+    found
+    )
+  )
+
+(defun blast-bot-scene-active? ()
+  (blast-bot-scene-in? *active-pool*)
+  )
+
 (defun blast-bot-jak-busy? ((st object))
   ;; states we must NOT fight: cutscene grabs, death/respawn, and the bot's own ride state
   (or (= st 'target-grab-ride) (= st 'target-grab) (= st 'target-clone-anim)
@@ -1941,7 +1965,7 @@
         (set! *blast-bot-last-jak-state* st)
         )
       ;; stuck in target-grab with no cutscene stream playing -> end the grab ourselves after the timeout
-      (if (and (= st 'target-grab) (not (-> *art-control* active-stream)))
+      (if (and (= st 'target-grab) (not (-> *art-control* active-stream)) (not (blast-bot-scene-active?)))
           (when (zero? *blast-bot-grab-since*)
             (set! *blast-bot-grab-since* (current-time))
             )
@@ -1958,7 +1982,8 @@
                  (>= (current-time) (-> this ride-retry))
                  (not (blast-bot-jak-busy? st))
                  (zero? *blast-bot-despawn-step*)           ;; not while the bot is being removed
-                 (not (-> *art-control* active-stream))) ;; no cutscene stream playing
+                 (not (-> *art-control* active-stream)) ;; no cutscene stream playing
+                 (not (blast-bot-scene-active?)))       ;; and no cutscene loading or playing
         (format 0 "Blast Bot: Jak left the bot (~A), putting him back~%" st)
         (set! (-> this ride-retry) (+ (current-time) (seconds 0.25)))
         (move-to-point! (-> *target* control) (-> this root trans))
@@ -2909,11 +2934,17 @@
     )
   )
 
+;; The bot's own fixed pool. A plain dead-pool never compacts, so the bot is never moved in memory (when it was moved, the
+;; game crashed right after). The stock *16k-dead-pool* has one slot that is permanently taken in retail builds, which sent
+;; the bot to the compacting default pool. Two slots so a re-summon can spawn the new bot while the old one still lives.
+(define *blast-bot-pool* (new 'global 'dead-pool 2 #x4000 "blast-bot-pool"))
+
 (defun spawn-my-bombbot ()
   ;; Spawns a new bot, then removes every previous one. Jak is released from the old bot first so the new bot can take him over.
   (when *target*
     (format 0 "Blast Bot: spawn requested~%")
-    (format 0 "Blast Bot: 16k pool slot free: ~A~%" (if (-> *16k-dead-pool* child) #t #f))
+    (format 0 "Blast Bot: own pool slot free: ~A, 16k pool slot free: ~A~%"
+            (if (-> *blast-bot-pool* child) #t #f) (if (-> *16k-dead-pool* child) #t #f))
     (if (blast-bot-find)
         (send-event *target* 'change-mode 'grab #t)
         )
@@ -2921,7 +2952,11 @@
                               ;; *16k-dead-pool* is a plain dead-pool (fixed slots, never compacts), so the bot is never
                               ;; moved in memory. It has a single slot (debug builds), so fall back to the compacting
                               ;; default pool when the slot is taken.
-                              :from (if (-> *16k-dead-pool* child) *16k-dead-pool* *default-dead-pool*)
+                              :from (cond
+                                      ((-> *blast-bot-pool* child) *blast-bot-pool*)
+                                      ((-> *16k-dead-pool* child) *16k-dead-pool*)
+                                      (else *default-dead-pool*)
+                                      )
                               :to *entity-pool*
                               :stack-size #x4000
                               :name "blast-bot-player")))

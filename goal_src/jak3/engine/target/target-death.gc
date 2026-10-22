@@ -7,6 +7,8 @@
 
 ;; DECOMP BEGINS
 
+(define-extern runs-on-jak-spawn (function none))
+
 (define *auto-continue* #f)
 
 ;; WARN: Return type mismatch object vs continue-point.
@@ -783,6 +785,7 @@
       )
     (ja-channel-set! 1)
     (ja :group! jakb-stance-loop-ja)
+    (runs-on-jak-spawn) ;; trigger hook for mod base mod-base-change (same spot as the Jak 1 mod base)
     (suspend)
     (logior! (-> self control status) (collide-status on-surface on-ground touch-surface))
     (when (-> self mode-cache)
