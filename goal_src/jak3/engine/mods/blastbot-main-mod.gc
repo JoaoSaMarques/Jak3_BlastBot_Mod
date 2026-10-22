@@ -135,6 +135,8 @@
 (define-extern blast-bot-yellow-update (function blast-bot-player none))
 (define-extern blast-bot-scan-update (function blast-bot-player none))
 (define-extern blast-bot-fire-input (function blast-bot-player none))
+;; Mass Inverter lifesteal (bombbot-ally.gc): report damage the bot deals. #f = dealt by the bot, #t = by the allied bombbot.
+(define-extern blast-lifesteal-dealt (function float symbol none))
 ;; L2 spy-bot (blastbot-spybot.gc). While *blast-bot-spy-active* the bot stands idle: no steering, jumping, dash, hover,
 ;; shield or shooting, and the camera zooms in (*blast-bot-spy-cam-zoom*, 1.0 = the normal distance) on the droid.
 (define *blast-bot-spy-active* #f)
@@ -220,7 +222,8 @@
 (define *blast-bot-elbows* (new 'static 'boxed-array :type int32 19 13 15 17))
 (define *blast-bot-hand-dist* (new 'static 'boxed-array :type float 14880.768 -14880.768 14880.768 -14880.768))
 
-(define *blast-bot-hatred* 5.0)
+(define *blast-bot-hatred* 20.0)
+(define *blast-bot-ally-hatred* 5.0)   ;; how much kg / metalhead squad members hate the bot's minions (spydroid, sentinel, roboguard, bombbot, L2 droid); the bot itself is the line above
 
 (defun blast-bot-foot-phase ((i int))
   ;; Where in the 0.8s gait cycle foot i steps. Feet 0/2 and 3/1 are diagonal pairs,
@@ -353,6 +356,7 @@
             (when (and p
                        (blast-bot-valid-target? this p)
                        (< (vector-vector-distance (-> p root trans) pos) radius))
+              (blast-lifesteal-dealt 2.0 #f)
               (send-event p 'attack #f
                           (blast-bot-credit-jak!
                             (static-attack-info ((id (new-attack-id)) (damage 2.0) (mode 'explode)))))
@@ -1441,6 +1445,7 @@
             (when (and p
                        (blast-bot-valid-target? this p)
                        (< (vector-vector-distance (-> p root trans) center) 28672.0))
+              (blast-lifesteal-dealt 6.0 #f)
               (send-event p 'attack #f
                           (blast-bot-credit-jak!
                             (static-attack-info ((id (-> this dash-id)) (damage 6.0) (mode 'explode)))))
@@ -2068,6 +2073,12 @@
     (when (as-type proc shield-sphere)
       (set! friendly #t)
       )
+    ;; hits sent by the bot's own minions (spydroids, sentinels, roboguards, bombbot, the L2 droid)
+    (let ((pf (as-type proc process-focusable)))
+      (when (and pf (blast-bot-ally? pf))
+        (set! friendly #t)
+        )
+      )
     (if *blast-bot-attack-debug*
         (let ((en (as-type proc enemy)))
           (format 0 "Blast Bot: attack from ~A dmg ~f friendly ~A shield ~A state ~A dangerous ~A~%"
@@ -2266,6 +2277,9 @@
          (when (>= (current-time) (-> self leg-id-time))
            (set! (-> self leg-id-time) (+ (current-time) (seconds 0.4)))
            (set! (-> self leg-id) (new-attack-id))
+           (if (logtest? (process-mask enemy) (-> proc mask))
+               (blast-lifesteal-dealt 2.0 #f)   ;; Mass Inverter lifesteal: once per leg attack id (0.4 s), enemies only
+               )
            )
          (send-event proc 'attack (-> block param 0)
                      (blast-bot-credit-jak!
@@ -2286,6 +2300,8 @@
                   (nonzero? (-> block param 0))
                   (logtest? (process-mask enemy) (-> pd mask))
                   (type? (-> pd root) collide-shape)
+                  ;; the bot's own minions (spydroid headbutt etc.) never hurt it
+                  (not (blast-bot-ally? (the-as process-focusable pd)))
                   )
               (when (and (let ((en (as-type proc enemy)))
                           (and en (logtest? (-> en focus-status) (focus-status dangerous))))

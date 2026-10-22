@@ -78,6 +78,15 @@
 
 (defmethod enemy->hatred-val ((this kg-squad-member) (arg0 process))
   (cond
+    ;; the bot's minions come first: their process-masks (kg-robot / enemy) would otherwise read as friends
+    ((or (= (-> arg0 type symbol) 'spydroid-ally)
+         (= (-> arg0 type symbol) 'sentinel-ally)
+         (= (-> arg0 type symbol) 'roboguard-ally)
+         (= (-> arg0 type symbol) 'bombbot-ally)
+         (= (-> arg0 type symbol) 'spy-bot-player)
+         )
+     *blast-bot-ally-hatred*
+     )
     ((logtest? (process-mask guard) (-> arg0 mask))
      0.5
      )

@@ -676,6 +676,14 @@ hurt Jak / the bot, and the 'deadly' sphere is switched off (the headbutt damage
               )
         )
       )
+    ;; the stock child spheres keep their 'deadly' action even with *spydroid-ally-child-prims* off: during the headbutt jump
+    ;; they hurt the bot / Jak on touch. The headbutt damage is sent by spydroid-ally-headbutt-update, so switch it off here.
+    (let ((c0 (-> grp child 0))
+          (c1 (-> grp child 1))
+          )
+      (logclear! (-> c0 prim-core action) (collide-action deadly))
+      (logclear! (-> c1 prim-core action) (collide-action deadly))
+      )
     (set! (-> cs nav-radius) *spydroid-ally-nav-radius*)
     ;; the leaf spheres do the real colliding, and *spydroid-ally-child-prims* leaves them alone, so give the solid body
     ;; sphere (child 1) the 'bot' bit on both sides: two droids then see each other and push apart.

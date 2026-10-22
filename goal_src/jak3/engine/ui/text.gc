@@ -175,6 +175,8 @@
     ((= arg0 (text-id progress-secrets-gun-upgrade-blue-2)) "Arc Wielder: Chain Companions")
     ((= arg0 (text-id progress-secrets-gun-upgrade-blue-3)) "Needle Lazer: +1 Roboguard")
     ((= arg0 (text-id progress-secrets-gun-upgrade-dark-1)) "Peace Maker: Split Bombs")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-dark-2)) "Mass Inverter: Lifesteal")
+    ((= arg0 (text-id progress-secrets-gun-upgrade-dark-3)) "Super Nova: Spy-Bot Invulnerable")
     ((= arg0 (text-id progress-secrets-board-fast)) "Turbo Jetboard in Desert")
     ((= arg0 (text-id progress-secrets-darkjak-tracking)) "Homing Attacks")
     ((= arg0 (text-id progress-secrets-button-invis)) "Spy-Bot Invisibility")

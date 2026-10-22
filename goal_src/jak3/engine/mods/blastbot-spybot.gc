@@ -8,6 +8,12 @@
 ;;   L2 (second press)  the blast bot is moved to the droid's position, the droid is removed and the camera goes back.
 ;;   If the droid is destroyed, or the bot is despawned, control simply goes back without moving the bot.
 ;;
+;; Jak's grab-ride goes from the bot to the droid while it is out (the droid carries him every frame) and back to the bot afterwards.
+;; Super Nova (purple 3, blastbot_guns.gc) also ends in a spy-bot: spybot-nova-start launches the same droid for the rest of the
+;; kamikaze's 10 s (Jak rides the droid, camera on it). It keeps Jak until the new blast bot has respawned and then hands him over,
+;; so Jak is never standing free in between.
+;; Purple 3 secret (gun-upgrade-dark-3): the droid is invulnerable for 3 s after you become a spy-bot (L2 and Super Nova).
+;;
 ;; LOAD ORDER: put this file LAST in your list (after blastbot-main-mod, blastbot_guns, spydroid-ally, roboguard-ally...)
 ;; because it uses the blast-bot-player and spydroid-ally types. blastbot-main-mod.gc calls spybot-toggle from the bot's own
 ;; :trans when L2 is pressed (declared there with define-extern).
@@ -27,8 +33,12 @@
 (define *spybot-wall-height* 5120.0)   ;; wall probe height above the feet (1.25 m): its bottom is 0.625 m up, so lips and steps lower than that are walked over
 (define *spybot-gravity* 163840.0)     ;; 40 m/s^2
 (define *spybot-spawn-dist* 0.0)       ;; spawns this far in front of the blast bot (0 = right at its centre)
+(define *spybot-invuln-time* 3.0)      ;; purple 3 secret: seconds of invulnerability after becoming a spy-bot
+(define *spybot-nova-fallback* 3.0)    ;; Super Nova: the droid keeps Jak until the new bot is there; if none shows up this long after the respawn time, it releases him
 
 (define-extern spybot-end (function symbol none))
+(define-extern spybot-nova-end (function none))
+(define *spybot-nova-active* #f)       ;; #t from the Super Nova until its droid is removed (L2 is ignored meanwhile)
 
 (define *spybot-box* (new 'global 'vector))
 (define *spybot-hits* (new 'global 'array 'collide-shape 64))
@@ -49,6 +59,11 @@
    (hurt-time  time-frame)  ;; last time an enemy attack was counted
    (hp         int32)
    (is-dead    int32)       ;; 0 = alive (a symbol field would read as truthy before init)
+   (invuln-until time-frame) ;; purple 3 secret: no damage before this time
+   (nova       int32)       ;; 1 = launched by the Super Nova (no blast bot is around, Jak is parked instead)
+   (nova-ready int32)       ;; Super Nova: 1 once the old bot is gone and Jak rides the droid, 2 = releasing Jak
+   (jak-held   int32)       ;; 1 = Jak is riding this droid (target-grab-ride) and it carries him
+   (nova-end   time-frame)  ;; Super Nova: fallback release time, only used when no new bot ever appears (while releasing: when it started)
    )
   (:state-methods
     active
@@ -275,10 +290,45 @@
   0
   )
 
+(defbehavior spybot-grant-invuln spy-bot-player ()
+  ;; purple 3 secret (gun-upgrade-dark-3): invulnerable for *spybot-invuln-time* seconds after becoming a spy-bot
+  (when (blast-bot-secret? gun-upgrade-dark-3)
+    (set! (-> self invuln-until) (+ (current-time) (the int (* *spybot-invuln-time* 300.0))))
+    )
+  0
+  )
+
 (defbehavior spybot-update spy-bot-player ()
-  (let ((dt (seconds-per-frame))
-        (speed (-> *cpad-list* cpads 0 stick0-speed))
+  ;; Super Nova droid: it stands still until the old blast bot is gone (despawn finished, Jak released). Then Jak grab-rides
+  ;; the droid (so the pad only drives the droid), the camera follows and zooms in on it, and the invulnerability starts.
+  (when (and (= (-> self nova) 1)
+             (zero? (-> self nova-ready))
+             (zero? *blast-bot-despawn-step*)
+             (not (blast-bot-find))
+             )
+    (set! (-> self nova-ready) 1)
+    (when *target*
+      (send-event *target* 'change-mode 'grab-ride #t)
+      (set! (-> self jak-held) 1)
+      )
+    (when *camera*
+      (send-event *camera* 'change-target self)
+      (let ((angle (* 182.04445 25.0))
+            (z *blast-bot-spy-cam-zoom*)
+            )
+        (set-setting! 'string-min-height 'abs (+ -4096.0 (* 61440.0 (sin angle) z)) 0)
+        (set-setting! 'string-max-height 'abs (+ 4096.0 (* 61440.0 (sin angle) z)) 0)
+        (set-setting! 'string-min-length 'abs (+ -4096.0 (* 61440.0 (cos angle) z)) 0)
+        (set-setting! 'string-max-length 'abs (+ 4096.0 (* 61440.0 (cos angle) z)) 0)
         )
+      (set-setting! 'immediate-string-min-max #f 0.0 0)
+      )
+    (spybot-grant-invuln)
+    )
+  (let* ((dt (seconds-per-frame))
+         (waiting (and (= (-> self nova) 1) (zero? (-> self nova-ready))))
+         (speed (if waiting 0.0 (-> *cpad-list* cpads 0 stick0-speed)))
+         )
     (case (-> self anim-mode)
       ((0)
        ;; walking / idle: the stick steers relative to the camera, the body turns to face the way it goes
@@ -313,7 +363,7 @@
            )
          )
        ;; Square: headbutt
-       (when (and (cpad-pressed? 0 square) (>= (current-time) (-> self hb-ready)))
+       (when (and (not waiting) (cpad-pressed? 0 square) (>= (current-time) (-> self hb-ready)))
          (set! (-> self anim-mode) 1)
          (set! (-> self hb-ready) (+ (current-time) (seconds 1.0)))
          (set! (-> self hb-id) (new-attack-id))
@@ -347,11 +397,50 @@
       )
     )
   (spybot-ground-update self)
+  ;; Jak rides along: his grab-ride follows the droid like it follows the bot
+  (when (and (nonzero? (-> self jak-held)) *target* (!= (-> self nova-ready) 2))
+    (move-to-point! (-> *target* control) (-> self root trans))
+    (when (and *blast-bot-clear-grabbed* (= (blast-bot-jak-state) 'target-grab-ride))
+      (logclear! (-> *target* focus-status) (focus-status grabbed ignore))
+      )
+    )
   (quaternion-vector-angle! (-> self root quat) *up-vector* (-> self yaw))
   ;; destroyed, or the bot is gone (despawned / killed): control goes back. This removes the droid, so it comes last.
-  (when (or (<= (-> self hp) 0) (not (blast-bot-find)))
-    (set! (-> self is-dead) 1)
-    (spybot-end #f)
+  ;; Super Nova droid: there is no bot while it lives; it ends when destroyed, when its time is up, or when a bot is back.
+  (cond
+    ((= (-> self nova) 1)
+     (cond
+       ((= (-> self nova-ready) 2)
+        ;; releasing: grab first, end-grab 0.1 s later (same two events as despawn-my-bombbot), then the droid goes
+        (when (>= (current-time) (+ (-> self nova-end) (seconds 0.1)))
+          (set! (-> self is-dead) 1)
+          (spybot-nova-end)
+          )
+        )
+       ((or (<= (-> self hp) 0)
+            (>= (current-time) (-> self nova-end))
+            (and (nonzero? (-> self nova-ready)) (blast-bot-find))
+            )
+        (cond
+          ((and (nonzero? (-> self jak-held)) *target* (not (blast-bot-find)) (= (blast-bot-jak-state) 'target-grab-ride))
+           (send-event *target* 'change-mode 'grab #t)
+           (set! (-> self nova-ready) 2)
+           (set-time! (-> self nova-end))
+           )
+          (else
+            (set! (-> self is-dead) 1)
+            (spybot-nova-end)
+            )
+          )
+        )
+       )
+     )
+    (else
+      (when (or (<= (-> self hp) 0) (not (blast-bot-find)))
+        (set! (-> self is-dead) 1)
+        (spybot-end #f)
+        )
+      )
     )
   0
   )
@@ -365,10 +454,11 @@
   :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
     (case message
       (('attack 'attack-invinc)
-       ;; enemy shots / swings: one hit point per 0.5 s at most
+       ;; enemy shots / swings: one hit point per 0.5 s at most (none while the purple 3 invulnerability runs)
        (when (and proc
                   (!= proc *target*)
                   (time-elapsed? (-> self hurt-time) (seconds 0.5))
+                  (>= (current-time) (-> self invuln-until))
                   )
          (set-time! (-> self hurt-time))
          (+! (-> self hp) -1)
@@ -394,7 +484,7 @@
 ;; Init
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defbehavior spy-bot-player-init-by-other spy-bot-player ((pos vector) (yaw float))
+(defbehavior spy-bot-player-init-by-other spy-bot-player ((pos vector) (yaw float) (nova int))
   ;; collision: the stock droid's shapes (a group with one body sphere), 'bot' so enemy shots can hit it
   (let ((cs (new 'process 'collide-shape-moving self (collide-list-enum usually-hit-by-player))))
     (set! (-> cs dynam) (copy *standard-dynamics* 'process))
@@ -440,13 +530,35 @@
   (set! (-> self hurt-time) 0)
   (set! (-> self hp) *spybot-hp*)
   (set! (-> self is-dead) 0)
+  (set! (-> self invuln-until) 0)
+  (set! (-> self nova) nova)
+  (set! (-> self nova-ready) 0)
+  (set! (-> self jak-held) 0)
+  (set! (-> self nova-end) 0)
   (set! (-> self cur-anim) 3)
   (ja-channel-set! 1)
   (ja :group! (-> self draw art-group data 3) :num! min)
   (format 0 "Spy bot: launched~%")
-  ;; the camera follows the droid; the bot (still idle) zooms it in (blast-bot-spy-cam-zoom)
-  (when *camera*
-    (send-event *camera* 'change-target self)
+  (cond
+    ((= nova 1)
+     ;; Super Nova: the droid lives until just before the new bot respawns. Camera, Jak and invulnerability follow in
+     ;; spybot-update once the old bot is gone.
+     (set! (-> self nova-end)
+           (+ (current-time) (the int (* (+ *blast-nova-respawn-time* *spybot-nova-fallback*) 300.0)))
+           )
+     (set! *spybot-nova-active* #t)
+     )
+    (else
+      ;; the camera follows the droid; the bot (still idle) zooms it in (blast-bot-spy-cam-zoom)
+      (when *camera*
+        (send-event *camera* 'change-target self)
+        )
+      ;; Jak is in the bot's grab-ride: the droid takes him over (carries him every frame) until spybot-end gives him back
+      (when *target*
+        (set! (-> self jak-held) 1)
+        )
+      (spybot-grant-invuln)
+      )
     )
   (go-virtual active)
   )
@@ -499,6 +611,11 @@
     (when (and sb bot summon)
       (spybot-summon bot sb)
       )
+    ;; Jak rides back: his grab-ride goes to the bot (after a summon the bot already stands at the droid, so he does not move).
+    ;; Without a bot he was already released by the despawn / death code.
+    (when (and sb bot (nonzero? (-> sb jak-held)) *target*)
+      (move-to-point! (-> *target* control) (-> bot root trans))
+      )
     (if sb
         (deactivate sb)
         )
@@ -517,9 +634,63 @@
   (none)
   )
 
+(defun spybot-nova-end ()
+  ;; Super Nova droid is over (destroyed, or a bot is back): Jak is released unless a bot has already taken him (then he is
+  ;; moved to it, the bot's grab-ride takes over), the camera goes back, the droid is removed (last, it may be the process running this).
+  (let ((sb (the-as spy-bot-player (spybot-find)))
+        (bot (blast-bot-find))
+        )
+    (set! *spybot-nova-active* #f)
+    (when (and sb (nonzero? (-> sb jak-held)) *target* (not bot))
+      (send-event *target* 'end-mode 'grab)
+      )
+    (when (and sb (nonzero? (-> sb jak-held)) *target* bot)
+      (move-to-point! (-> *target* control) (-> (the-as blast-bot-player bot) root trans))
+      )
+    (when *camera*
+      (cond
+        (bot
+          (send-event *camera* 'change-target bot)
+          )
+        (*target*
+          (send-event *camera* 'change-target *target*)
+          )
+        )
+      )
+    (format 0 "Spy bot: Super Nova droid removed~%")
+    (if sb
+        (deactivate sb)
+        )
+    )
+  (none)
+  )
+
+(defun spybot-nova-start ((owner process-drawable))
+  ;; Super Nova (blast-nova-spybot-start in blastbot_guns.gc): the droid appears where the exploding bot stood. No blast bot
+  ;; is involved, so this does not touch *blast-bot-spy-active*.
+  (when (not (spybot-find))
+    (let ((pos *spybot-pos*)
+          (yaw (quaternion-y-angle (-> owner root quat)))
+          )
+      (vector-copy! pos (-> owner root trans))
+      (+! (-> pos y) 4096.0)
+      (process-spawn spy-bot-player
+                     :init spy-bot-player-init-by-other pos yaw 1
+                     :name "spy-bot-player"
+                     :to *entity-pool*
+                     )
+      )
+    )
+  (none)
+  )
+
 (defun spybot-toggle ()
   ;; L2
   (cond
+    (*spybot-nova-active*
+      ;; the Super Nova droid is out: nothing to launch or summon
+      (format 0 "Spy bot: Super Nova droid is out~%")
+      )
     (*blast-bot-spy-active*
       (spybot-end #t)
       )
@@ -539,7 +710,7 @@
               (+! (-> pos y) 4096.0)
               (set! *blast-bot-spy-active* #t)
               (let ((sp (process-spawn spy-bot-player
-                                       :init spy-bot-player-init-by-other pos yaw
+                                       :init spy-bot-player-init-by-other pos yaw 0
                                        :name "spy-bot-player"
                                        :to *entity-pool*
                                        )

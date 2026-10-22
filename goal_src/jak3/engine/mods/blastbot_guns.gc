@@ -92,6 +92,9 @@
             )
           )
         (+! (-> *game-info* shots-hit 1) 1.0)
+        (if (as-type (ppointer->process (-> this parent)) blast-bot-player)
+            (blast-lifesteal-dealt f30-0 #f)   ;; only the bot's own shots, not Jak's real gun
+            )
         (send-event
           arg0
           'attack
@@ -128,6 +131,9 @@
       (when (and shot *target* *blast-bot-credit-shots*)
         (set! (-> (the-as guard-shot (ppointer->process shot)) owner-handle) (process->handle *target*))
         )
+      (if (and shot (-> this locked))
+          (blast-lifesteal-dealt *blast-lifesteal-cannon-damage* #f)   ;; Mass Inverter lifesteal: the cannon shot has a target
+          )
       )
     )
   (none)
@@ -640,7 +646,7 @@
 
 ;; ---- purple selection (same idea as red / yellow / blue) ----
 (define *blast-bot-purple-weapon* 1)      ;; 1 Peace Maker, 2 Mass Inverter, 3 Super Nova
-(define *blast-bot-purple-max* 2)         ;; highest purple level that is built (1 = Peace Maker, blastbot-ordnance.gc; 2 = Mass Inverter, bombbot-ally.gc)
+(define *blast-bot-purple-max* 3)         ;; highest purple level that is built (1 = Peace Maker, blastbot-ordnance.gc; 2 = Mass Inverter, bombbot-ally.gc; 3 = Super Nova, below)
 
 (defun blast-bot-purple-fix ()
   ;; keep *blast-bot-purple-weapon* on a built level Jak actually owns
@@ -1120,6 +1126,197 @@
   (none)
   )
 
+;; ---- Super Nova (purple 3): kamikaze ----
+;; Doc: you explode and kill everything within 100 m, and become a spy-bot for 10 seconds until your blast-bot respawns. One use
+;; before overheating. What happens:
+;;   0. R1 starts a *blast-nova-fuse-time* countdown (3 s). The bot stays fully controllable; if it dies meanwhile the nova is cancelled.
+;;   1. R1: a small director process (blast-nova) is spawned at the bot. When the fuse ends it does the blast: every valid target within
+;;      *blast-nova-radius* takes *blast-nova-damage* (same target rule as the Peace Maker: whatever the red / yellow / blue shots
+;;      hurt; never Jak, the bot or the allies), plus the explosion effects and a big camera shake.
+;;   2. the bot is removed the way L1 + Triangle does it (despawn-my-bombbot: Jak is released, then blast-bot-despawn-update, which
+;;      your mod code already calls every frame, deactivates the bot).
+;;   3. *blast-nova-respawn-time* seconds later the director calls spawn-my-bombbot (a new bot with full health) and dies.
+;; The spy-bot part lives in blastbot-spybot.gc (loaded after this file, hence the define-extern below): blast-nova-spybot-start
+;; launches the droid, which you drive until just before step 3. The purple 3 secret (invulnerable 3 s after becoming a
+;; spy-bot) is applied there as well.
+(define *blast-nova-damage* 1000.0)             ;; "kill everything"
+(define *blast-nova-radius* 409600.0)           ;; doc: 100 m
+(define *blast-nova-respawn-time* 10.0)         ;; doc: 10 s until the new bot (counted from the blast, not from R1)
+(define *blast-nova-fuse-time* 3.0)             ;; seconds between R1 and the explosion
+(define *blast-nova-fx-scale* 3.0)              ;; size of the stock huge explosion effect
+(define *blast-nova-handle* (the-as handle #f)) ;; the live director: only one kamikaze at a time
+(define *blast-nova-hits* (new 'global 'array 'collide-shape 256))
+(define *blast-nova-box* (new 'global 'vector))
+
+(deftype blast-nova (process-drawable)
+  ((spawn-time   time-frame)
+   (bot-handle   handle)
+   )
+  (:state-methods
+    fuse
+    active
+    die
+    )
+  )
+
+(defun blast-nova-blast ((owner process-drawable) (pos vector))
+  ;; every valid target within the radius takes one hit (one attack id for the whole blast)
+  (let ((box *blast-nova-box*)
+        (hits *blast-nova-hits*)
+        (id (new-attack-id))
+        (n 0)
+        )
+    (vector-copy! box pos)
+    (set! (-> box w) (+ *blast-nova-radius* 16384.0))
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 256))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (and (blast-bomb-valid-target? owner p)
+                       (< (vector-vector-distance pos (get-trans p 3)) (+ *blast-nova-radius* 4096.0))
+                       )
+              (+! n 1)
+              (send-event
+                p
+                'attack
+                #f
+                (static-attack-info ((id id)
+                                     (damage *blast-nova-damage*)
+                                     (vehicle-damage-factor 1.0)
+                                     (vehicle-impulse-factor 1.0)
+                                     (mode 'explode)
+                                     (attacker (blast-ord-attacker owner))
+                                     )
+                                    )
+                )
+              )
+            )
+          )
+        )
+      )
+    (format 0 "Super Nova: ~D targets hit~%" n)
+    )
+  (none)
+  )
+
+(define-extern spybot-nova-start (function process-drawable none))
+(defun blast-nova-spybot-start ((owner process-drawable))
+  ;; "become a spy-bot for 10 seconds": the droid from blastbot-spybot.gc, at the bot's position. It waits until the bot is
+  ;; gone, parks Jak, takes the camera and (purple 3 secret) is invulnerable for 3 s.
+  (spybot-nova-start owner)
+  (none)
+  )
+
+(defbehavior blast-nova-detonate blast-nova ((owner process-drawable) (pos vector))
+  ;; the explosion itself (fuse over): blast, effects, the bot goes away, the droid starts. The respawn timer starts here.
+  (vector-copy! (-> self root trans) pos)
+  (set-time! (-> self spawn-time))
+  (blast-nova-blast owner pos)
+  ;; the explosion: the stock huge explosion effect (visual only, the damage was dealt above) + the dark shot's burst
+  (when (and group-kg-huge-explosion (nonzero? group-kg-huge-explosion))
+    (let ((gp (new 'stack-no-clear 'explosion-init-params)))
+      (vector-copy! (-> gp spawn-point) pos)
+      (quaternion-identity! (-> gp spawn-quat))
+      (set! (-> gp radius) 61440.0)
+      (set! (-> gp scale) *blast-nova-fx-scale*)
+      (set! (-> gp group) group-kg-huge-explosion)
+      (set! (-> gp collide-with) (collide-spec))
+      (set! (-> gp damage) 0.0)
+      (set! (-> gp damage-scale) 1.0)
+      (set! (-> gp vehicle-damage-factor) 1.0)
+      (set! (-> gp vehicle-impulse-factor) 1.0)
+      (set! (-> gp ignore-proc) (process->handle #f))
+      (explosion-spawn gp self)
+      )
+    )
+  (vector-copy! (-> *launch-matrix* trans) pos)
+  (if (logtest? (-> group-gun-dark-shot-hit flags) (sp-group-flag sp13))
+      (part-tracker-spawn part-tracker-subsampler :to *entity-pool* :group group-gun-dark-shot-hit)
+      (part-tracker-spawn part-tracker :to *entity-pool* :group group-gun-dark-shot-hit)
+      )
+  (activate! *camera-smush-control* 2048.0 37 300 1.0 0.995 (-> self clock))
+  ;; the bot goes away and Jak is released (the L1 + Triangle despawn)
+  (despawn-my-bombbot)
+  (blast-nova-spybot-start owner)
+  0
+  )
+
+(defbehavior blast-nova-init-by-other blast-nova ((owner process-drawable) (pos vector))
+  (set! (-> self root) (new 'process 'trsqv))
+  (vector-copy! (-> self root trans) pos)
+  (set! (-> self bot-handle) (process->handle owner))
+  (set-time! (-> self spawn-time))
+  (format 0 "Super Nova: fuse lit (~f s)~%" *blast-nova-fuse-time*)
+  (go-virtual fuse)
+  )
+
+(defstate fuse (blast-nova)
+  :virtual #t
+  :trans (behavior ()
+    (let ((bot (the-as blast-bot-player (handle->process (-> self bot-handle)))))
+      (cond
+        ((or (not bot) (<= (-> bot health) 0.0))
+         (format 0 "Super Nova: cancelled, the bot is gone~%")
+         (deactivate self)
+         )
+        ((time-elapsed? (-> self spawn-time) (the int (* *blast-nova-fuse-time* 300.0)))
+         (let ((pos (new 'stack-no-clear 'vector)))
+           (vector-copy! pos (-> bot root trans))
+           (+! (-> pos y) 12288.0)
+           (blast-nova-detonate bot pos)
+           )
+         (go-virtual active)
+         )
+        )
+      )
+    )
+  :code sleep-code
+  )
+
+(defstate active (blast-nova)
+  :virtual #t
+  :enter (behavior ()
+    (set-time! (-> self state-time))
+    )
+  :trans (behavior ()
+    (if (time-elapsed? (-> self spawn-time) (the int (* *blast-nova-respawn-time* 300.0)))
+        (go-virtual die)
+        )
+    )
+  :code sleep-code
+  )
+
+(defstate die (blast-nova)
+  :virtual #t
+  :code (behavior ()
+    (format 0 "Super Nova: respawning the bot~%")
+    ;; Jak is still riding the spy droid (grab-ride). Same step spawn-my-bombbot takes when an old bot exists: grab first, so the
+    ;; new bot's own grab-ride request takes him over. The droid hands him over and goes once the bot is there.
+    (when (and *target* (= (blast-bot-jak-state) 'target-grab-ride))
+      (send-event *target* 'change-mode 'grab #t)
+      )
+    (spawn-my-bombbot)
+    (deactivate self)
+    )
+  )
+
+(defun blast-bot-fire-supernova ((this blast-bot-player))
+  (let ((pos (new 'stack-no-clear 'vector)))
+    (vector-copy! pos (-> this root trans))
+    (+! (-> pos y) 12288.0)
+    (let ((p (process-spawn blast-nova
+                            :init blast-nova-init-by-other this pos
+                            :name "blast-nova"
+                            :to *entity-pool*
+                            )))
+      (if p
+          (set! *blast-nova-handle* (process->handle (ppointer->process p)))
+          )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-purple-arsenal ((this blast-bot-player))
   (case *blast-bot-purple-weapon*
     ((2)
@@ -1127,6 +1324,12 @@
      ;; spent while one is already alive.
      (when (and (< (bombbot-ally-count) *bombbot-ally-max*) (blast-bot-heat-try-use 1.0))
        (bombbot-ally-launch this)
+       )
+     )
+    ((3)
+     ;; Super Nova: the kamikaze. One use before overheating; nothing is spent while one is already going off.
+     (when (and (not (handle->process *blast-nova-handle*)) (blast-bot-heat-try-use 1.0))
+       (blast-bot-fire-supernova this)
        )
      )
     (else
@@ -1188,6 +1391,7 @@
 ;;   gun-upgrade-blue-1 Vulcan Fury     : ramps to a faster fire rate
 ;;   gun-upgrade-blue-3 Needle Lazer    : +1 roboguard (1 -> 2)
 ;;   gun-upgrade-dark-1 Peace Maker     : each bomb splits into 3 smaller bombs, no impact splash (blastbot-ordnance.gc)
+;;   gun-upgrade-dark-2 Mass Inverter   : lifesteal both ways between the bot and the allied bombbot (bombbot-ally.gc)
 ;;   endless-ammo (cheat)               : weapons never overheat
 ;;   invulnerable (cheat)               : *blast-bot-god-mode* (blastbot-main-mod.gc), the bot ignores all damage
 (define *blast-bot-secrets-debug* #f)   ;; #t: print the upgrade set whenever it changes
@@ -1228,6 +1432,10 @@
   ;; blue
   (set! *blast-bot-blue-fast* (if (blast-bot-secret? gun-upgrade-blue-1) *blast-bot-blue-fast-upgraded* 0.05))
   (set! *roboguard-ally-count* (if (blast-bot-secret? gun-upgrade-blue-3) 2 1))
+  ;; purple 2: Mass Inverter lifesteal (gun-upgrade-dark-2). Only ever turns ON, like god mode.
+  (when (blast-bot-secret? gun-upgrade-dark-2)
+    (set! *blast-lifesteal* #t)
+    )
   ;; purple 1: Peace Maker bombs split into 3 smaller ones without splash (blast-bomb-launch)
   (set! *blast-bomb-split* (blast-bot-secret? gun-upgrade-dark-1))
   ;; yellow 1: Blaster auto-mode (the switch itself is blast-bot-auto-toggle). Like god mode these only ever turn ON, so the
@@ -1379,8 +1587,23 @@
   (none)
   )
 
+(defun blast-bot-lifesteal-apply ((this blast-bot-player))
+  ;; Mass Inverter lifesteal: heal the bot with what the allied bombbot has dealt since last frame
+  (when *blast-lifesteal*
+    (when (zero? (bombbot-ally-count))
+      (set! *blast-lifesteal-to-ally* 0.0)     ;; nothing is banked for an ally that is not there
+      )
+    (when (and (< 0.0 *blast-lifesteal-to-bot*) (< 0.0 (-> this health)))
+      (set! (-> this health) (fmin (-> this max-health) (+ (-> this health) *blast-lifesteal-to-bot*)))
+      )
+    )
+  (set! *blast-lifesteal-to-bot* 0.0)
+  (none)
+  )
+
 (defun blast-bot-fire-input ((this blast-bot-player))
   (blast-bot-secrets-apply)
+  (blast-bot-lifesteal-apply this)
   (blast-bot-auto-toggle)
   (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2)
                    (!= *blast-bot-blue-weapon* 2) (!= *blast-bot-blue-weapon* 3)))

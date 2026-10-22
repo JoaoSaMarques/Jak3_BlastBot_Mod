@@ -82,6 +82,27 @@
 (define *bombbot-ally-laser-width* 1228.8)
 (define *bombbot-ally-laser-width-rand* 819.2)
 (define *bombbot-ally-debug* #t)                 ;; #t: print launches, landings, target changes (set to #f once it works)
+;; ---- Mass Inverter secret (menu entry "Mass Inverter: Lifesteal", bit gun-upgrade-dark-2): lifesteal both ways ----
+;; Any damage the player's bot deals heals the allied bombbot, and any damage the allied bombbot deals heals the player's bot.
+;; Everything that hurts something calls blast-lifesteal-dealt; the heal is banked here and paid out by whoever receives it
+;; (the ally in bombbot-ally-update, the bot in blast-bot-lifesteal-apply in blastbot_guns.gc).
+(define *blast-lifesteal* #f)                    ;; #t once the secret is bought (blast-bot-secrets-apply). REPL: (set! *blast-lifesteal* #t) to test
+(define *blast-lifesteal-ratio* 1.0)             ;; health healed per point of damage dealt (both bots have 100 health)
+(define *blast-lifesteal-cannon-damage* 2.0)     ;; damage credited per cannon shot fired at a locked target (the cannon is a stock projectile, so its hit can't be seen)
+(define *blast-lifesteal-to-ally* 0.0)           ;; banked heal for the ally
+(define *blast-lifesteal-to-bot* 0.0)            ;; banked heal for the player's bot
+
+(defun blast-lifesteal-dealt ((dmg float) (by-ally symbol))
+  ;; by-ally #f: the player's bot dealt dmg, so the ally gets healed. #t: the ally dealt it, so the bot gets healed.
+  (when (and *blast-lifesteal* (< 0.0 dmg))
+    (if by-ally
+        (+! *blast-lifesteal-to-bot* (* dmg *blast-lifesteal-ratio*))
+        (+! *blast-lifesteal-to-ally* (* dmg *blast-lifesteal-ratio*))
+        )
+    )
+  (none)
+  )
+
 
 ;; Own 1-slot dead-pool: a plain dead-pool never compacts, so the ally is never MOVED in memory (same reason the player bot
 ;; spawns from *16k-dead-pool*). The bot holds the single 16k slot, so the ally needs its own.
@@ -731,6 +752,7 @@
                        (< (vector-vector-xz-distance (-> this root trans) (-> p root trans))
                           (+ *bombbot-ally-land-radius* (-> p root nav-radius)))
                        )
+              (blast-lifesteal-dealt *bombbot-ally-land-damage* #t)
               (send-event p 'attack #f
                           (static-attack-info ((id atk-id)
                                                (damage *bombbot-ally-land-damage*)
@@ -1044,6 +1066,7 @@
                 (set! (-> this burst-left) *bombbot-ally-burst*)
                 )
               (bombbot-ally-shoot this)
+              (blast-lifesteal-dealt *blast-lifesteal-cannon-damage* #t)
               (+! (-> this burst-left) -1)
               (set! (-> this next-shoot)
                     (+ (current-time)
@@ -1151,6 +1174,11 @@
   )
 
 (defun bombbot-ally-update ((this bombbot-ally))
+  ;; Mass Inverter lifesteal: pay out what the player's bot has dealt since last frame
+  (when (and (< 0.0 *blast-lifesteal-to-ally*) (< 0.0 (-> this health)))
+    (set! (-> this health) (fmin (-> this max-health) (+ (-> this health) *blast-lifesteal-to-ally*)))
+    (set! *blast-lifesteal-to-ally* 0.0)
+    )
   (let ((addr (the-as int this)))
     (when (!= addr *bombbot-ally-last-addr*)
       (format 0 "bombbot ally: process now at #x~X~%" addr)

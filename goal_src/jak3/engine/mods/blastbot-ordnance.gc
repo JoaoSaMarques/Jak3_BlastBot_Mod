@@ -205,6 +205,7 @@
                        (< (vector-vector-distance pos (get-trans p 3)) (+ *blast-missile-radius* 4096.0))
                        )
               (+! n 1)
+              (blast-lifesteal-dealt *blast-missile-damage* #f)
               (send-event
                 p
                 'attack
@@ -648,6 +649,7 @@
               )
          )
     (when (blast-arc-covers-pos? c rad a0 stp)
+      (blast-lifesteal-dealt *blast-arc-damage* #f)
       (send-event
         p
         'attack
@@ -803,6 +805,7 @@
                          )
                     )
                 (when (< (blast-chain-seg-dist (get-trans p 3) a b) (+ *blast-chain-reach* rad))
+                  (blast-lifesteal-dealt *blast-arc-damage* #f)
                   (send-event
                     p
                     'attack
@@ -1143,6 +1146,7 @@
     (when (and (not seen) (< (-> this hit-count) 24))
       (set! (-> this hits (-> this hit-count)) key)
       (+! (-> this hit-count) 1)
+      (blast-lifesteal-dealt (-> this damage) #f)
       (send-event
         p
         'attack
@@ -1222,12 +1226,32 @@
   (none)
   )
 
+;; Every wave redraws its whole ring EVERY frame (2 rows x segments x 2 beams = 144 draw-beam calls for one wave), and each
+;; call spends a particle. When a second bomb landed while the first wave was still growing (the split upgrade lands three
+;; at once) the ring particles plus the explosion's burst ran the particle pool dry and the rings vanished. Nothing in
+;; the code removes a wave early; this budget is the fix: all live waves share *blast-bomb-ring-budget* beams per frame,
+;; so one wave looks exactly as before and each extra wave gets fewer, longer segments instead of disappearing.
+(define *blast-bomb-ring-budget* 144)            ;; draw-beam calls per frame for ALL shockwaves together. 9999 = the old behaviour
+(define *blast-bomb-wave-stamp* (the-as time-frame -1))
+(define *blast-bomb-wave-now* 0)                 ;; waves that drew this frame so far
+(define *blast-bomb-wave-last* 1)                ;; waves that drew last frame
+
+(defun blast-bomb-ring-segs-now ()
+  (when (!= *blast-bomb-wave-stamp* (current-time))
+    (set! *blast-bomb-wave-last* (max 1 *blast-bomb-wave-now*))
+    (set! *blast-bomb-wave-now* 0)
+    (set! *blast-bomb-wave-stamp* (current-time))
+    )
+  (+! *blast-bomb-wave-now* 1)
+  (max 8 (min *blast-bomb-ring-segs* (/ *blast-bomb-ring-budget* (* 4 *blast-bomb-wave-last*))))
+  )
+
 (defun blast-bomb-draw-ring ((this blast-peace-wave) (r float))
   ;; two crackling rings (low and a little higher) of short beam segments, glow + core
   (let ((prev *blast-bomb-prev*)
         (cur *blast-bomb-cur*)
         (seg *blast-bomb-seg*)
-        (n *blast-bomb-ring-segs*)
+        (n (blast-bomb-ring-segs-now))
         )
     (dotimes (row 2)
       (let ((y (+ (-> this center y) 2048.0 (* 6144.0 (the float row)))))
