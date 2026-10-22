@@ -91,7 +91,7 @@
   )
 
 (defun spybot-valid-target? ((this spy-bot-player) (p process-focusable))
-  ;; what the headbutt may hit: enemies, crimson guards, metalheads, kg robots. Not Jak, not the bot, not the allies.
+  ;; what the headbutt may hit: enemies, crimson guards, metalheads, kg robots, crates / breakable obstacles. Not Jak, not the bot, not the allies.
   (and p
        (!= this p)
        (!= p *target*)
@@ -100,8 +100,8 @@
        (not (type? p blast-bot-player))
        (not (focus-test? p inactive))
        (not (blast-target-dead? p))
-       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
-       (not (logtest? (process-mask crate civilian) (-> p mask)))
+       (logtest? (process-mask enemy guard metalhead kg-robot crate) (-> p mask))
+       (not (logtest? (process-mask civilian) (-> p mask)))
        (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))
        )
   )
@@ -254,19 +254,29 @@
                          (< (fabs (- (-> p root trans y) (-> this root trans y))) 16384.0)
                          )
                 (set-time! (-> this hb-hit))
-                (send-event p 'attack #f
-                            (static-attack-info :mask (vehicle-impulse-factor) ((id (-> this hb-id))
-                                                                                (damage *spybot-damage*)
-                                                                                (vehicle-damage-factor 1.0)
-                                                                                (vehicle-impulse-factor 1.0)
-                                                                                (mode 'shock)
-                                                                                (attacker (if *target*
-                                                                                              (process->handle *target*)
-                                                                                              (process->handle this)
-                                                                                              ))
-                                                                                )
-                                                )
-                            )
+                (if (logtest? (process-mask crate) (-> p mask))
+                    ;; crates / breakable obstacles only react to attacks that carry penetrate flags (same as the bot's legs)
+                    (send-event p 'attack #f
+                                (static-attack-info :mask (penetrate-using)
+                                                    ((id (-> this hb-id))
+                                                     (damage *spybot-damage*)
+                                                     (mode 'explode)
+                                                     (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
+                                                     )))
+                    (send-event p 'attack #f
+                                (static-attack-info :mask (vehicle-impulse-factor) ((id (-> this hb-id))
+                                                                                    (damage *spybot-damage*)
+                                                                                    (vehicle-damage-factor 1.0)
+                                                                                    (vehicle-impulse-factor 1.0)
+                                                                                    (mode 'shock)
+                                                                                    (attacker (if *target*
+                                                                                                  (process->handle *target*)
+                                                                                                  (process->handle this)
+                                                                                                  ))
+                                                                                    )
+                                                    )
+                                )
+                    )
                 )
               )
             )
@@ -466,6 +476,35 @@
   (none)
   )
 
+;; Fallback that does not rely on the touch system at all: look for collectables around the droid and hit them with the same
+;; 'attack the 'touched handler sends (a pickup answers 'attack with 'get-pickup, handled in the state below).
+(defun spybot-collect ((this spy-bot-player))
+  (let ((box *spybot-box*)
+        (hits *spybot-hits*)
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) (+ *spybot-pickup-radius* 8192.0))
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) collectable)))
+            (when (and p (< (vector-vector-distance (-> this root trans) (-> cs trans)) (+ *spybot-pickup-radius* 2048.0)))
+              (send-event p 'attack #f
+                          (static-attack-info :mask (penetrate-using)
+                                              ((id (new-attack-id))
+                                               (damage 1.0)
+                                               (mode 'explode)
+                                               (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
+                                               )))
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
 (defstate active (spy-bot-player)
   :virtual #t
   :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
@@ -516,6 +555,7 @@
   :trans (behavior ()
     (spybot-update)
     (spybot-touch self)
+    (spybot-collect self)
     )
   :code sleep-code
   :post (behavior ()
