@@ -1863,6 +1863,66 @@
   (none)
   )
 
+;; ---- Vehicles bump into the bot like a wall ----
+;; The vehicles' own collision never treats the bot as solid, so do it with their 'apply-impulse event (the same one the
+;; engine uses for explosions): a vehicle that overlaps the bot and moves toward it gets its velocity reflected, and one that
+;; sits inside the bot is pushed out gently. Applied at the vehicle's centre so it does not spin.
+(define *blast-bot-vehicle-wall* #t)
+(define *blast-bot-wall-radius* 20480.0)    ;; bot footprint, 5 m
+(define *blast-bot-wall-veh-scale* 0.5)     ;; vehicle footprint = this * its root sphere radius
+(define *blast-bot-wall-bounce* 0.5)        ;; 0 = dead stop, 1 = full rebound
+(define *blast-bot-wall-min-out* 20480.0)    ;; vehicles inside the bot always leave at least this fast (5 m/s)
+(define *blast-bot-wall-mass* 50.0)          ;; stand-in for the vehicle's mass (the vehicle type is not visible from the mods folder): impulse = mass * speed change
+(define *blast-bot-wall-box* (new 'global 'vector))
+(define *blast-bot-wall-hits* (new 'global 'array 'collide-shape 32))
+
+(defun blast-bot-vehicle-wall ((this blast-bot-player))
+  (when *blast-bot-vehicle-wall*
+    (let ((box *blast-bot-wall-box*)
+          (hits *blast-bot-wall-hits*)
+          )
+      (vector-copy! box (-> this root trans))
+      (set! (-> box w) 61440.0)
+      (countdown (i (fill-actor-list-for-box *actor-hash* box hits 32))
+        (let ((cs (as-type (-> hits i) collide-shape)))
+          (when cs
+            (let ((v (as-type (-> cs process) process-focusable)))
+              (when (and v
+                         (logtest? (process-mask vehicle) (-> v mask))
+                         (not (focus-test? v dead))
+                         )
+                (let ((n (new 'stack-no-clear 'vector))
+                      (imp (new 'stack-no-clear 'vector))
+                      )
+                  (vector-! n (-> v root trans) (-> this root trans))
+                  (set! (-> n y) 0.0)
+                  (let ((dist (vector-length n))
+                        (reach (+ *blast-bot-wall-radius* (* *blast-bot-wall-veh-scale* (-> v root root-prim local-sphere w))))
+                        )
+                    (when (and (< 1.0 dist) (< dist reach))
+                      (vector-float*! n n (/ 1.0 dist))
+                      ;; n points from the bot to the vehicle, so a vehicle driving into the bot has a negative vn
+                      (let ((vn (vector-dot (-> (the-as collide-shape-moving (-> v root)) transv) n)))
+                        (when (< vn *blast-bot-wall-min-out*)
+                          (let ((dv (- (fmax *blast-bot-wall-min-out* (* (- *blast-bot-wall-bounce*) vn)) vn)))
+                            (vector-float*! imp n (* dv *blast-bot-wall-mass*))
+                            (send-event v 'apply-impulse (-> v root trans) imp)
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-ride-update ((this blast-bot-player))
   ;; Elevators / platforms learn that someone stands on them from a 'ridden event with a rider of type target
   ;; (elevator.gc), so look for a platform under the feet and send it 'ridden ourselves with Jak as the rider.
@@ -2391,6 +2451,7 @@
     (blast-bot-absorb-push self)
     (blast-bot-jump-update self)
     (blast-bot-hazard-check self)
+    (blast-bot-vehicle-wall self)
     ;; L2: launch the spy droid / summon the bot to it (blastbot-spybot.gc). Handled here, in the bot's own state, so it does
     ;; not depend on how your mod code calls blast-bot-pad-check.
     (when (cpad-pressed? 0 l2)
