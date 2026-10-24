@@ -321,7 +321,7 @@
                     (-> cs process type)
                     (-> cs process mask)
                     (vector-vector-distance center (-> cs trans))
-                    (if (logtest? (process-mask enemy guard metalhead kg-robot) (-> cs process mask)) "ENEMY" "-")
+                    (if (logtest? (process-mask enemy guard metalhead kg-robot vehicle) (-> cs process mask)) "ENEMY" "-")
                     )
             )
           )
