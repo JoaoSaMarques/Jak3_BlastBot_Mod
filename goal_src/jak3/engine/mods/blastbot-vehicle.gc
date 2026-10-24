@@ -1,0 +1,996 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: blastbot-vehicle.gc
+;; name in dgo: blastbot-vehicle
+;; dgos: GAME
+
+;; The Blast Bot's vehicle code, moved out of blastbot-main-mod.gc unchanged: merging with / riding a vehicle (the merge
+;; stages, the camera and hud handling, the vehicle-mission checks, the ride) and the "vehicles bump into the bot like a wall"
+;; code. Compiled AFTER blastbot-main-mod.o (needs the blast-bot-player type and blast-bot-jak-state from there) and before
+;; blastbot_guns.o / blastbot-spybot.o. blastbot-main-mod.gc reaches it through the define-extern lines at the place where
+;; this code used to be.
+;;
+;; NOTE: the vehicle wall has its own radius, *blast-bot-vehicle-wall-radius*. It used to share the name *blast-bot-wall-radius* with the
+;; bot's own wall sweep (blastbot-main-mod.gc); this file loads later, so this value silently replaced the sweep's one.
+
+
+;; ---- Vehicle merge ----
+;; Triangle near a vehicle: Jak really mounts it (so missions see a normal pilot: 'get-vehicle, current-vehicle, seats for
+;; NPCs) and is then held in target-pilot-grab, which makes the vehicle ignore the pad. The vehicle is then placed under the
+;; bot every frame, so it travels with the bot. Triangle again: Jak gets off and the regrab watchdog puts him back in the bot.
+;; Only rigid-body-object is used (rigid-body-h is in the main game group), never the vehicle type itself.
+;; stage: 0 none | 6 release Jak from the bot's grab | 7 wait for target-stance | 1 mount requested | 2 pilot-grab requested | 3 merged | 4 leaving (grab ended) | 5 get-off sent
+(define *blast-bot-merge-stage* 0)
+;; NOTE: a handle is 64 bits and a global symbol only keeps 32, so the vehicle is kept as a process pointer instead
+(define *blast-bot-merge-pp* (the-as (pointer process) #f))
+(define *blast-bot-merge-time* 0)
+(define *blast-bot-merge-range* 61440.0)     ;; how far away a vehicle can be picked up (15 m)
+(define *blast-bot-merge-y-offset* 12288.0)  ;; raise / lower the vehicle under the bot (12288 = 3 m)
+(define *blast-bot-merge-invisible* #t)      ;; #t: the merged vehicle (and its wheels / child parts) is not drawn
+(define *blast-bot-merge-cam-time* 0)        ;; last time the camera was re-pointed at the bot while merged
+(define *blast-bot-merge-ride* #f)            ;; the current merge is a ride (set when the merge starts)
+(define *blast-bot-merge-box* (new 'global 'vector))
+(define *blast-bot-merge-hits* (new 'global 'array 'collide-shape 32))
+
+(defun blast-bot-pilot-state? ((st object))
+  (or (= st 'target-pilot-start) (= st 'target-pilot-stance) (= st 'target-pilot-get-on) (= st 'target-pilot-get-off)
+      (= st 'target-pilot-grab) (= st 'target-pilot-impact) (= st 'target-pilot-hit) (= st 'target-pilot-death)
+      (= st 'target-pilot-clone-anim) (= st 'target-pilot-edge-grab) (= st 'target-pilot-daxter-perch))
+  )
+
+(defun blast-bot-merge-vehicle ()
+  ;; the vehicle we are merged with (or about to), #f if there is none or it is gone
+  (if *blast-bot-merge-pp*
+      (as-type (ppointer->process *blast-bot-merge-pp*) rigid-body-object)
+      #f
+      )
+  )
+
+(defun blast-bot-merge-find ((this blast-bot-player))
+  ;; nearest living vehicle within range, or #f
+  (let ((box *blast-bot-merge-box*)
+        (hits *blast-bot-merge-hits*)
+        (best (the-as process #f))
+        (best-d 0.0)
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) *blast-bot-merge-range*)
+    (countdown (i (fill-actor-list-for-box *actor-hash* box hits 32))
+      (let ((cs (as-type (-> hits i) collide-shape)))
+        (when cs
+          (let ((v (as-type (-> cs process) rigid-body-object)))
+            (when (and v
+                       (logtest? (process-mask vehicle) (-> v mask))
+                       (not (focus-test? v dead))
+                       ;; the wheels are separate rigid-body-object processes with the vehicle mask: not mountable
+                       (not (string= (-> v name) "vehicle-wheel"))
+                       (not (string= (-> v name) "wvehicle-wheel"))
+                       )
+              (let ((d (vector-vector-xz-distance (-> this root trans) (-> cs trans))))
+                (when (and (< d *blast-bot-merge-range*) (or (not best) (< d best-d)))
+                  (set! best v)
+                  (set! best-d d)
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    best
+    )
+  )
+
+;; hide / show a vehicle and every child process that has a draw-control (wheels, turrets, attachments)
+(defun blast-bot-set-no-draw ((d draw-control) (hide symbol))
+  (when (nonzero? d)
+    (if hide
+        (logior! (-> d status) (draw-control-status no-draw))
+        (logclear! (-> d status) (draw-control-status no-draw))
+        )
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-set-hidden ((v rigid-body-object) (hide symbol))
+  (blast-bot-set-no-draw (-> v draw) hide)
+  (let ((p (-> v child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (pd (as-type (-> p 0) process-drawable))
+            )
+        (if pd
+            (blast-bot-set-no-draw (-> pd draw) hide)
+            )
+        (set! p next)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-follow ((this blast-bot-player) (v rigid-body-object))
+  ;; put the vehicle under the bot, same heading, and stop it from moving on its own
+  (when (nonzero? (-> v rbody))
+    (let ((rb (-> v rbody)))
+      (vector-copy! (-> rb position) (-> this root trans))
+      (+! (-> rb position y) *blast-bot-merge-y-offset*)
+      (quaternion-copy! (-> rb rotation) (-> this root quat))
+      (quaternion->matrix (-> rb matrix) (-> rb rotation))
+      (vector-copy! (-> rb matrix trans) (-> rb position))
+      (vector-reset! (-> rb lin-velocity))
+      (vector-reset! (-> rb ang-velocity))
+      (vector-reset! (-> rb lin-momentum))
+      (vector-reset! (-> rb ang-momentum))
+      (vector-reset! (-> rb force))
+      (vector-reset! (-> rb torque))
+      )
+    (vector-reset! (-> v root transv))
+    )
+  (if *blast-bot-merge-invisible*
+      (blast-bot-merge-set-hidden v #t)
+      )
+  (none)
+  )
+
+(define *blast-bot-merge-cam-debug* #f)       ;; #t: once a second, while merged, print what the camera is really using to the console
+
+(defun blast-bot-merge-cam-debug ()
+  (when (and *blast-bot-merge-cam-debug* *camera* (>= (current-time) (+ *blast-bot-merge-cam-time* (seconds 1.0))))
+    (set! *blast-bot-merge-cam-time* (current-time))
+    (let ((st (-> *camera* settings)))
+      (format 0 "MergeCam: focus ~A | slave-opt #x~X master-opt #x~X | mode ~A | butt ~A~%"
+              (handle->process (-> *camera* focus handle))
+              (the-as int (-> st slave-options))
+              (the-as int (-> st master-options))
+              (-> st mode-name)
+              (handle->process (-> st butt-handle))
+              )
+      (format 0 "MergeCam: string len ~f..~f height ~f..~f~%"
+              (-> st string-min-length) (-> st string-max-length) (-> st string-min-height) (-> st string-max-height)
+              )
+      (format 0 "MergeCam: fov ~f extra-follow ~f interp ~f | slave state ~A~%"
+              (-> st fov) (-> st extra-follow-height) (-> st interp-time)
+              (if (and (-> *camera* slave 0) (-> *camera* slave 0 next-state)) (-> *camera* slave 0 next-state name) #f)
+              )
+      )
+    )
+  (none)
+  )
+
+(defbehavior blast-bot-merge-camera blast-bot-player ()
+  ;; While Jak is pilot-grabbed the vehicle keeps setting its own close-up camera settings. Removing the bot's camera
+  ;; string settings and setting them again every frame makes them the newest entries, so the bot's camera wins.
+  (let ((angle (* 182.04445 25.0))
+        (z (-> self cam-zoom))
+        )
+    (remove-setting! 'string-min-height)
+    (remove-setting! 'string-max-height)
+    (remove-setting! 'string-min-length)
+    (remove-setting! 'string-max-length)
+    (set-setting! 'string-min-height 'abs (+ -4096.0 (* 61440.0 (sin angle) z)) 0)
+    (set-setting! 'string-max-height 'abs (+ 4096.0 (* 61440.0 (sin angle) z)) 0)
+    (set-setting! 'string-min-length 'abs (+ -4096.0 (* 61440.0 (cos angle) z)) 0)
+    (set-setting! 'string-max-length 'abs (+ 4096.0 (* 61440.0 (cos angle) z)) 0)
+    )
+  ;; 'change-target runs reset-target-tracking (snaps the follow point, pitch and string), so only send it when the camera
+  ;; is really not on the bot
+  (when (and *camera* (!= (handle->process (-> *camera* focus handle)) self))
+    (format 0 "Blast Bot: camera was on ~A, putting it back on the bot~%" (handle->process (-> *camera* focus handle)))
+    (send-event *camera* 'change-target self)
+    )
+  (blast-bot-merge-cam-debug)
+  (none)
+  )
+
+;; The vehicle's own camera code (vehicle-method-94: string lengths, fov, look mode, max-angle-offset) only runs while
+;; vehicle-flag camera (bit 30) is set in its v-flags, which overlays rigid-body-object's 'flags' (the vehicle type itself
+;; is not visible from the mods folder, so the bits are cleared through a raw pointer). Bit 32 is camera-look-mode.
+;; While merged both are cleared every frame so the vehicle never touches the camera; they are given back on unmerge.
+;; Camera: BIKE_MODE (the camera pushes itself back behind the target's heading, ignores right-stick pitch) and RAPID_TRACKING
+;; are the vehicle camera. They are switched on through the vehicle's own settings; here the vehicle's camera settings are
+;; removed from its process every frame, its camera flags (28 bike-mode, 29 rapid-tracking, 30 camera, 32 look-mode) are
+;; cleared, and a top-priority (engine-hi, applied last) 'slave-options clear BIKE_MODE|RAPID_TRACKING is held while merged.
+(define *blast-bot-merge-cam-bits* (the-as uint 0))
+(define *blast-bot-merge-wipe-vehicle-settings* #f)  ;; #t: remove ALL of the vehicle's settings every frame (can make the vehicle hud flicker)
+(define *blast-bot-merge-cam-hi* #f)
+(define *blast-bot-merge-jak-hid* #f)
+
+
+;; ---- Ride mode: the car's collision spheres are made smaller, and its lights go out ----
+;; The car is invisible and the bot sits on it, but the car's collision spheres still stick out in front of the bot. While riding
+;; every sphere of the car's collision shape is shrunk by *blast-bot-ride-shrink* (4096 = 1 m; never below 40 % of its radius).
+;; The original radii are stored and given back when the ride ends. (The mesh part of the shape cannot be scaled.)
+(define *blast-bot-ride-shrink* 4096.0)      ;; every collision sphere of the car gets this much smaller (4096 = 1 m, never below 40 % of its radius)
+(define *blast-bot-ride-pull* 0.3)           ;; ... and its centre is pulled this far toward the car's middle (x / z only; 1.0 = leave it, 0.0 = middle)
+(define *blast-bot-ride-hb-on* #f)
+(define *blast-bot-ride-hb-debug* #f)        ;; #t: print every sphere that is changed (game units, 4096 = 1 m)
+(define *blast-bot-ride-hb-i* 0)
+(define *blast-bot-ride-hb-orig* (new 'global 'boxed-array float 96))   ;; per sphere: radius, x, z
+(define *blast-bot-ride-lights-was* #f)
+
+(defun blast-bot-ride-hitbox-on ((v rigid-body-object))
+  (when (and (not *blast-bot-ride-hb-on*) (or (< 0.0 *blast-bot-ride-shrink*) (< *blast-bot-ride-pull* 1.0)))
+    (set! *blast-bot-ride-hb-i* 0)
+    (iterate-prims
+      (-> v root)
+      (lambda ((arg0 collide-shape-prim))
+        (when (and (= (-> arg0 prim-core prim-type) -1) (< *blast-bot-ride-hb-i* 32))
+          (let ((r (-> arg0 local-sphere w))
+                (x (-> arg0 local-sphere x))
+                (z (-> arg0 local-sphere z))
+                (k (* 3 *blast-bot-ride-hb-i*))
+                )
+            (set! (-> *blast-bot-ride-hb-orig* k) r)
+            (set! (-> *blast-bot-ride-hb-orig* (+ k 1)) x)
+            (set! (-> *blast-bot-ride-hb-orig* (+ k 2)) z)
+            (set! (-> arg0 local-sphere w) (fmax (* 0.4 r) (- r *blast-bot-ride-shrink*)))
+            (set! (-> arg0 local-sphere x) (* x *blast-bot-ride-pull*))
+            (set! (-> arg0 local-sphere z) (* z *blast-bot-ride-pull*))
+            (if *blast-bot-ride-hb-debug*
+                (begin
+                  (format 0 "Blast Bot: hitbox sphere ~D: radius ~f -> ~f~%" *blast-bot-ride-hb-i* r (-> arg0 local-sphere w))
+                  (format 0 "Blast Bot: hitbox sphere ~D: centre x ~f z ~f -> x ~f z ~f~%"
+                          *blast-bot-ride-hb-i* x z (-> arg0 local-sphere x) (-> arg0 local-sphere z))
+                  )
+                )
+            )
+          (+! *blast-bot-ride-hb-i* 1)
+          )
+        (none)
+        )
+      )
+    (set! *blast-bot-ride-hb-on* #t)
+    (if *blast-bot-ride-hb-debug*
+        (format 0 "Blast Bot: hitbox: ~D collision spheres changed~%" *blast-bot-ride-hb-i*)
+        )
+    )
+  (none)
+  )
+
+(defun blast-bot-ride-hitbox-off ((v rigid-body-object))
+  (when *blast-bot-ride-hb-on*
+    (set! *blast-bot-ride-hb-i* 0)
+    (iterate-prims
+      (-> v root)
+      (lambda ((arg0 collide-shape-prim))
+        (when (and (= (-> arg0 prim-core prim-type) -1) (< *blast-bot-ride-hb-i* 32))
+          (let ((k (* 3 *blast-bot-ride-hb-i*)))
+            (set! (-> arg0 local-sphere w) (-> *blast-bot-ride-hb-orig* k))
+            (set! (-> arg0 local-sphere x) (-> *blast-bot-ride-hb-orig* (+ k 1)))
+            (set! (-> arg0 local-sphere z) (-> *blast-bot-ride-hb-orig* (+ k 2)))
+            )
+          (+! *blast-bot-ride-hb-i* 1)
+          )
+        (none)
+        )
+      )
+    (set! *blast-bot-ride-hb-on* #f)
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-vehicle-camera-off ((v rigid-body-object))
+  (let ((fp (the-as (pointer uint64) (&-> v flags)))
+        (m (the-as uint (logior (logior (shl 1 28) (shl 1 29)) (logior (shl 1 30) (shl 1 32)))))
+        )
+    (set! *blast-bot-merge-cam-bits* (logior *blast-bot-merge-cam-bits* (logand (-> fp 0) m)))
+    (set! (-> fp 0) (logclear (-> fp 0) m))
+    )
+  (let ((sc *setting-control*)
+        (vp (the-as process v))
+        )
+    (if *blast-bot-merge-wipe-vehicle-settings*
+        (remove-setting sc vp #t)   ;; #t = every setting the vehicle process has registered (also non-camera ones)
+        (begin
+          ;; only the camera keys the vehicle code registers (vehicle.gc), so its other settings (hud etc.) are left alone
+          (remove-setting sc vp 'bike-mode)
+          (remove-setting sc vp 'rapid-tracking)
+          (remove-setting sc vp 'slave-options)
+          (remove-setting sc vp 'mode-name)
+          (remove-setting sc vp 'interp-time)
+          (remove-setting sc vp 'lock-sound-camera-to-target)
+          (remove-setting sc vp 'extra-follow-height)
+          (remove-setting sc vp 'fov)
+          (remove-setting sc vp 'string-min-length)
+          (remove-setting sc vp 'string-max-length)
+          (remove-setting sc vp 'string-min-height)
+          (remove-setting sc vp 'string-max-height)
+          )
+        )
+    (when (and *target* (= *blast-bot-merge-stage* 3))
+      (remove-setting sc (the-as process *target*) 'bike-mode)
+      (remove-setting sc (the-as process *target*) 'rapid-tracking)
+      (remove-setting sc (the-as process *target*) 'mode-name)
+      (remove-setting sc (the-as process *target*) 'interp-time)
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-vehicle-camera-on ((v rigid-body-object))
+  (blast-bot-ride-hitbox-off v)
+  (when *blast-bot-ride-lights-was*
+    (let ((fp (the-as (pointer uint64) (&-> v flags))))
+      (set! (-> fp 0) (logior (-> fp 0) (the-as uint (shl 1 40))))
+      )
+    (set! *blast-bot-ride-lights-was* #f)
+    )
+  ;; give the vehicle back the camera flags it had (not look-mode, that one is transient)
+  (when (nonzero? *blast-bot-merge-cam-bits*)
+    (let ((fp (the-as (pointer uint64) (&-> v flags))))
+      (set! (-> fp 0) (logior (-> fp 0) (logclear *blast-bot-merge-cam-bits* (the-as uint (shl 1 32)))))
+      )
+    (set! *blast-bot-merge-cam-bits* (the-as uint 0))
+    )
+  (none)
+  )
+
+(define *blast-bot-merge-cam-hi-rapid* #f)
+
+(defun blast-bot-merge-cam-hi-on ()
+  (when (not *blast-bot-merge-cam-hi*)
+    (if *blast-bot-merge-ride*
+        (begin
+          ;; free camera (no snapping back behind the heading) that still tracks fast enough for a car
+          (set-setting-by-param *setting-control* 'slave-options 'clear 0.0 (the-as int (cam-slave-options BIKE_MODE)))
+          (set-setting-by-param *setting-control* 'rapid-tracking #t 0.0 0)
+          (set! *blast-bot-merge-cam-hi-rapid* #t)
+          )
+        (set-setting-by-param *setting-control* 'slave-options 'clear 0.0 (the-as int (cam-slave-options BIKE_MODE RAPID_TRACKING)))
+        )
+    (set! *blast-bot-merge-cam-hi* #t)
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-cam-hi-off ()
+  (when *blast-bot-merge-cam-hi*
+    (remove-setting-by-arg0 *setting-control* 'slave-options)
+    (when *blast-bot-merge-cam-hi-rapid*
+      (remove-setting-by-arg0 *setting-control* 'rapid-tracking)
+      (set! *blast-bot-merge-cam-hi-rapid* #f)
+      )
+    (set! *blast-bot-merge-cam-hi* #f)
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-kill-vehicle-huds ()
+  ;; The vehicle health / turbo huds that target-pilot spawns on get-on fight with the bot's hud handling (they slide in and
+  ;; out over and over). Same two steps the pilot exit code does: tell them to hide-and-die and forget the handles.
+  (when *target*
+    (let ((pi (-> *target* pilot)))
+      (when (nonzero? pi)
+        (when (nonzero? (-> pi hud-health))
+          (send-event (handle->process (-> pi hud-health)) 'hide-and-die)
+          (set! (-> pi hud-health) (new 'static 'handle))
+          )
+        (when (nonzero? (-> pi hud-turbo))
+          (send-event (handle->process (-> pi hud-turbo)) 'hide-and-die)
+          (set! (-> pi hud-turbo) (new 'static 'handle))
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-jak-update ((st object))
+  ;; Jak sits in the vehicle's seat while merged (stages 1-5): keep him undrawn. Afterwards he is shown again, unless he is
+  ;; already back in the bot's grab-ride (that state hides him by itself).
+  (when *target*
+    (let ((stage *blast-bot-merge-stage*))
+      (cond
+        ((and (>= stage 1) (<= stage 5))
+         (logior! (-> *target* draw status) (draw-control-status no-draw))
+         ;; the driving model is a separate manipy that only the target's 'draw event reaches
+         (if *blast-bot-merge-ride*
+             (send-event *target* 'draw #f)
+             )
+         (set! *blast-bot-merge-jak-hid* #t)
+         )
+        (*blast-bot-merge-jak-hid*
+          (set! *blast-bot-merge-jak-hid* #f)
+          (if (!= st 'target-grab-ride)
+              (logclear! (-> *target* draw status) (draw-control-status no-draw))
+              )
+          (if (and (!= st 'target-grab-ride) *blast-bot-merge-ride*)
+              (send-event *target* 'draw #t)
+              )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+
+;; ---- Ride mode ----
+;; The normal merge pins the vehicle under the bot, so a vehicle mission that reads the car's real speed / pad input (the
+;; turtle training, races) can never progress. Ride mode is the other way round: Jak keeps driving the car for real (he is NOT
+;; grabbed, the pad drives the car), the car and Jak are invisible, and the bot is simply placed on the car every frame with
+;; its legs locked in the hover pose. Walking, jumping, dash, shield, hover toggle and the spy droid are off while riding (the
+;; pad belongs to the car); the weapons (R1 + d-pad, in blastbot_guns.gc) and the turret lock-on keep working. Other vehicles
+;; still bounce off the bot (blast-bot-vehicle-wall), the one it rides is excluded there.
+(define *blast-bot-ride-in-missions* #t)      ;; #t: during a vehicle mission the merge becomes a ride (#f: merge is refused instead)
+(define *blast-bot-ride-always* #t)           ;; #t: every merge is a ride, even outside missions
+(define *blast-bot-ride-y-offset* -4096.0)    ;; bot origin relative to the car origin (4096 = 1 m): tune if it floats / sinks
+(define *blast-bot-ride-hover-was* #f)
+(define *blast-bot-ride-cam-restore* #f)      ;; set when the ride ends: the state's :trans gives the bot's camera settings back
+
+(defun blast-bot-ride? ()
+  (and *blast-bot-merge-ride* (!= *blast-bot-merge-stage* 0))
+  )
+
+(defun blast-bot-ride-start ((this blast-bot-player) (v rigid-body-object))
+  (set! *blast-bot-ride-hover-was* (-> this hover-on))
+  (set! (-> this hover-on) #t)
+  ;; the bot's weapons, explosions and legs must not hurt the car it rides (this also stops everything else hurting it)
+  (send-event v 'ignore-damage #t)
+  (blast-bot-ride-hitbox-on v)
+  ;; the camera is handled exactly like the normal merge (free orbit camera on the bot, the vehicle's camera code is switched off)
+  (if *camera*
+      (send-event *camera* 'change-target this)
+      )
+  (none)
+  )
+
+(defun blast-bot-ride-end ((this blast-bot-player))
+  (set! (-> this hover-on) *blast-bot-ride-hover-was*)
+  (set! (-> this jump-mode) 0)
+  (set! (-> this hover-vx) 0.0)
+  (set! (-> this hover-vz) 0.0)
+  (none)
+  )
+
+(defun blast-bot-ride-follow ((this blast-bot-player) (v rigid-body-object))
+  ;; the bot sits on the car: same position, same heading (yaw only), legs in the hover pose
+  (let ((fwd (new 'stack-no-clear 'vector)))
+    (vector-copy! (-> this root trans) (-> v root trans))
+    (+! (-> this root trans y) *blast-bot-ride-y-offset*)
+    (vector-z-quaternion! fwd (-> v root quat))
+    (set! (-> fwd y) 0.0)
+    (when (< 0.01 (vector-length fwd))
+      (vector-normalize! fwd 1.0)
+      (let ((yaw (vector-y-angle fwd)))
+        (set! (-> this head-yaw) yaw)
+        (quaternion-vector-angle! (-> this root quat) *up-vector* yaw)
+        )
+      )
+    )
+  ;; the invisible car's headlights / taillights (vehicle-flag lights-on, bit 40) would hang in the air in front of the bot
+  (let ((fp (the-as (pointer uint64) (&-> v flags))))
+    (when (logtest? (-> fp 0) (the-as uint (shl 1 40)))
+      (set! *blast-bot-ride-lights-was* #t)
+      (set! (-> fp 0) (logclear (-> fp 0) (the-as uint (shl 1 40))))
+      )
+    )
+  (set! (-> this ground-y) (-> this root trans y))
+  (set! (-> this jump-mode) 0)
+  (set! (-> this hover-on) #t)
+  (set! (-> this hover-vx) 0.0)
+  (set! (-> this hover-vz) 0.0)
+  (vector-reset! (-> this linear-speed))
+  (if *blast-bot-merge-invisible*
+      (blast-bot-merge-set-hidden v #t)
+      )
+  (none)
+  )
+
+;; Missions that read the vehicle's real speed / driver input (the turtle training waits for the car to reach speed, brake,
+;; reverse, handbrake...). A merged vehicle is pinned under the bot with zero velocity and gets no driver input, so those
+;; missions can never progress: merging is refused while one of them is running and an active merge is dropped.
+(define *blast-bot-merge-block-missions* #t)
+
+(define-extern blast-bot-vehicle-mission-in? (function process-tree symbol))
+(defun blast-bot-vehicle-mission-in? ((tree process-tree))
+  (let ((p (-> tree child))
+        (found #f)
+        )
+    (while (and p (not found))
+      (let ((next (-> p 0 brother))
+            (ty (-> p 0 type symbol))
+            )
+        ;; compared by type NAME: these task-manager types live in level dgos and do not exist yet when this file is compiled
+        (if (or (= ty 'task-manager-desert-turtle-training)
+                (= ty 'race-manager)                      ;; every race: "starting race-manager" in the console
+                (= ty 'task-manager-desert-course-race)
+                (= ty 'task-manager-desert-artifact-race)
+                (blast-bot-vehicle-mission-in? (-> p 0))
+                )
+            (set! found #t)
+            )
+        (set! p next)
+        )
+      )
+    found
+    )
+  )
+
+(defun blast-bot-vehicle-mission? ()
+  (and *blast-bot-merge-block-missions* (blast-bot-vehicle-mission-in? *active-pool*))
+  )
+
+;; ---- Vehicle health bonus ----
+;; While the bot is merged with / riding a vehicle (merge stage 3) its max health and health go up by an amount that depends on
+;; the vehicle type; when the vehicle is left the bonus is taken away again (health is capped to the normal max, never below 1,
+;; so leaving a car can not kill the bot). The bonus is worked out from max-health itself (max-health minus the normal
+;; *blast-bot-max-health*), so a bot that respawns while merged simply gets the bonus again.
+;;   light  (Tough Puppy v-turtle, Dune Hopper v-toad)                                  +50
+;;   medium (Sand Shark v-snake, Heat Seeker v-fox, Dust Demon v-mirage, Desert Screamer v-x-ride)  +40
+;;   heavy  (Gila Stomper v-scorpion, Slam Dozer v-rhino)                                +100
+(define *blast-bot-vehicle-hp-light* 50.0)
+(define *blast-bot-vehicle-hp-medium* 40.0)
+(define *blast-bot-vehicle-hp-heavy* 100.0)
+
+;; #t if the process is of the vehicle type sym or of a type that inherits from it (the vehicle types live in per-level DGOs,
+;; so they are compared by name, not by type object)
+(defun blast-bot-vehicle-type? ((v process) (sym symbol))
+  (let ((ty (-> v type))
+        (found #f)
+        )
+    (dotimes (i 8)
+      (when (and ty (= (-> ty symbol) sym))
+        (set! found #t)
+        )
+      (set! ty (if ty (-> ty parent) (the-as type #f)))
+      )
+    found
+    )
+  )
+
+(defun blast-bot-vehicle-hp-bonus ((v process))
+  (cond
+    ((not v) 0.0)
+    ((or (blast-bot-vehicle-type? v 'v-turtle) (blast-bot-vehicle-type? v 'v-toad))
+     *blast-bot-vehicle-hp-light*)
+    ((or (blast-bot-vehicle-type? v 'v-snake) (blast-bot-vehicle-type? v 'v-fox)
+         (blast-bot-vehicle-type? v 'v-mirage) (blast-bot-vehicle-type? v 'v-x-ride))
+     *blast-bot-vehicle-hp-medium*)
+    ((or (blast-bot-vehicle-type? v 'v-scorpion) (blast-bot-vehicle-type? v 'v-rhino))
+     *blast-bot-vehicle-hp-heavy*)
+    (else 0.0)
+    )
+  )
+
+(defun blast-bot-merge-hp-update ((this blast-bot-player))
+  (let* ((v (if (= *blast-bot-merge-stage* 3) (blast-bot-merge-vehicle) #f))
+         (want (if v (blast-bot-vehicle-hp-bonus (the-as process v)) 0.0))
+         (have (- (-> this max-health) *blast-bot-max-health*))
+         (delta (- want have))
+         )
+    (when (< 0.01 (fabs delta))
+      (+! (-> this max-health) delta)
+      ;; a bot that is already dying is not revived by this
+      (when (< 0.0 (-> this health))
+        (if (< 0.0 delta)
+            (+! (-> this health) delta)
+            (set! (-> this health) (fmax 1.0 (fmin (-> this health) (-> this max-health))))
+            )
+        )
+      (format 0 "Blast Bot: vehicle health bonus ~f, health ~f / ~f~%" want (-> this health) (-> this max-health))
+      )
+    )
+  (none)
+  )
+
+;; ---- Flut (the Leaper Lizard) ----
+;; While Jak is a flut (any target-flut-* state) he used to be teleported to the bot's feet by the regrab watchdog and stood
+;; there, drawn. Now he is hidden and held inside the bot, *blast-bot-flut-y-offset* above its origin (16384 = 4 m, about half
+;; way up the bot): target-flut-grab (pad ignored) + a position pin every frame. He stays a flut, so missions that need the
+;; flut still see it. blast-bot-jak-busy? (blastbot-main-mod.gc) counts the flut states as busy so the regrab watchdog leaves him alone.
+(define *blast-bot-flut-y-offset* 16384.0)
+(define *blast-bot-flut-hide* #t)           ;; #t: the flut / Jak are not drawn
+(define *blast-bot-flut-retry* 0)
+(define *blast-bot-flut-hid* #f)
+
+(defun blast-bot-flut-state? ((st object))
+  (or (= st 'target-flut-start) (= st 'target-flut-stance) (= st 'target-flut-walk) (= st 'target-flut-run-wild)
+      (= st 'target-flut-falling) (= st 'target-flut-jump) (= st 'target-flut-double-jump) (= st 'target-flut-hit-ground)
+      (= st 'target-flut-running-attack) (= st 'target-flut-air-attack) (= st 'target-flut-air-attack-hit-ground)
+      (= st 'target-flut-kanga-catch) (= st 'target-flut-hit) (= st 'target-flut-death) (= st 'target-flut-get-on)
+      (= st 'target-flut-get-off) (= st 'target-flut-get-off-jump) (= st 'target-flut-eject) (= st 'target-flut-grab)
+      (= st 'target-flut-clone-anim))
+  )
+
+;; the calm flut states: only these are grabbed and pinned (the mount / dismount / hit / death animations are left alone)
+(defun blast-bot-flut-hold-state? ((st object))
+  (or (= st 'target-flut-stance) (= st 'target-flut-walk) (= st 'target-flut-run-wild) (= st 'target-flut-falling)
+      (= st 'target-flut-jump) (= st 'target-flut-double-jump) (= st 'target-flut-hit-ground)
+      (= st 'target-flut-running-attack) (= st 'target-flut-air-attack) (= st 'target-flut-air-attack-hit-ground)
+      (= st 'target-flut-grab))
+  )
+
+(defun blast-bot-flut-update ((this blast-bot-player))
+  (when *target*
+    (let ((st (if (-> *target* next-state) (-> *target* next-state name) #f)))
+      (cond
+        ((blast-bot-flut-state? st)
+         (when *blast-bot-flut-hide*
+           (logior! (-> *target* draw status) (draw-control-status no-draw))
+           ;; the flut model is a separate manipy that only the target's 'draw event reaches
+           (send-event *target* 'draw #f)
+           (set! *blast-bot-flut-hid* #t)
+           )
+         (when (blast-bot-flut-hold-state? st)
+           (when (and (!= st 'target-flut-grab) (>= (current-time) *blast-bot-flut-retry*))
+             (set! *blast-bot-flut-retry* (+ (current-time) (seconds 0.25)))
+             (send-event *target* 'change-mode 'grab #t)
+             )
+           (let ((p (new 'stack-no-clear 'vector)))
+             (vector-copy! p (-> this root trans))
+             (+! (-> p y) *blast-bot-flut-y-offset*)
+             (move-to-point! (-> *target* control) p)
+             )
+           (vector-reset! (-> *target* control transv))
+           )
+         )
+        (*blast-bot-flut-hid*
+          (set! *blast-bot-flut-hid* #f)
+          (when (!= st 'target-grab-ride)
+            (logclear! (-> *target* draw status) (draw-control-status no-draw))
+            (send-event *target* 'draw #t)
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+;; ---- Car weapons from the bot's barrel ----
+;; The car's own weapon code (wvehicle-method-169 of each v-* type) lives in the level dgos and can not be changed from here.
+;; Moving a car shot after it has spawned did not work (its trail / flash / impact were already made at the car's gun), so now
+;; each shot the merged car spawns is removed on the spot and an identical one (same type, owner, damage settings, timeout and
+;; speed) is spawned at the bot's muzzle (bone 6, the same point the bot's own shots use) flying along the barrel direction, i.e.
+;; wherever the bot's turret is aiming (manual aim or locked target). The new shot ignores the bot, so it can not hit the bot it
+;; starts inside; shots that already ignore the bot are the new ones and are left alone.
+;; #f: car shots come out of the car like before.
+(define *blast-bot-car-shots-from-barrel* #t)
+
+;; recursive, so it needs its own declaration first
+(define-extern blast-bot-carshot-scan (function blast-bot-player process-tree process vector vector none))
+
+(defun blast-bot-carshot-scan ((this blast-bot-player) (tree process-tree) (veh process) (start vector) (dir vector))
+  (let ((p (-> tree child)))
+    (while p
+      (let ((next (-> p 0 brother))
+            (pj (as-type (-> p 0) projectile))
+            (killed #f)
+            )
+        (when (and pj
+                   (= (handle->process (-> pj owner-handle)) veh)
+                   (!= (handle->process (-> pj ignore-handle)) this)
+                   )
+          (let ((speed (vector-length (-> pj root transv)))
+                (params (new 'stack-no-clear 'projectile-init-by-other-params))
+                )
+            (if (< speed 1000.0)
+                (set! speed 409600.0)
+                )
+            (set! (-> params ent) (-> pj entity))
+            (set! (-> params charge) (-> pj charge-level))
+            (set! (-> params options) (projectile-options))
+            (logclear! (-> params options) (projectile-options po14 po15 po16))
+            (vector-copy! (-> params pos) start)
+            (vector-float*! (-> params vel) dir speed)
+            (set! (-> params notify-handle) (the-as handle #f))
+            (set! (-> params owner-handle) (-> pj owner-handle))
+            (set! (-> params target-handle) (the-as handle #f))
+            (vector-reset! (-> params target-pos))
+            (set! (-> params ignore-handle) (process->handle this))
+            (set! (-> params attack-id) (-> pj attack-id))
+            (set! (-> params timeout) (-> pj timeout))
+            (let ((shot (spawn-projectile (-> pj type) params this *default-dead-pool*)))
+              (when shot
+                (format 0 "Blast Bot: car shot ~A re-fired from the barrel~%" pj)
+                (deactivate pj)
+                (set! killed #t)
+                )
+              )
+            )
+          )
+        (if (not killed)
+            (blast-bot-carshot-scan this (-> p 0) veh start dir)
+            )
+        (set! p next)
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-carshot-update ((this blast-bot-player))
+  (when (and *blast-bot-car-shots-from-barrel* (= *blast-bot-merge-stage* 3))
+    (let ((veh (blast-bot-merge-vehicle)))
+      (when veh
+        (let* ((m (matrix-copy! (new 'stack-no-clear 'matrix) (-> this node-list data 6 bone transform)))
+               (start (matrix->trans m (new 'stack-no-clear 'vector)))
+               (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> m fvec) 1.0))
+               )
+          (vector+*! start start dir 8192.0)
+          (blast-bot-carshot-scan this *active-pool* (the-as process veh) start dir)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-merge-update ((this blast-bot-player))
+  (blast-bot-merge-hp-update this)
+  (blast-bot-flut-update this)
+  (blast-bot-carshot-update this)
+  (when *target*
+    (let* ((st (if (-> *target* next-state) (-> *target* next-state name) #f)) ;; same as blast-bot-jak-state, which is defined further down
+           (v (the-as rigid-body-object (blast-bot-merge-vehicle)))
+           (stage *blast-bot-merge-stage*)
+           )
+      (when (and v (>= stage 1) (<= stage 3))
+        (blast-bot-merge-vehicle-camera-off v)
+        )
+      (cond
+        ((zero? stage)
+         ;; a race / training puts Jak in the car by itself: ride it right away instead of fighting over him
+         (when (and *blast-bot-ride-in-missions* (blast-bot-vehicle-mission?) (not *blast-bot-spy-active*)
+                    (= st 'target-pilot-stance) (focus-test? *target* pilot-riding))
+           (let ((pv (as-type (handle->process (-> *target* pilot vehicle)) rigid-body-object)))
+             (when pv
+               (format 0 "Blast Bot: riding (auto) ~A~%" pv)
+               (set! *blast-bot-merge-pp* (process->ppointer (the-as process pv)))
+               (set! *blast-bot-merge-ride* #t)
+               (set! *blast-bot-merge-time* (current-time))
+               (blast-bot-ride-start this pv)
+               (set! *blast-bot-merge-stage* 3)
+               )
+             )
+           )
+         (when (and (cpad-pressed? 0 triangle) (not *blast-bot-spy-active*) (= st 'target-grab-ride))
+           (if (and (blast-bot-vehicle-mission?) (not *blast-bot-ride-in-missions*))
+               (format 0 "Blast Bot: merge is disabled while a vehicle training / race mission is running~%")
+               )
+           (let ((cand (if (and (blast-bot-vehicle-mission?) (not *blast-bot-ride-in-missions*)) #f (blast-bot-merge-find this))))
+             (when cand
+               (set! *blast-bot-merge-ride* (or *blast-bot-ride-always* (blast-bot-vehicle-mission?)))
+               (format 0 "Blast Bot: ~A with ~A~%" (if *blast-bot-merge-ride* "riding" "merging") cand)
+               (set! *blast-bot-merge-pp* (process->ppointer (the-as process cand)))
+               (set! *blast-bot-merge-stage* 6)
+               (set! *blast-bot-merge-time* (current-time))
+               ;; target-grab-ride ignores 'change-mode 'pilot, so release Jak first (same two steps as the die code)
+               (send-event *target* 'change-mode 'grab #t)
+               )
+             )
+           )
+         )
+        ((= stage 6)
+         (cond
+           ((or (not v) (> (- (current-time) *blast-bot-merge-time*) (seconds 2)))
+            (format 0 "Blast Bot: merge could not release Jak (~A), giving up~%" st)
+            (set! *blast-bot-merge-stage* 0)
+            )
+           ((= st 'target-grab)
+            (send-event *target* 'end-mode 'grab)
+            (set! *blast-bot-merge-stage* 7)
+            (set! *blast-bot-merge-time* (current-time))
+            )
+           )
+         )
+        ((= stage 7)
+         (cond
+           ((or (not v) (> (- (current-time) *blast-bot-merge-time*) (seconds 2)))
+            (format 0 "Blast Bot: merge could not free Jak (~A), giving up~%" st)
+            (set! *blast-bot-merge-stage* 0)
+            )
+           ((= st 'target-stance)
+            ;; same message the engine uses for 'get in this vehicle': param1 = vehicle, param3 = skip the get-on animation
+            (send-event *target* 'change-mode 'pilot v #f #t)
+            (set! *blast-bot-merge-stage* 1)
+            (set! *blast-bot-merge-time* (current-time))
+            )
+           )
+         )
+        ((= stage 1)
+         (cond
+           ((or (not v) (> (- (current-time) *blast-bot-merge-time*) (seconds 3)))
+            (format 0 "Blast Bot: merge failed to mount (~A), giving up~%" st)
+            (if v (blast-bot-merge-vehicle-camera-on v))
+            (set! *blast-bot-merge-stage* 0)
+            )
+           ((and (= st 'target-pilot-stance) (focus-test? *target* pilot-riding))
+            (cond
+              (*blast-bot-merge-ride*
+                ;; ride: Jak stays free in the seat (the pad drives the car), nothing is pinned
+                (format 0 "Blast Bot: riding~%")
+                (blast-bot-ride-start this v)
+                (set! *blast-bot-merge-stage* 3)
+                )
+              (else
+                ;; mounted: the vehicle has sent itself 'pilot-on, now park Jak in the seat
+                (send-event *target* 'change-mode 'grab #t)
+                (set! *blast-bot-merge-stage* 2)
+                (set! *blast-bot-merge-time* (current-time))
+                )
+              )
+            )
+           )
+         )
+        ((= stage 2)
+         (cond
+           ((or (not v) (> (- (current-time) *blast-bot-merge-time*) (seconds 3)))
+            (format 0 "Blast Bot: merge failed to grab Jak in the seat (~A), giving up~%" st)
+            (if v (blast-bot-merge-vehicle-camera-on v))
+            (set! *blast-bot-merge-stage* 0)
+            )
+           ((= st 'target-pilot-grab)
+            (format 0 "Blast Bot: merged~%")
+            ;; the bot's legs / weapons would keep damaging the vehicle it is standing on
+            (send-event v 'ignore-damage #t)
+            (send-event v 'ignore-impulse #t)
+            (set! *blast-bot-merge-stage* 3)
+            (if *camera*
+                (send-event *camera* 'change-target this)
+                )
+            )
+           )
+         )
+        ((= stage 3)
+         (cond
+           ((and *blast-bot-merge-ride* (= st 'target-pilot-grab) (> (- (current-time) *blast-bot-merge-time*) (seconds 1.5)))
+            ;; a cutscene (the race win) took Jak: the scene needs the real car and Jak on screen
+            (format 0 "Blast Bot: a cutscene grabbed Jak, releasing the ride~%")
+            (when v
+              (blast-bot-merge-set-hidden v #f)
+              (blast-bot-merge-vehicle-camera-on v)
+              (if (not (blast-bot-vehicle-mission?)) (send-event v 'ignore-damage #f))
+              )
+            (blast-bot-ride-end this)
+            (set! *blast-bot-merge-stage* 0)
+            )
+           ((or (not v) (focus-test? v dead)
+                (if *blast-bot-merge-ride* (not (blast-bot-pilot-state? st)) (!= st 'target-pilot-grab)))
+            (format 0 "Blast Bot: ~A lost (~A)~%" (if *blast-bot-merge-ride* "ride" "merge") st)
+            (when v
+              (if *blast-bot-merge-ride*
+                  (if (not (blast-bot-vehicle-mission?)) (send-event v 'ignore-damage #f))
+                  (begin
+                    (send-event v 'ignore-damage #f)
+                    (send-event v 'ignore-impulse #f)
+                    )
+                  )
+              (blast-bot-merge-set-hidden v #f)
+              (blast-bot-merge-vehicle-camera-on v)
+              )
+            (if *blast-bot-merge-ride* (blast-bot-ride-end this))
+            (set! *blast-bot-merge-stage* 0)
+            )
+           ((and (blast-bot-vehicle-mission?) (not *blast-bot-merge-ride*) *blast-bot-ride-in-missions*)
+            ;; the mission starts the moment Jak sits in the car: turn the pinned merge into a ride, no second Triangle needed
+            (format 0 "Blast Bot: a vehicle mission started, switching the merge to a ride~%")
+            (send-event v 'ignore-impulse #f)
+            (set! *blast-bot-merge-ride* #t)
+            (set! *blast-bot-merge-time* (current-time))   ;; Jak is still in pilot-grab for a moment: not a cutscene
+            (blast-bot-ride-start this v)
+            (blast-bot-merge-cam-hi-off)
+            (send-event *target* 'end-mode 'grab)
+            )
+           ((or (cpad-pressed? 0 triangle)
+                (and (blast-bot-vehicle-mission?) (not *blast-bot-merge-ride*)))
+            (format 0 "Blast Bot: ~A~%" (if *blast-bot-merge-ride* "ending the ride" "unmerging"))
+            (if *blast-bot-merge-ride*
+                (if (not (blast-bot-vehicle-mission?)) (send-event v 'ignore-damage #f))
+                (begin
+                  (send-event v 'ignore-damage #f)
+                  (send-event v 'ignore-impulse #f)
+                  )
+                )
+            (blast-bot-merge-set-hidden v #f)
+            (blast-bot-merge-vehicle-camera-on v)
+            (if *blast-bot-merge-ride*
+                (blast-bot-ride-end this)
+                (send-event *target* 'end-mode 'grab)
+                )
+            (set! *blast-bot-merge-stage* 4)
+            (set! *blast-bot-merge-time* (current-time))
+            )
+           (else
+             (if *blast-bot-merge-ride*
+                 (blast-bot-ride-follow this v)
+                 (blast-bot-merge-follow this v)
+                 )
+             )
+           )
+         )
+        ((= stage 4)
+         (cond
+           ((= st 'target-pilot-stance)
+            (send-event *target* 'end-mode 'pilot)
+            (set! *blast-bot-merge-stage* 5)
+            (set! *blast-bot-merge-time* (current-time))
+            )
+           ((> (- (current-time) *blast-bot-merge-time*) (seconds 2))
+            (set! *blast-bot-merge-stage* 0)
+            )
+           )
+         )
+        ((= stage 5)
+         ;; wait until Jak is out of the pilot states, then the regrab watchdog puts him back in the bot
+         (when (or (not (blast-bot-pilot-state? st)) (> (- (current-time) *blast-bot-merge-time*) (seconds 4)))
+           (set! *blast-bot-merge-stage* 0)
+           )
+         )
+        )
+      (if (= *blast-bot-merge-stage* 3)
+          (blast-bot-merge-cam-hi-on)
+          (blast-bot-merge-cam-hi-off)
+          )
+      (if (and (>= *blast-bot-merge-stage* 1) (<= *blast-bot-merge-stage* 5))
+          (blast-bot-merge-kill-vehicle-huds)
+          )
+      (blast-bot-merge-jak-update st)
+      )
+    )
+  (none)
+  )
+
+;; ---- Vehicles bump into the bot like a wall ----
+;; The vehicles' own collision never treats the bot as solid, so do it with their 'apply-impulse event (the same one the
+;; engine uses for explosions): a vehicle that overlaps the bot and moves toward it gets its velocity reflected, and one that
+;; sits inside the bot is pushed out gently. Applied at the vehicle's centre so it does not spin.
+(define *blast-bot-vehicle-wall* #t)
+(define *blast-bot-vehicle-wall-radius* 20480.0)    ;; bot footprint, 5 m
+(define *blast-bot-wall-veh-scale* 1.0)     ;; vehicle footprint = this * its root sphere radius
+(define *blast-bot-wall-bounce* 0.5)        ;; 0 = dead stop, 1 = full rebound
+(define *blast-bot-wall-min-out* 16384.0)    ;; vehicles inside the bot always leave at least this fast (4 m/s)
+(define *blast-bot-wall-mass* 50.0)          ;; stand-in for the vehicle's mass (the vehicle type is not visible from the mods folder): impulse = mass * speed change
+(define *blast-bot-wall-box* (new 'global 'vector))
+(define *blast-bot-wall-hits* (new 'global 'array 'collide-shape 32))
+
+(defun blast-bot-vehicle-wall ((this blast-bot-player))
+  (when *blast-bot-vehicle-wall*
+    (let ((box *blast-bot-wall-box*)
+          (hits *blast-bot-wall-hits*)
+          )
+      (vector-copy! box (-> this root trans))
+      (set! (-> box w) 61440.0)
+      (countdown (i (fill-actor-list-for-box *actor-hash* box hits 32))
+        (let ((cs (as-type (-> hits i) collide-shape)))
+          (when cs
+            (let ((v (as-type (-> cs process) process-focusable)))
+              (when (and v
+                         (logtest? (process-mask vehicle) (-> v mask))
+                         (not (focus-test? v dead))
+                         (!= v (blast-bot-merge-vehicle))
+                         )
+                (let ((n (new 'stack-no-clear 'vector))
+                      (imp (new 'stack-no-clear 'vector))
+                      )
+                  (vector-! n (-> v root trans) (-> this root trans))
+                  (set! (-> n y) 0.0)
+                  (let ((dist (vector-length n))
+                        (reach (+ *blast-bot-vehicle-wall-radius* (* *blast-bot-wall-veh-scale* (-> v root root-prim local-sphere w))))
+                        )
+                    (when (and (< 1.0 dist) (< dist reach))
+                      (vector-float*! n n (/ 1.0 dist))
+                      ;; n points from the bot to the vehicle, so a vehicle driving into the bot has a negative vn
+                      (let ((vn (vector-dot (-> (the-as collide-shape-moving (-> v root)) transv) n)))
+                        (when (< vn *blast-bot-wall-min-out*)
+                          (let ((dv (- (fmax *blast-bot-wall-min-out* (* (- *blast-bot-wall-bounce*) vn)) vn)))
+                            (vector-float*! imp n (* dv *blast-bot-wall-mass*))
+                            (send-event v 'apply-impulse (-> v root trans) imp)
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  (none)
+  )
