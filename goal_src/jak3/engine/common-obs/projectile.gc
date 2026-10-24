@@ -7,6 +7,9 @@
 
 ;; DECOMP BEGINS
 
+;; blast bot: moves car shots to the bot barrel before they are built (blastbot-vehicle.gc)
+(define-extern blast-bot-carshot-params (function projectile-init-by-other-params none))
+
 (defun cshape-reaction-projectile ((arg0 control-info) (arg1 collide-query) (arg2 vector) (arg3 vector))
   (let ((s5-0 (cshape-reaction-default arg0 arg1 arg2 arg3)))
     (case (-> arg1 best-other-tri pat material)
@@ -433,6 +436,7 @@
 
 ;; WARN: Return type mismatch int vs object.
 (defbehavior projectile-init-by-other projectile ((arg0 projectile-init-by-other-params))
+  (blast-bot-carshot-params arg0)
   (let ((a1-0 (projectile-method-40 self)))
     (stack-size-set! (-> self main-thread) a1-0)
     )

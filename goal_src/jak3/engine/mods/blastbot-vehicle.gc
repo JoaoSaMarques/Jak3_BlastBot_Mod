@@ -649,6 +649,57 @@
 ;; starts inside; shots that already ignore the bot are the new ones and are left alone.
 ;; #f: car shots come out of the car like before.
 (define *blast-bot-car-shots-from-barrel* #t)
+(define *blast-bot-carshot-site* 1)   ;; debug: 1 = caught in the bot's update (merge-update), 2 = caught at the end of its :post
+
+;; ---- Spawn-time hook (the real fix for car shots still showing at the car's barrels) ----
+;; A car shot is created INSIDE the car's own update (wvehicle-method-169 -> spawn-projectile). projectile-init-by-other runs
+;; right there, so the muzzle flash, trail, sound and the first collision test all happen at the car's gun, before any of
+;; our code can run. Catching the shot afterwards (the scan below) is always too late: that is why the log shows shots in
+;; state 'impact / 'moving and why it was always "caught at 1" (the bot's update) and never at 2 (the end of its :post).
+;; So the params are rewritten BEFORE the shot is built: the very first form of projectile-init-by-other (projectile.gc) calls
+;;   (blast-bot-carshot-params <its params argument>)
+;; which moves the start to the bot's muzzle, aims it along the barrel and makes the shot ignore the bot. Everything the
+;; shot creates after that (flash, trail, impact) then belongs to the barrel. The scan below stays as a fallback and
+;; skips shots that already ignore the bot.
+;; a pointer, NOT a handle: a handle is 64 bits and a global symbol only keeps 32, so the stored handle always read back as #f
+(define *blast-bot-carshot-bot* (the-as (pointer process) #f))   ;; the bot, set every frame by blast-bot-carshot-update
+(define *blast-bot-carshot-debug* #t)
+(define *blast-bot-carshot-trace* #t)   ;; #t: print one line per projectile spawned while merged (to see if the hook is called at all)
+
+(defun blast-bot-carshot-params ((params projectile-init-by-other-params))
+  (when (and *blast-bot-car-shots-from-barrel* (= *blast-bot-merge-stage* 3))
+    (let ((veh (the-as process (blast-bot-merge-vehicle)))
+          (bot (if *blast-bot-carshot-bot* (as-type (ppointer->process *blast-bot-carshot-bot*) blast-bot-player) #f))
+          )
+      (if *blast-bot-carshot-trace*
+          (format 0 "Blast Bot: carshot hook: veh ~A bot ~A owner ~A ignore ~A~%" veh bot (handle->process (-> params owner-handle)) (handle->process (-> params ignore-handle)))
+          )
+      (when (and veh
+                 bot
+                 (= (handle->process (-> params owner-handle)) veh)
+                 (!= (handle->process (-> params ignore-handle)) bot)
+                 )
+        (let* ((m (matrix-copy! (new 'stack-no-clear 'matrix) (-> (the-as blast-bot-player bot) node-list data 6 bone transform)))
+               (start (matrix->trans m (new 'stack-no-clear 'vector)))
+               (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> m fvec) 1.0))
+               (speed (vector-length (-> params vel)))
+               )
+          (if (< speed 1000.0)
+              (set! speed 409600.0)
+              )
+          (vector+*! start start dir 8192.0)
+          (vector-copy! (-> params pos) start)
+          (vector-float*! (-> params vel) dir speed)
+          (set! (-> params ignore-handle) (process->handle bot))
+          (if *blast-bot-carshot-debug*
+              (format 0 "Blast Bot: car shot start moved to the barrel at spawn~%")
+              )
+          )
+        )
+      )
+    )
+  (none)
+  )
 
 ;; recursive, so it needs its own declaration first
 (define-extern blast-bot-carshot-scan (function blast-bot-player process-tree process vector vector none))
@@ -685,7 +736,7 @@
             (set! (-> params timeout) (-> pj timeout))
             (let ((shot (spawn-projectile (-> pj type) params this *default-dead-pool*)))
               (when shot
-                (format 0 "Blast Bot: car shot ~A re-fired from the barrel~%" pj)
+                (format 0 "Blast Bot: car shot ~A re-fired from the barrel (caught at ~D)~%" pj *blast-bot-carshot-site*)
                 (deactivate pj)
                 (set! killed #t)
                 )
@@ -703,6 +754,7 @@
   )
 
 (defun blast-bot-carshot-update ((this blast-bot-player))
+  (set! *blast-bot-carshot-bot* (process->ppointer this))
   (when (and *blast-bot-car-shots-from-barrel* (= *blast-bot-merge-stage* 3))
     (let ((veh (blast-bot-merge-vehicle)))
       (when veh
@@ -722,6 +774,7 @@
 (defun blast-bot-merge-update ((this blast-bot-player))
   (blast-bot-merge-hp-update this)
   (blast-bot-flut-update this)
+  (set! *blast-bot-carshot-site* 1)
   (blast-bot-carshot-update this)
   (when *target*
     (let* ((st (if (-> *target* next-state) (-> *target* next-state name) #f)) ;; same as blast-bot-jak-state, which is defined further down

@@ -171,7 +171,7 @@
 ;; how fast the body turns toward the stick direction (rotation units/sec, 21845 = 120 deg/s)
 (define *blast-bot-body-turn-rate* 21845.0)
 ;; wall blocking: radius of the sweep sphere, and how high above the ground it is centred
-(define *blast-bot-wall-radius* 14336.0)   ;; was 14336.0 in this file, but blastbot-vehicle.gc redefined it to 20480.0 later, so 20480.0 is what was really used; now this is the only definition
+(define *blast-bot-wall-radius* 18432.0)   ;; was 18432.0 in this file, but blastbot-vehicle.gc redefined it to 20480.0 later, so 20480.0 is what was really used; now this is the only definition
 (define *blast-bot-wall-height* 26624.0)   ;; was 20480.0. Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
 ;; how much of the leg-lift tilt goes into the body the legs hang from. The head gets the rest,
 ;; so the head's total tilt is unchanged and the body tilts too (it also carries the head).
@@ -1040,6 +1040,45 @@
   (none)
   )
 
+;; Debug: why did the bot decide it walked off a ledge? Probes straight down with NOTHING filtered (every collide-spec, no pat
+;; ignore) and prints what is really under the bot next to what the normal ground probe found.
+(define *blast-bot-fall-debug* #t)
+(defun blast-bot-fall-debug ((this blast-bot-player))
+  (when *blast-bot-fall-debug*
+    (let ((q (new 'stack-no-clear 'collide-query)))
+      (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 12288.0)
+      (vector-float*! (-> q move-dist) *y-vector* -163840.0)
+      (set! (-> q radius) 40.96)
+      (set! (-> q collide-with) (the-as collide-spec #xffffffff))
+      (set! (-> q ignore-process0) this)
+      (set! (-> q ignore-process1) #f)
+      (set! (-> q ignore-pat) (new 'static 'pat-surface))
+      (set! (-> q action-mask) (collide-action solid))
+      (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+        (if (>= hit 0.0)
+            (let ((prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim)))
+              (format 0 "Blast Bot: fall debug: root y ~f, ground-y ~f, unfiltered floor y ~f (m), owner ~A~%"
+                      (/ (-> this root trans y) 4096.0)
+                      (/ (-> this ground-y) 4096.0)
+                      (/ (+ (-> q start-pos y) (* hit (-> q move-dist y))) 4096.0)
+                      (if prim (-> prim cshape process) "background")
+                      )
+              (format 0 "Blast Bot: fall debug: collide-as #x~X, pat #x~X, ride ~A~%"
+                      (if prim (the-as int (-> prim prim-core collide-as)) 0)
+                      (the-as int (-> q best-other-tri pat))
+                      *blast-bot-ride-seen*
+                      )
+              )
+            (format 0 "Blast Bot: fall debug: root y ~f, ground-y ~f (m), NOTHING below the bot at all~%"
+                    (/ (-> this root trans y) 4096.0)
+                    (/ (-> this ground-y) 4096.0))
+            )
+        )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-jump-update ((this blast-bot-player))
   ;; Call every frame from :trans, before the walking code.
   (let ((dt (seconds-per-frame))
@@ -1067,6 +1106,7 @@
        (cond
          ((< (-> this ground-y) (- (- (-> this root trans y) (-> this hover-lift)) 20480.0))
           ;; walked off a ledge (more than 5m drop): fall, thruster works like after a jump
+          (blast-bot-fall-debug this)
           (set! (-> this jump-mode) 2)
           (set! (-> this jump-timer) (current-time))
           (set! (-> this jump-vy) 0.0)
@@ -1909,6 +1949,8 @@
 (define-extern blast-bot-merge-cam-hi-off (function none))
 (define-extern blast-bot-vehicle-wall (function blast-bot-player none))
 (define-extern blast-bot-flut-state? (function object object))
+(define-extern blast-bot-carshot-update (function blast-bot-player none))
+(define-extern *blast-bot-carshot-site* int)
 
 
 (defun blast-bot-ride-update ((this blast-bot-player))
@@ -2003,6 +2045,47 @@
       (= st 'target-hit) (= st 'target-death) (= st 'target-continue))
   )
 
+;; Elevators / doors that change level (the wasteland city -> the palace elevator) teleport Jak while he is parked in the bot.
+;; The old level (and the elevator under the bot) is then unloaded, so putting Jak back into the bot left both of them over
+;; nothing: the bot fell. When Jak is found further than this from the bot, the BOT goes to Jak instead. (0 = never)
+(define *blast-bot-follow-dist* 163840.0)   ;; 40 m
+
+(defun blast-bot-teleport-to ((this blast-bot-player) (pos vector))
+  ;; moves the whole bot (body, aggro shape, feet, speed) to POS and stands it up, like spybot-summon does for the droid
+  (vector-copy! (-> this root trans) pos)
+  (set! (-> this ground-y) (-> pos y))
+  (set! (-> this jump-mode) 0)
+  (set! (-> this jump-vy) 0.0)
+  (set! (-> this hover-vx) 0.0)
+  (set! (-> this hover-vz) 0.0)
+  (let ((a (-> this aggro-shape)))
+    (when (nonzero? a)
+      (vector-copy! (-> a trans) (-> this root trans))
+      (update-transforms a)
+      )
+    )
+  (dotimes (i 4)
+    (let ((local (new 'stack-no-clear 'vector))
+          (world (new 'stack-no-clear 'vector))
+          )
+      (blast-bot-foot-local local i)
+      (vector-orient-by-quat! world local (-> this root quat))
+      (vector+! world world (-> this root trans))
+      (set! (-> world y) (-> pos y))
+      (vector-copy! (-> this foot-pos i) world)
+      (vector-copy! (-> this foot-next i) world)
+      (vector-reset! (-> this foot-speed i))
+      (set! (-> this foot-moving i) #f)
+      (set! (-> this foot-cool i) 0)
+      )
+    )
+  (vector-copy! (-> this last-trans) (-> this root trans))
+  (vector-copy! (-> this ext-pos) (-> this root trans))
+  (vector-reset! (-> this linear-speed))
+  (update-transforms (-> this root))
+  (none)
+  )
+
 (defun blast-bot-regrab ((this blast-bot-player))
   ;; Cutscenes (and elevators with the grab flag) send Jak a 'grab, which kicks him out of target-grab-ride, and when
   ;; they end he is released far away from the bot. Any state that is not in blast-bot-jak-busy? gets him put back
@@ -2036,7 +2119,15 @@
                  (not (blast-bot-scene-active?)))       ;; and no cutscene loading or playing
         (format 0 "Blast Bot: Jak left the bot (~A), putting him back~%" st)
         (set! (-> this ride-retry) (+ (current-time) (seconds 0.25)))
-        (move-to-point! (-> *target* control) (-> this root trans))
+        (if (and (< 0.0 *blast-bot-follow-dist*)
+                 (< *blast-bot-follow-dist* (vector-vector-distance (-> this root trans) (-> *target* control trans)))
+                 )
+            (begin
+              (format 0 "Blast Bot: Jak was moved far away (level change / teleport), the bot follows him~%")
+              (blast-bot-teleport-to this (-> *target* control trans))
+              )
+            (move-to-point! (-> *target* control) (-> this root trans))
+            )
         (send-event *target* 'change-mode 'grab-ride #t)
         (if *camera*
             (send-event *camera* 'change-target this)
@@ -2696,6 +2787,9 @@
     (blast-bot-touch self)
     (blast-bot-draw-laser self)
     (vector-copy! (-> self ext-pos) (-> self root trans))
+    ;; car shots are swapped for ones from the barrel here as well (after ja-post, so the muzzle bone is this frame's), see blastbot-vehicle.gc
+    (set! *blast-bot-carshot-site* 2)
+    (blast-bot-carshot-update self)
     (+! (-> self debug-frame-count) 1)
     )
   )
