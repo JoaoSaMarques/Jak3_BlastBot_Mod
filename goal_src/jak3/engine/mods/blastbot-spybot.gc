@@ -37,11 +37,6 @@
 (define *spybot-pickup-radius* 5120.0)  ;; pickup magnet: orbs / health etc. within this radius of the droid (1.25 m) are collected
 (define *spybot-nova-fallback* 3.0)    ;; Super Nova: the droid keeps Jak until the new bot is there; if none shows up this long after the respawn time, it releases him
 
-;; Activating the world like Jak does: elevators / platforms (they only start when told 'ridden with a target rider, and the droid
-;; carries Jak, so the droid sends it for him) and buttons / switches / other non-living things the droid touches (hit with the same
-;; 'attack the bot's legs use). #f turns both off.
-(define *spybot-activate* #t)
-
 (define-extern spybot-end (function symbol none))
 (define-extern spybot-nova-end (function none))
 (define *spybot-nova-active* #f)       ;; #t from the Super Nova until its droid is removed (L2 is ignored meanwhile)
@@ -70,7 +65,6 @@
    (nova-ready int32)       ;; Super Nova: 1 once the old bot is gone and Jak rides the droid, 2 = releasing Jak
    (jak-held   int32)       ;; 1 = Jak is riding this droid (target-grab-ride) and it carries him
    (nova-end   time-frame)  ;; Super Nova: fallback release time, only used when no new bot ever appears (while releasing: when it started)
-   (act-time   time-frame)  ;; last time the droid hit a button / switch it touched (one hit per 0.4 s)
    )
   (:state-methods
     active
@@ -467,49 +461,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Elevators / platforms
-;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(defun spybot-ride-update ((this spy-bot-player))
-  ;; Same as blast-bot-ride-update: elevators / platforms learn that someone stands on them from a 'ridden event with a rider
-  ;; of type target (elevator.gc). Jak is parked inside the droid, so look for a platform right under its feet and send it
-  ;; 'ridden with Jak as the rider. The carrying itself is done by the engine (can-ride group + ride sphere in the init).
-  (when (and *spybot-activate* *target* (nonzero? (-> this jak-held)) (zero? (-> this is-dead)))
-    (let ((q (new 'stack-no-clear 'collide-query)))
-      (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 8192.0)
-      (vector-float*! (-> q move-dist) *y-vector* -61440.0)
-      (set! (-> q radius) 40.96)
-      (set! (-> q collide-with) (collide-spec pusher hit-by-others-list))
-      (set! (-> q ignore-process0) this)
-      (set! (-> q ignore-process1) #f)
-      (set! (-> q ignore-pat)
-            (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
-      (set! (-> q action-mask) (collide-action solid))
-      (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
-        (when (>= hit 0.0)
-          ;; only a platform right under the feet counts, not one far below a ledge
-          (let ((hit-y (+ (-> q start-pos y) (* hit (-> q move-dist y))))
-                (prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim))
-                )
-            (when (and prim (< (fabs (- hit-y (-> this root trans y))) 6144.0))
-              (let ((proc (-> prim cshape process))
-                    (f (new 'stack-no-clear 'focus))
-                    )
-                (when proc
-                  (set! (-> f handle) (process->handle *target*))
-                  (send-event proc 'ridden f)
-                  )
-                )
-              )
-            )
-          )
-        )
-      )
-    )
-  (none)
-  )
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Pickups
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -575,26 +526,6 @@
                                           (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
                                           )))
          )
-       ;; buttons / switches / other non-living things the pickup sphere overlaps: hit them like the bot's legs do (living things
-       ;; are the headbutt's business, pickups are handled above)
-       (when (and *spybot-activate*
-                  proc
-                  (!= proc self)
-                  (!= proc *target*)
-                  (not (type? proc collectable))
-                  (not (type? proc process-focusable))
-                  (> (-> block num-params) 0)
-                  (time-elapsed? (-> self act-time) (seconds 0.4))
-                  )
-         (set-time! (-> self act-time))
-         (send-event proc 'attack (-> block param 0)
-                     (static-attack-info :mask (penetrate-using)
-                                         ((id (new-attack-id))
-                                          (damage 1.0)
-                                          (mode 'explode)
-                                          (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
-                                          )))
-         )
        #t
        )
       (('get-pickup)
@@ -623,7 +554,6 @@
     )
   :trans (behavior ()
     (spybot-update)
-    (spybot-ride-update self)
     (spybot-touch self)
     (spybot-collect self)
     )
@@ -647,13 +577,13 @@
           (the-as (function collide-shape-moving collide-query vector vector object) nothing)
           )
     (set! (-> cs penetrated-by) (the-as penetrate -1))
-    (let ((grp (new 'process 'collide-shape-prim-group cs (the-as uint 3) 0)))
-      (set! (-> cs total-prims) (the-as uint 4))
+    (let ((grp (new 'process 'collide-shape-prim-group cs (the-as uint 2) 0)))
+      (set! (-> cs total-prims) (the-as uint 3))
       (set! (-> grp prim-core collide-as) (collide-spec bot))
       ;; the group's collide-with gates its children: the engine only tests the pickup sphere against things the GROUP
       ;; may collide with, and pickups are not backgnd/obstacle/hit-by-others. The bot's group is #xffffffff for the same reason.
       (set! (-> grp prim-core collide-with) (the-as collide-spec #xffffffff))
-      (set! (-> grp prim-core action) (collide-action solid can-ride))
+      (set! (-> grp prim-core action) (collide-action solid))
       (set! (-> grp transform-index) 3)
       (set-vector! (-> grp local-sphere) 0.0 0.0 0.0 4300.8)
       (set! (-> cs root-prim) grp)
@@ -673,16 +603,6 @@
       (set! (-> pk prim-core action) (collide-action solid no-standon))
       (set! (-> pk transform-index) 3)
       (set-vector! (-> pk local-sphere) 0.0 0.0 0.0 *spybot-pickup-radius*)
-      )
-    ;; ride sphere (same recipe as the bot's): the platform's detect-riders! needs the rider's root prim to have can-ride AND one
-    ;; child sphere with can-ride whose surface is near the platform mesh. Centred on the root, bottom at the feet, collides with
-    ;; nothing so it never makes touch events.
-    (let ((ride (new 'process 'collide-shape-prim-sphere cs (the-as uint 0))))
-      (set! (-> ride prim-core collide-as) (collide-spec jak))
-      (set! (-> ride prim-core collide-with) (collide-spec))
-      (set! (-> ride prim-core action) (collide-action can-ride))
-      (set! (-> ride transform-index) -2)
-      (set-vector! (-> ride local-sphere) 0.0 2048.0 0.0 2048.0)
       )
     (set! (-> cs nav-radius) 4096.0)
     (let ((v1 (-> cs root-prim)))
@@ -714,7 +634,6 @@
   (set! (-> self nova-ready) 0)
   (set! (-> self jak-held) 0)
   (set! (-> self nova-end) 0)
-  (set! (-> self act-time) 0)
   (set! (-> self cur-anim) 3)
   (ja-channel-set! 1)
   (ja :group! (-> self draw art-group data 3) :num! min)
