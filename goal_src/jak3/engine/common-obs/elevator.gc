@@ -37,6 +37,17 @@
 
 ;; DECOMP BEGINS
 
+;; blast bot (blastbot-main-mod.gc): tells the bot an elevator camera started (#t) / ended (#f)
+(define-extern blast-bot-elevator-cam (function symbol none))
+(define-extern blast-bot-elevator-cam-tick (function process float symbol symbol))
+(define-extern blast-bot-elevator-lift (function float none))
+(define-extern *blast-bot-elev-jump-to* float)
+
+;; debug (camera sequence of scripted elevators): prints once a second while an elevator is running, and every time the camera
+;; entity changes. Works with or without the bot, so the two logs can be compared.
+(define *elev-cam-dbg-time* 0)
+(define *elev-cam-dbg-name* (the-as string #f))
+
 (deftype elevator-params (structure)
   ((xz-threshold  float)
    (y-threshold   float)
@@ -236,10 +247,12 @@
      #t
      )
     (('use-camera)
+     (format 0 "Elevator ~A: use-camera ~A (from ~A)~%" (-> self name) (-> arg3 param 0) (if arg0 (-> arg0 name) "?"))
      (if (-> arg3 param 0)
          (set-setting! 'entity-name (-> arg3 param 0) 0.0 0)
          (remove-setting! 'entity-name)
          )
+     (blast-bot-elevator-cam (if (-> arg3 param 0) #t #f))
      )
     (('move-to)
      (when (and (-> self next-state) (let ((v1-20 (-> self next-state name)))
@@ -320,7 +333,21 @@
         (+ (-> self move-pos 0) (* (-> self path-pos) (- (-> self move-pos 1) (-> self move-pos 0))))
         )
        (('player-standing-on?)
-        (= (-> self sticky-player-last-ride-time) (current-time))
+        ;; Vanilla asks "was I ridden on exactly THIS tick?". running's :code asks it once, on its first run, to decide whether to
+        ;; fire the on-up / on-down scripts (the scripted camera and the transition). The 'ridden event that sets the time comes
+        ;; from the rider, and whether it lands before or after this elevator's own run in the same frame depends on process order.
+        ;; A rider that is not the one the engine detects itself (Jak parked in the bot's grab-ride) can arrive a tick late, so
+        ;; the exact test fails and the scripts never run. Accept a ridden event from the last 0.2 s instead.
+        (let ((exact (= (-> self sticky-player-last-ride-time) (current-time)))
+              (recent (< (- (current-time) (-> self sticky-player-last-ride-time)) (seconds 0.2)))
+              )
+          (if (and recent (not exact))
+              (format 0 "Elevator ~A: player-standing-on? was #f on the exact tick, accepted (ridden ~D ticks ago)~%"
+                      (-> self name)
+                      (- (current-time) (-> self sticky-player-last-ride-time)))
+              )
+          recent
+          )
         )
        (('point-inside-shaft?)
         (point-inside-shaft? self (the-as vector (-> arg3 param 1)) (-> self bottom-top 1) (-> self bottom-top 0))
@@ -436,6 +463,9 @@
 (defbehavior teleport-check elevator ()
   (when (and *target* (logtest? (-> self params flags) (elevator-flags teleport)) (focus-test? *target* teleporting))
     (let ((sv-16 (the-as float 0.0)))
+      ;; debug: shows whether the elevator's skip (teleport) happens at all, and where it thinks Jak is
+      (format 0 "Elevator ~A: teleport-check, Jak at y ~M x ~M, path point found ~A~%" (-> self name) (-> (target-pos 0) y) (-> (target-pos 0) x)
+              (find-closest-point-in-path! self (target-pos 0) (& sv-16) #f #t))
       (when (find-closest-point-in-path! self (target-pos 0) (& sv-16) #f #t)
         (set! (-> self move-pos 0) sv-16)
         (set! (-> self move-pos 1) sv-16)
@@ -585,10 +615,21 @@
       (set-setting! 'board #f 0.0 0)
       (set-setting! 'lightjak #f 0.0 0)
       (toggle-fence-collision self #t)
-      (if (logtest? (-> self params flags) (elevator-flags grab))
+      ;; Do not replace an active vehicle grab-ride with the elevator's normal grab.
+      (if (and (logtest? (-> self params flags) (elevator-flags grab))
+               *target*
+               (not (and (-> *target* next-state)
+                         (= (-> *target* next-state name) 'target-grab-ride))))
           (process-grab? *target* #f)
           )
       )
+    ;; debug: the level's own scripts for this elevator (this is where its camera / transitions are defined)
+    (format 0 "Elevator ~A scripts: activate-test ~A~%" (-> self name) (-> self activate-test))
+    (format 0 "Elevator ~A scripts: on-activate ~A~%" (-> self name) (-> self on-activate))
+    (format 0 "Elevator ~A scripts: on-running ~A~%" (-> self name) (-> self on-running))
+    (format 0 "Elevator ~A scripts: on-up ~A~%" (-> self name) (-> self on-up))
+    (format 0 "Elevator ~A scripts: on-down ~A~%" (-> self name) (-> self on-down))
+    (format 0 "Elevator ~A scripts: on-deactivate ~A~%" (-> self name) (-> self on-deactivate))
     (let ((gp-1 (-> self on-activate)))
       (if gp-1
           (script-eval gp-1 :key (* (the int (-> self move-pos 0)) 8) :vector (-> self root trans))
@@ -616,7 +657,9 @@
         (set! (-> self path-dest) 1.0)
         )
     (if (and (logtest? (-> self params flags) (elevator-flags grab))
-             (and *target* (not (logtest? (-> *target* focus-status) (focus-status grabbed))))
+             (and *target* (not (logtest? (-> *target* focus-status) (focus-status grabbed)))
+                  (not (and (-> *target* next-state)
+                            (= (-> *target* next-state name) 'target-grab-ride))))
              )
         (process-grab? *target* #f)
         )
@@ -634,6 +677,48 @@
       (if gp-0
           (script-eval gp-0 :key (* (the int (-> self move-pos 0)) 8) :vector (-> self root trans))
           )
+      )
+    ;; the bot sent Jak to the top (camera skip): finish the ride now, so on-deactivate (camera released, Jak and the bot freed)
+    ;; runs right away instead of the elevator creeping on with Jak held in target-grab
+    (let ((r (blast-bot-elevator-cam-tick self (-> self root trans y) (if (send-event self 'query 'going-up?) #t #f))))
+      (cond
+        ((= r 'finish)   ;; instant skip: arrive now
+         (set! (-> self path-pos) 1.0)
+         )
+        ((= r 'lift)     ;; final segment: the platform jumps ahead to just below the top and the bot (+ Jak) is put on it,
+                         ;; the last few metres are ridden normally and the ride ends as usual
+         (let ((top (new 'stack-no-clear 'vector))
+               (np *blast-bot-elev-jump-to*)
+               )
+           (when (< (-> self path-pos) np)
+             (get-point-in-path! (-> self path) top
+                                 (+ (-> self move-pos 0)
+                                    (* (ease-value-in-out np 0.08) (- (-> self move-pos 1) (-> self move-pos 0)))
+                                    )
+                                 'interp)
+             (blast-bot-elevator-lift (- (-> top y) (-> self basetrans y)))
+             (set! (-> self path-pos) np)
+             )
+           )
+         )
+        )
+      )
+    (when *camera*
+      (let ((cn (-> *camera* settings real-entity-name)))
+        (when (!= cn *elev-cam-dbg-name*)
+          (set! *elev-cam-dbg-name* cn)
+          (format 0 "ELEV CAM: entity is now ~A (elevator y ~f m)~%" cn (/ (-> self root trans y) 4096.0))
+          )
+        )
+      (when (time-elapsed? *elev-cam-dbg-time* (seconds 1))
+        (set! *elev-cam-dbg-time* (current-time))
+        (format 0 "ELEV CAM: ~A mode ~A | elevator y ~f | camera tracks y ~f | Jak y ~f (m)~%"
+                (-> *camera* settings real-entity-name)
+                (-> *camera* settings cam-mode)
+                (/ (-> self root trans y) 4096.0)
+                (/ (-> *camera* tpos-curr y) 4096.0)
+                (if *target* (/ (-> (target-pos 0) y) 4096.0) 0.0))
+        )
       )
     (plat-trans)
     )

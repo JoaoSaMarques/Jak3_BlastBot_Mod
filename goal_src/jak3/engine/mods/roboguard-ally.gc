@@ -126,7 +126,7 @@
        (!= (handle->process (-> this owner-handle)) p)
        (not (focus-test? p inactive))
        (not (blast-target-dead? p))
-       (logtest? (process-mask enemy guard metalhead kg-robot vehicle) (-> p mask))
+       (logtest? (process-mask enemy guard metalhead kg-robot) (-> p mask))
        (not (logtest? (process-mask crate civilian) (-> p mask)))
        (not (spydroid-ally-ignored-type? p))
        (not (logtest? (-> p focus-status) (focus-status disable dead ignore grabbed)))

@@ -1,0 +1,287 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: blastbot-elevator.gc
+;; name in dgo: blastbot-elevator
+;; dgos: GAME
+
+;; Everything the Blast Bot does while Jak rides an elevator that changes level (camera sequence, level loads, the skip that
+;; jumps the platform ahead, putting the bot back on the platform). It used to sit in blastbot-main-mod.gc.
+;;
+;; game.gd: this file goes right after blastbot-main-mod.o (it needs the blast-bot-player type and blast-bot-teleport-to from
+;; there) and before blastbot-vehicle.o. elevator.gc loads much earlier and reaches the functions below through its
+;; define-extern lines (blast-bot-elevator-cam, -cam-tick, -lift and *blast-bot-elev-jump-to*), so it needs no change.
+;;
+;; blastbot-main-mod.gc only calls blast-bot-elevator-update (every frame, from blast-bot-regrab) and reads *blast-bot-elev-cam*.
+;;
+;; ADDING AN ELEVATOR: define another blast-bot-elev-cfg like *blast-bot-elev-waspala* below and add one line to
+;; blast-bot-elev-config. Heights are in meters, scripts are run with script-eval at the stage they belong to.
+
+(define-extern blast-bot-find (function process))
+
+;; ---------------------------------------------------------------------------------------------------------------------
+;; per-elevator data
+;; ---------------------------------------------------------------------------------------------------------------------
+;; A ride has two stages per direction. Going up the stage fires when the platform is AT OR ABOVE its height, going down when
+;; it is AT OR BELOW. Each stage fires its camera (use-camera) and optionally a script. At *-skip-rank* (1, 2 or -1 = none) the
+;; platform also jumps ahead to the *-jump fraction (0..1) of the ride, with the bot put on it.
+(deftype blast-bot-elev-cfg (structure)
+  ((name             string)
+   ;; going up
+   (up-cam1          string)
+   (up-y1            float)
+   (up-script1       object)
+   (up-cam2          string)
+   (up-y2            float)
+   (up-script2       object)
+   (up-skip-rank     int32)
+   (up-jump          float)
+   (up-continue      string)    ;; only used by the instant skip
+   ;; going down
+   (down-cam1        string)
+   (down-y1          float)
+   (down-script1     object)
+   (down-cam2        string)
+   (down-y2          float)
+   (down-script2     object)
+   (down-skip-rank   int32)
+   (down-jump        float)
+   (down-continue    string)
+   )
+  )
+
+;; wasteland city <-> palace elevator.
+;;   up   : camera-297 at the start (the elevator's own script), camera-298 at 48 m, camera-299 at 86.4 m (+ skip: jumps to 0.935,
+;;          about 6 m below the top, like the original's 86 -> 240 m). The level loads for the way up are in the elevator's script.
+;;   down : camera-302 at the start (script), camera-298 at 215.8 m (+ skip: jumps to 0.80, about 70 m from the bottom),
+;;          camera-301 at 48.1 m. The level below (wascityb) has to be asked for HERE: want-load adds it to the load list (want-vis
+;;          alone does not), waspala is left out so it is the one discarded. The jump must not go near the bottom: wascityb
+;;          needs the rest of the ride to load.
+(define *blast-bot-elev-waspala*
+  (new 'static 'blast-bot-elev-cfg
+       :name "waspala-elevator-2"
+       :up-cam1 "camera-298" :up-y1 48.0 :up-script1 #f
+       :up-cam2 "camera-299" :up-y2 86.4 :up-script2 #f
+       :up-skip-rank 2 :up-jump 0.935 :up-continue "waspala-start"
+       :down-cam1 "camera-298" :down-y1 215.8
+       :down-script1 '(begin
+                        (want-load 'wasall 'waswide 'wascitya 'wascityb)
+                        (want-vis 'wascityb)
+                        (want-display 'wascityb 'display))
+       :down-cam2 "camera-301" :down-y2 48.1
+       ;; asked again in case the first request was dropped while waspala was still being discarded
+       :down-script2 '(begin
+                        (want-load 'wasall 'waswide 'wascitya 'wascityb)
+                        (want-vis 'wascityb)
+                        (want-display 'wascityb 'display)
+                        (want-display 'waswide 'display))
+       :down-skip-rank 1 :down-jump 0.80 :down-continue "wascitya-outside-waspala"
+       )
+  )
+
+(defun blast-bot-elev-config ((name string))
+  ;; the data for the elevator called NAME, #f = the bot does not handle this elevator (its own level triggers do everything)
+  (cond
+    ((string= name "waspala-elevator-2") *blast-bot-elev-waspala*)
+    (else (the-as blast-bot-elev-cfg #f))
+    )
+  )
+
+;; ---------------------------------------------------------------------------------------------------------------------
+;; state and settings
+;; ---------------------------------------------------------------------------------------------------------------------
+;; Elevator cameras (elevator.gc 'use-camera): while a scripted elevator camera is active the bot must not pull the camera back
+;; onto itself (that was the hard cut in the middle of the ride). Time it started, 0 = none. Ignored after 30 s as a safety net
+;; in case the elevator never sends the release. (blastbot-main-mod.gc reads this one.)
+(define *blast-bot-elev-cam* 0)
+;; #f = after an elevator camera the camera just stays on Jak (he is at the bot's position anyway), so there is no retarget cut.
+;; #t = point the camera at the bot again *blast-bot-cam-delay* after the elevator camera ends (the old behaviour).
+(define *blast-bot-elev-retarget* #f)
+;; #t = (OFF by default) when the elevator gives its camera back, the follow camera is placed straight at the destination
+;; (camera 'teleport) instead of blending from the shaft camera.
+(define *blast-bot-elev-snap* #f)
+(define *blast-bot-elev-snap-until* 0)   ;; end of the short window in which the camera is held snapped (0 = off)
+;; #t = for the length of an elevator camera the camera FOCUS is put back on Jak (like the original game, where the elevator's
+;; camera sequence works). With the focus on the bot those switches never happen.
+(define *blast-bot-elev-focus-jak* #t)
+(define *blast-bot-last-cam-name* (the-as string #f))   ;; debug: last camera entity seen while an elevator camera is active
+;; #t = the bot fires the elevator's camera sequence itself (with Jak parked in the bot's grab-ride the level's region triggers never fire)
+(define *blast-bot-elev-seq* #t)
+(define *blast-bot-elev-cam-sent* (the-as string #f))
+;; #t = at the skip stage the platform jumps ahead (see blast-bot-elev-cfg)
+(define *blast-bot-elev-skip* #t)
+;; #t = the skip sends Jak to the elevator's continue point instead (instant, no ride)
+(define *blast-bot-elev-instant* #f)
+(define *blast-bot-elev-jump-to* 0.935)   ;; the jump fraction in use, set per ride (elevator.gc reads it)
+(define *blast-bot-lift-y* 0.0)           ;; fallback height for the bot after the jump
+(define *blast-bot-lift-off* 0.0)         ;; bot height above the platform when the lift was asked for
+(define *blast-bot-lift-time* 0)          ;; when the lift was asked for (0 = none); applied on a LATER frame, after the platform moved
+(define *blast-bot-elev-dir* 0)           ;; latched on the first call of a ride: 0 = not latched, 1 = up, 2 = down
+(define *blast-bot-elev-stage* 0)         ;; highest stage fired so far in this ride; a stage never goes back
+
+;; ---------------------------------------------------------------------------------------------------------------------
+;; called from elevator.gc
+;; ---------------------------------------------------------------------------------------------------------------------
+(defun blast-bot-elevator-lift ((dy float))
+  ;; the elevator is about to jump DY up: remember where the bot has to end up. The final height is taken from the platform
+  ;; itself on the next frame (offset above it), because the path interpolation used for DY does not match where the platform
+  ;; really ends up (going down the bot was left several metres off and fell through).
+  (let ((bot (the-as blast-bot-player (blast-bot-find)))
+        (el (process-by-ename "waspala-elevator-2"))
+        )
+    (when bot
+      (set! *blast-bot-lift-y* (+ (-> bot root trans y) dy))   ;; fallback only
+      (set! *blast-bot-lift-off* (if el
+                                     (- (-> bot root trans y) (-> (the-as elevator el) root trans y))
+                                     0.0))
+      (set! *blast-bot-lift-time* (current-time))
+      (format 0 "Blast Bot: elevator lift, bot goes ~f m up with the platform (offset ~f m, platform found: ~A)~%"
+              (/ dy 4096.0) (/ *blast-bot-lift-off* 4096.0) (if el #t #f))
+      )
+    )
+  (none)
+  )
+
+;; Called every frame from the running elevator (elevator.gc). The direction is latched on the first call of a ride and a stage
+;; never goes back (the elevator's own going-up? flips once the skip has moved it). Returns #t-ish on the frame the elevator has
+;; to do something: 'lift = jump ahead (elevator.gc does it), 'finish = arrive at once.
+(defun blast-bot-elevator-cam-tick ((elev process) (y float) (up symbol))
+  (let ((finish #f)
+        (cfg (blast-bot-elev-config (-> elev name)))
+        )
+    (when (and cfg
+               *blast-bot-elev-seq*
+               (nonzero? *blast-bot-elev-cam*)
+               (blast-bot-find)   ;; without the bot the level's own triggers do all of this
+               )
+      (if (zero? *blast-bot-elev-dir*)
+          (set! *blast-bot-elev-dir* (if up 1 2))
+          )
+      (let ((m (/ y 4096.0))
+            (going-up (= *blast-bot-elev-dir* 1))
+            (rank 0)
+            (want (the-as string #f))
+            (script (the-as object #f))
+            )
+        (if going-up
+            (cond
+              ((>= m (-> cfg up-y2))
+               (set! rank 2) (set! want (-> cfg up-cam2)) (set! script (-> cfg up-script2)))
+              ((>= m (-> cfg up-y1))
+               (set! rank 1) (set! want (-> cfg up-cam1)) (set! script (-> cfg up-script1)))
+              )
+            (cond
+              ((<= m (-> cfg down-y2))
+               (set! rank 2) (set! want (-> cfg down-cam2)) (set! script (-> cfg down-script2)))
+              ((<= m (-> cfg down-y1))
+               (set! rank 1) (set! want (-> cfg down-cam1)) (set! script (-> cfg down-script1)))
+              )
+            )
+        (when (> rank *blast-bot-elev-stage*)
+          (set! *blast-bot-elev-stage* rank)
+          (set! *blast-bot-elev-cam-sent* want)
+          (format 0 "Blast Bot: elevator camera sequence -> ~A at ~f m~%" want m)
+          (send-event elev 'use-camera want)
+          ;; the level's own triggers do more than the camera (they switch the loaded level): run the stage's script
+          (when script
+            (script-eval (the-as pair script))
+            (format 0 "Blast Bot: elevator level step for ~A~%" want)
+            )
+          (when (and (= rank (if going-up (-> cfg up-skip-rank) (-> cfg down-skip-rank)))
+                     *blast-bot-elev-skip*
+                     *target*)
+            (cond
+              (*blast-bot-elev-instant*
+                (let ((cp (get-continue-by-name *game-info* (if going-up (-> cfg up-continue) (-> cfg down-continue)))))
+                  (format 0 "Blast Bot: elevator skip (instant), continue found: ~A~%" (if cp #t #f))
+                  (when cp
+                    (send-event *target* 'continue cp)
+                    (set! finish 'finish)
+                    )
+                  )
+                )
+              (else
+                (set! *blast-bot-elev-jump-to* (if going-up (-> cfg up-jump) (-> cfg down-jump)))
+                (set! finish 'lift)
+                )
+              )
+            )
+          )
+        )
+      )
+    finish
+    )
+  )
+
+(defun blast-bot-elevator-cam ((on symbol))
+  (cond
+    (on
+      (let ((first (zero? *blast-bot-elev-cam*)))
+        (set! *blast-bot-elev-cam* (current-time))
+        (when first
+          (set! *blast-bot-elev-cam-sent* (the-as string #f))
+          (set! *blast-bot-elev-dir* 0)
+          (set! *blast-bot-elev-stage* 0)
+          (format 0 "Blast Bot: elevator camera on, bot will not take the camera~%")
+          (when (and *blast-bot-elev-focus-jak* *camera* *target* (not *blast-bot-spy-active*))
+            (format 0 "Blast Bot: camera focus -> Jak for the elevator ride~%")
+            (send-event *camera* 'change-target *target*)
+            )
+          )
+        )
+      )
+    (else
+      (format 0 "Blast Bot: elevator camera released, retarget onto the bot: ~A~%" *blast-bot-elev-retarget*)
+      ;; the elevator gave its camera back: let the game's own blend back to the follow camera finish (the usual wait)
+      ;; before the camera is pointed at the bot again
+      (set! *blast-bot-elev-cam* 0)
+      (set! *blast-bot-continue-time* (current-time))
+      (set! *blast-bot-cam-pending* *blast-bot-elev-retarget*)
+      (if *blast-bot-elev-snap*
+          (set! *blast-bot-elev-snap-until* (+ (current-time) (seconds 0.3)))
+          )
+      )
+    )
+  (none)
+  )
+
+;; ---------------------------------------------------------------------------------------------------------------------
+;; called every frame from blast-bot-regrab (blastbot-main-mod.gc)
+;; ---------------------------------------------------------------------------------------------------------------------
+(defun blast-bot-elevator-update ((this blast-bot-player))
+  ;; the elevator jumped (blast-bot-elevator-lift): on the next frame, after the platform has moved, put the bot (and Jak,
+  ;; parked in it) on it, at the platform's real height plus the offset the bot had above it.
+  (when (and (nonzero? *blast-bot-lift-time*) (> (current-time) *blast-bot-lift-time*))
+    (set! *blast-bot-lift-time* 0)
+    (let ((p (new 'stack-no-clear 'vector)))
+      (vector-copy! p (-> this root trans))
+      (let ((el (process-by-ename "waspala-elevator-2")))
+        (set! (-> p y) (if el
+                           (+ (-> (the-as elevator el) root trans y) *blast-bot-lift-off*)
+                           *blast-bot-lift-y*))
+        )
+      (blast-bot-teleport-to this p)
+      (if *target*
+          (move-to-point! (-> *target* control) p)
+          )
+      )
+    )
+  ;; debug: while an elevator camera is active print every camera entity change (shows whether the camera switches happen at
+  ;; all, and which entities they are)
+  (when (and (nonzero? *blast-bot-elev-cam*) *camera*)
+    (let ((cn (-> *camera* settings real-entity-name)))
+      (when (!= cn *blast-bot-last-cam-name*)
+        (set! *blast-bot-last-cam-name* cn)
+        (format 0 "Blast Bot: elevator ride camera entity is now ~A~%" cn)
+        )
+      )
+    )
+  ;; Elevator camera released: for 0.3 s keep teleporting the camera so the new follow camera starts at the destination.
+  (when (nonzero? *blast-bot-elev-snap-until*)
+    (if (and *camera* (< (current-time) *blast-bot-elev-snap-until*))
+        (send-event *camera* 'teleport)
+        (set! *blast-bot-elev-snap-until* 0)
+        )
+    )
+  (none)
+  )

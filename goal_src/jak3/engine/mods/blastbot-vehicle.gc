@@ -203,7 +203,7 @@
 ;; every sphere of the car's collision shape is shrunk by *blast-bot-ride-shrink* (4096 = 1 m; never below 40 % of its radius).
 ;; The original radii are stored and given back when the ride ends. (The mesh part of the shape cannot be scaled.)
 (define *blast-bot-ride-shrink* 4096.0)      ;; every collision sphere of the car gets this much smaller (4096 = 1 m, never below 40 % of its radius)
-(define *blast-bot-ride-pull* 0.3)           ;; ... and its centre is pulled this far toward the car's middle (x / z only; 1.0 = leave it, 0.0 = middle)
+(define *blast-bot-ride-pull* 1.0)           ;; ... and its centre is pulled this far toward the car's middle (x / z only; 1.0 = leave it, 0.0 = middle)
 (define *blast-bot-ride-hb-on* #f)
 (define *blast-bot-ride-hb-debug* #f)        ;; #t: print every sphere that is changed (game units, 4096 = 1 m)
 (define *blast-bot-ride-hb-i* 0)
@@ -521,9 +521,9 @@
 ;;   light  (Tough Puppy v-turtle, Dune Hopper v-toad)                                  +50
 ;;   medium (Sand Shark v-snake, Heat Seeker v-fox, Dust Demon v-mirage, Desert Screamer v-x-ride)  +40
 ;;   heavy  (Gila Stomper v-scorpion, Slam Dozer v-rhino)                                +100
-(define *blast-bot-vehicle-hp-light* 50.0)
-(define *blast-bot-vehicle-hp-medium* 40.0)
-(define *blast-bot-vehicle-hp-heavy* 100.0)
+(define *blast-bot-vehicle-hp-light* 150.0)
+(define *blast-bot-vehicle-hp-medium* 100.0)
+(define *blast-bot-vehicle-hp-heavy* 250.0)
 
 ;; #t if the process is of the vehicle type sym or of a type that inherits from it (the vehicle types live in per-level DGOs,
 ;; so they are compared by name, not by type object)

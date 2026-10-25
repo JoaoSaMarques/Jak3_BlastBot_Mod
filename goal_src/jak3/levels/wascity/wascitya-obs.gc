@@ -68,13 +68,26 @@
               :bounds (static-spherem 0 20 0 30)
               )
 
+;; The active Blast Bot source defines this in GAME.  Waspala is loaded in WCA.
+(define-extern blast-bot-find (function process))
+
 (defmethod elevator-method-47 ((this waspala-elevator))
-  (if *target*
-      (< (vector-vector-xz-distance (target-pos 0) (-> this root trans))
-         (* 0.4 (-> this root root-prim prim-core world-sphere w))
-         )
-      #f
-      )
+  ;; Waspala uniquely validates rider proximity against Jak. While Jak is
+  ;; hidden inside the bot, test the actual passenger instead. Fall back to
+  ;; stock logic when Blast Bot isn't present.
+  (let ((bot (the-as process-focusable (blast-bot-find))))
+    (if bot
+        (< (vector-vector-xz-distance (-> bot root trans) (-> this root trans))
+           (* 0.4 (-> this root root-prim prim-core world-sphere w))
+           )
+        (if *target*
+            (< (vector-vector-xz-distance (target-pos 0) (-> this root trans))
+               (* 0.4 (-> this root root-prim prim-core world-sphere w))
+               )
+            #f
+            )
+        )
+    )
   )
 
 (defmethod get-art-group ((this waspala-elevator))

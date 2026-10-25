@@ -7,6 +7,9 @@
 
 ;; DECOMP BEGINS
 
+;; blast bot (blastbot-main-mod.gc): while #t, Jak never shows as `grabbed` / `ignore` to other processes inside the bot's grab-ride
+(define-extern *blast-bot-clear-grabbed* symbol)
+
 (let ((a0-1 (copy *walk-no-turn-mods* 'global)))
   (set! (-> a0-1 flags) (surface-flag gun-off gun-fast-exit))
   (set! *trip-mods* a0-1)
@@ -632,6 +635,12 @@
   :event (-> target-grab event)
   :enter (behavior ((arg0 handle))
     ((-> target-grab enter) 'stance)
+    ;; blast bot: target-grab's enter sets `grabbed` (and `ignore`). Elevators with the grab flag release a grabbed Jak every
+    ;; frame (process-release? in their arrived state), which threw him out of the bot again as soon as he got in. Clearing the
+    ;; flags right here, in the same run, means no other process ever sees them.
+    (if *blast-bot-clear-grabbed*
+        (logclear! (-> self focus-status) (focus-status grabbed ignore))
+        )
     )
   :exit (behavior ()
     ((-> target-grab exit))
@@ -647,13 +656,29 @@
       )
     0
     (ja-channel-set! 0)
-    (until #f
-      (let ((a0-6 (as-type (handle->process arg0) process-focusable)))
-        (if a0-6
-            (move-to-point! (-> self control) (get-trans (the-as process-focusable a0-6) 0))
+    (let ((gone-since (the-as time-frame 0)))
+      (until #f
+        (let ((a0-6 (as-type (handle->process arg0) process-focusable)))
+          (cond
+            (a0-6
+             (set! gone-since 0)
+             (move-to-point! (-> self control) (get-trans (the-as process-focusable a0-6) 0))
+             )
+            (else
+              ;; blast bot: whatever Jak is riding no longer exists (the bot was killed / unloaded without releasing him). He used
+              ;; to hang here forever, frozen, with the bot's auto-spawn waiting for him to be free. Let him go after 1.5 s.
+              (if (zero? gone-since)
+                  (set! gone-since (current-time))
+                  )
+              (when (>= (- (current-time) gone-since) (seconds 1.5))
+                (format 0 "Blast Bot: the ride Jak was parked in is gone, freeing him~%")
+                (go target-stance)
+                )
+              )
             )
+          )
+        (suspend)
         )
-      (suspend)
       )
     #f
     )

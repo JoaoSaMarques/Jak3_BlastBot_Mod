@@ -117,7 +117,8 @@
 ;; on-screen platform / rider debug text (top-left console); set to #f from the REPL to hide it
 (define *blast-bot-debug-ride* #f)
 (define *blast-bot-ride-seen* (the-as string #t))
-(define *blast-bot-elevator-draw-hidden* #f)
+(define *blast-bot-on-elevator* #f)
+(define *blast-bot-jak-hidden-by-bot* #f)
 
 ;; #t = everything the bot kills counts as Jak's kill (mission kill counters). Side effect: enemies see Jak as their
 ;; attacker. #f = the bot is its own attacker, which is the old behaviour where enemies fought back at the bot.
@@ -172,7 +173,14 @@
 ;; how fast the body turns toward the stick direction (rotation units/sec, 21845 = 120 deg/s)
 (define *blast-bot-body-turn-rate* 21845.0)
 ;; wall blocking: radius of the sweep sphere, and how high above the ground it is centred
-(define *blast-bot-wall-radius* 18432.0)   ;; was 14336.0 in this file, but blastbot-vehicle.gc redefined it to 20480.0 later, so 20480.0 is what was really used; now this is the only definition
+(define *blast-bot-wall-radius* 17408.0)   ;; was 14336.0 in this file, but blastbot-vehicle.gc redefined it to 20480.0 later, so 20480.0 is what was really used; now this is the only definition
+;; Half-size of the boxes the bot fills the collide cache with. The cache holds only ~460 triangles; in dense places (the palace
+;; elevator frame, planks, pots) the old 10 m boxes overflowed it ("Exceeded collide cache max # of tris (blast-bot-player)") and
+;; the triangles dropped included the platform floor, so the feet / body fell through it. Smaller boxes still cover the 4.5 m wall
+;; sphere + a frame of movement, and the feet's reach. Raise them if feet or walls get missed, lower them if the message returns.
+(define *blast-bot-leg-fill-xz* 32768.0)    ;; 8 m   (was 10 m)
+(define *blast-bot-wall-fill-xz* 30720.0)   ;; 7.5 m (was 10 m)
+(define *blast-bot-wall-fill-y* 28672.0)    ;; 7 m   (was 8 m)
 (define *blast-bot-wall-height* 26624.0)   ;; was 20480.0. Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
 ;; how much of the leg-lift tilt goes into the body the legs hang from. The head gets the rest,
 ;; so the head's total tilt is unchanged and the body tilts too (it also carries the head).
@@ -423,7 +431,7 @@
       )
     ;; collect nearby ground triangles once, then probe per foot
     (let ((ext (new 'stack-no-clear 'vector)))
-      (set-vector! ext 40960.0 24576.0 40960.0 1.0)
+      (set-vector! ext *blast-bot-leg-fill-xz* 24576.0 *blast-bot-leg-fill-xz* 1.0)
       (vector-! (-> q bbox min) (-> this root trans) ext)
       (vector+! (-> q bbox max) (-> this root trans) ext)
       )
@@ -938,7 +946,7 @@
     (set-vector! move dx 0.0 dz 1.0)
     (when (< 1.0 intended)
       ;; collect nearby static collision once
-      (set-vector! ext 40960.0 32768.0 40960.0 1.0)
+      (set-vector! ext *blast-bot-wall-fill-xz* *blast-bot-wall-fill-y* *blast-bot-wall-fill-xz* 1.0)
       (set-vector! start (-> this root trans x) (+ (-> this root trans y) *blast-bot-wall-height*) (-> this root trans z) 1.0)
       (vector-! (-> q bbox min) start ext)
       (vector+! (-> q bbox max) start ext)
@@ -1977,6 +1985,7 @@
   ;; (elevator.gc), so look for a platform under the feet and send it 'ridden ourselves with Jak as the rider.
   ;; The actual carrying is done by the engine (the ride sphere + can-ride in the collision setup).
   (set! *blast-bot-ride-seen* (the-as string #f))
+  (set! *blast-bot-on-elevator* #f)
   (when (and *target* (!= (-> this jump-mode) 2))
     (let ((q (new 'stack-no-clear 'collide-query)))
       (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 8192.0)
@@ -2000,6 +2009,11 @@
                     )
                 (when proc
                   (set! *blast-bot-ride-seen* (-> proc name))
+                  ;; Elevator actors can use a non-'elevator process type.
+                  ;; Treat a rideable moving platform detected beneath the bot as an elevator.
+                  (when (type? proc elevator)
+                    (set! *blast-bot-on-elevator* #t)
+                    )
                   (set! (-> f handle) (process->handle *target*))
                   (send-event proc 'ridden f)
                   )
@@ -2113,6 +2127,11 @@
 (define *blast-bot-cam-pending* #f)
 (define *blast-bot-cam-delay* (seconds 3))
 
+;; Elevator ride handling (camera sequence, level loads, skip, putting the bot back on the platform) is in blastbot-elevator.gc,
+;; which loads right after this file. These are the two things this file needs from it.
+(define-extern *blast-bot-elev-cam* int)   ;; time an elevator camera started, 0 = none
+(define-extern blast-bot-elevator-update (function blast-bot-player none))
+
 (define *blast-bot-regrab-fails* 0)    ;; consecutive "put him back" requests that did not end in target-grab-ride
 (define *blast-bot-regrab-debug* #t)   ;; print what Jak answers to the grab-ride request (to see why a regrab keeps failing)
 
@@ -2120,6 +2139,8 @@
   ;; Cutscenes (and elevators with the grab flag) send Jak a 'grab, which kicks him out of target-grab-ride, and when
   ;; they end he is released far away from the bot. Any state that is not in blast-bot-jak-busy? gets him put back
   ;; into the bot (blacklist instead of a list of allowed states, so unexpected post-cutscene states work too).
+  ;; elevator ride bookkeeping (put the bot back on the jumped platform, camera debug / snap): blastbot-elevator.gc
+  (blast-bot-elevator-update this)
   (when *target*
     ;; The elevator does not teleport Jak itself: it only reads Jak's `teleporting` focus status (teleport-check in elevator.gc)
     ;; and jumps to the path point nearest to him. So that flag is the exact moment the game moves Jak somewhere else.
@@ -2133,19 +2154,36 @@
       (format 0 "Blast Bot: Jak is teleporting, the bot goes with him~%")
       (blast-bot-teleport-to this (-> *target* control trans))
       )
-    ;; Check the full 40-meter separation every update, not just on the
-    ;; quarter-second regrab retry. Keep the existing teleporting fast path.
+    ;; Hide only while a confirmed elevator actor is under the bot.
+    ;; The target's draw event uses the persistent no-draw bit, not no-draw-temp.
+    ;; Remember whether we set it so an existing game hide is not cleared.
+    (if *blast-bot-on-elevator*
+        (when (not *blast-bot-jak-hidden-by-bot*)
+          (when (not (logtest? (-> *target* draw status) (draw-control-status no-draw)))
+            (set! *blast-bot-jak-hidden-by-bot* #t)
+            )
+          )
+        (when *blast-bot-jak-hidden-by-bot*
+          (logclear! (-> *target* draw status) (draw-control-status no-draw))
+          (set! *blast-bot-jak-hidden-by-bot* #f)
+          )
+        )
+    (when *blast-bot-jak-hidden-by-bot*
+      (logior! (-> *target* draw status) (draw-control-status no-draw))
+      )
+    ;; Distance fallback runs every frame, not only on the 0.25-second regrab retry.
     (when (and (< 0.0 *blast-bot-follow-dist*)
                (zero? *blast-bot-despawn-step*)
-               (< *blast-bot-follow-dist*
-                  (vector-vector-distance (-> this root trans) (-> *target* control trans))))
+               (< *blast-bot-follow-dist* (vector-vector-distance (-> this root trans) (-> *target* control trans))))
       (blast-bot-teleport-to this (-> *target* control trans))
       )
     (let ((st (if (-> *target* next-state) (-> *target* next-state name) #f)))
       (when (= st 'target-grab-ride)
         (set! *blast-bot-regrab-fails* 0)
-        (when (and *blast-bot-cam-pending* *camera* (>= (- (current-time) *blast-bot-continue-time*) *blast-bot-cam-delay*))
+        (when (and *blast-bot-cam-pending* *camera* (>= (- (current-time) *blast-bot-continue-time*) *blast-bot-cam-delay*)
+                   (or (zero? *blast-bot-elev-cam*) (>= (- (current-time) *blast-bot-elev-cam*) (seconds 30))))
           (set! *blast-bot-cam-pending* #f)
+          (format 0 "Blast Bot: camera now pointed at the bot (delayed retarget)~%")
           (send-event *camera* 'change-target this)
           )
         )
@@ -2161,7 +2199,8 @@
             )
           (set! *blast-bot-grab-since* 0)
           )
-      (when (and (nonzero? *blast-bot-grab-timeout*)
+      (when (and (not *blast-bot-on-elevator*)
+                 (nonzero? *blast-bot-grab-timeout*)
                  (nonzero? *blast-bot-grab-since*)
                  (> (- (current-time) *blast-bot-grab-since*) *blast-bot-grab-timeout*))
         (format 0 "Blast Bot: Jak stuck in target-grab, ending the grab~%")
@@ -2205,9 +2244,10 @@
                     (if (focus-test? *target* inactive) #t #f))
             )
           )
-        (if (and *camera* (not *blast-bot-cam-pending*))
-            (send-event *camera* 'change-target this)
-            )
+        ;; every regrab (cutscene end, teleport, level change) leaves the camera on Jak for a while instead of snapping it onto the
+        ;; bot: the game has just put the camera where the scene / continue point wants it (see *blast-bot-cam-delay*)
+        (set! *blast-bot-continue-time* (current-time))
+        (set! *blast-bot-cam-pending* #t)
         )
       )
     )
@@ -2793,11 +2833,6 @@
         )
       (blast-bot-ride-update self)
       (blast-bot-regrab self)
-      ;; Hide Jak when the bot detects a rideable platform.
-      ;; Never send draw #t automatically.
-      (when (and *target* *blast-bot-ride-seen* (not *blast-bot-elevator-draw-hidden*))
-        (set! *blast-bot-elevator-draw-hidden* #t)
-        )
       ;; keep Jak (parked in grab-ride) from blocking doors / level borders
       (when (and *target* *blast-bot-clear-grabbed* (= (blast-bot-jak-state) 'target-grab-ride))
         (logclear! (-> *target* focus-status) (focus-status grabbed ignore))
@@ -3185,6 +3220,27 @@
       )
     found
     )
+  )
+
+;; Called from target-handler.gc the moment the game sends Jak a 'continue (elevators / level doors teleport him that way): the
+;; bot goes to the same spot right then. (This used to live in blastbot-spybot.gc; that file was reverted, so it is here now.)
+(defun blast-bot-follow-continue ((cp continue-point))
+  (when (and cp
+             *target*
+             (zero? *blast-bot-despawn-step*)
+             (blast-bot-jak-alive?)
+             (= (blast-bot-jak-state) 'target-grab-ride)
+             )
+    (set! *blast-bot-continue-time* (current-time))
+    (set! *blast-bot-cam-pending* #t)
+    (let ((bot (as-type (blast-bot-find) blast-bot-player)))
+      (when bot
+        (format 0 "Blast Bot: Jak is being sent to a continue point, the bot goes with him~%")
+        (blast-bot-teleport-to bot (-> cp trans))
+        )
+      )
+    )
+  (none)
   )
 
 ;; The bot's own fixed pool. A plain dead-pool never compacts, so the bot is never moved in memory (when it was moved, the
