@@ -361,9 +361,11 @@
 
 (define *blast-bot-red-weapon* 1)         ;; 1 Scattergun, 2 Wave Concussor, 3 Plasmite RPG
 
-;; Scattergun grid. Doc: 4 wide x 2 long (8 bombs); the upgrade makes it 7 wide x 4 long.
-(define *blast-bot-scatter-cols* 4)
-(define *blast-bot-scatter-rows* 2)
+;; Scattergun: one wave of 2 grenades. The upgrade adds a second wave of 3 in front of it (the 2 land near, the 3 far).
+;; rows = number of waves, cols = grenades in each wave, front-cols = grenades in the LAST wave when there is more than one.
+(define *blast-bot-scatter-cols* 2)
+(define *blast-bot-scatter-rows* 1)
+(define *blast-bot-scatter-front-cols* 3)
 (define *blast-bot-scatter-spread* 9.0)   ;; degrees between neighbouring columns
 (define *blast-bot-scatter-speed-near* 150000.0)
 (define *blast-bot-scatter-speed-far* 250000.0)
@@ -436,7 +438,8 @@
         )
     (blast-bot-muzzle this start dir)
     (dotimes (r rows)
-      (let ((speed (if (< rows 2)
+      (let ((cols (if (and (< 1 rows) (= r (+ rows -1))) *blast-bot-scatter-front-cols* *blast-bot-scatter-cols*))
+            (speed (if (< rows 2)
                        *blast-bot-scatter-speed-far*
                        (+ *blast-bot-scatter-speed-near*
                           (* (/ (the float r) (the float (+ rows -1)))
@@ -1401,8 +1404,14 @@
 (define *blast-bot-spydroid-max-upgraded* 20)
 (define *blast-bot-blue-fast-upgraded* 0.03)   ;; Vulcan Fury upgrade: seconds between shots at full spin-up (stock 0.05)
 
+(define-extern *blast-bot-merge-stage* int)
+(define *blast-bodyguards-want* #f)
+(define *blast-bodyguard-check* (the-as time-frame 0))
+
 (defmacro blast-bot-secret? (name)
-  `(logtest? (-> *game-info* purchase-secrets) (game-secrets ,name))
+  ;; bought AND switched on in the menu (the menu's on/off toggle flips the `secrets` bit, the purchase only sets `purchase-secrets`)
+  `(and (logtest? (-> *game-info* purchase-secrets) (game-secrets ,name))
+        (logtest? (-> *game-info* secrets) (game-secrets ,name)))
   )
 
 (defun blast-bot-secrets-apply ()
@@ -1418,8 +1427,8 @@
         )
   ;; red
   (if (blast-bot-secret? gun-upgrade-red-1)
-      (begin (set! *blast-bot-scatter-cols* 7) (set! *blast-bot-scatter-rows* 4))
-      (begin (set! *blast-bot-scatter-cols* 4) (set! *blast-bot-scatter-rows* 2))
+      (begin (set! *blast-bot-scatter-cols* 2) (set! *blast-bot-scatter-rows* 2))
+      (begin (set! *blast-bot-scatter-cols* 2) (set! *blast-bot-scatter-rows* 1))
       )
   (set! *blast-bot-wave-inner-ring* (blast-bot-secret? gun-upgrade-red-2))
   (if (blast-bot-secret? gun-upgrade-red-3)
@@ -1433,30 +1442,36 @@
   (set! *blast-bot-blue-fast* (if (blast-bot-secret? gun-upgrade-blue-1) *blast-bot-blue-fast-upgraded* 0.05))
   (set! *roboguard-ally-count* (if (blast-bot-secret? gun-upgrade-blue-3) 2 1))
   ;; purple 2: Mass Inverter lifesteal (gun-upgrade-dark-2). Only ever turns ON, like god mode.
-  (when (blast-bot-secret? gun-upgrade-dark-2)
-    (set! *blast-lifesteal* #t)
-    )
+  (set! *blast-lifesteal* (blast-bot-secret? gun-upgrade-dark-2))
   ;; purple 1: Peace Maker bombs split into 3 smaller ones without splash (blast-bomb-launch)
   (set! *blast-bomb-split* (blast-bot-secret? gun-upgrade-dark-1))
   ;; yellow 1: Blaster auto-mode (the switch itself is blast-bot-auto-toggle). Like god mode these only ever turn ON, so the
   ;; REPL can still force them for testing without buying anything.
-  (when (blast-bot-secret? gun-upgrade-yellow-1)
-    (set! *blast-bot-auto-unlocked* #t)
-    )
+  (set! *blast-bot-auto-unlocked* (blast-bot-secret? gun-upgrade-yellow-1))
   ;; blue 2: Arc Wielder chains between the companions (blastbot-ordnance.gc)
-  (when (blast-bot-secret? gun-upgrade-blue-2)
-    (set! *blast-arc-chain* #t)
-    )
+  (set! *blast-arc-chain* (blast-bot-secret? gun-upgrade-blue-2))
   ;; cheat: Homing Attacks
-  (when (blast-bot-secret? darkjak-tracking)
-    (set! *blast-homing* #t)
-    )
+  (set! *blast-homing* (blast-bot-secret? darkjak-tracking))
   ;; cheat
   (set! *blast-bot-unlimited-ammo* (blast-bot-secret? endless-ammo))
   ;; invulnerable: only ever turns god mode ON, so (set! *blast-bot-god-mode* #t) from the REPL still works without the purchase
-  (when (blast-bot-secret? invulnerable)
-    (set! *blast-bot-god-mode* #t)
+  (set! *blast-bot-god-mode* (blast-bot-secret? invulnerable))
+  ;; vehicle secrets (only while merged with a vehicle) and the head-size secrets. Same menu slots as the stock vehicle upgrades:
+  ;;   vehicle-hit-points : Hero Toughness, all damage -50%      vehicle-fox  : Dark Marker Shield (hold Circle)
+  ;;   vehicle-mirage     : Dune Hopper Hops (not done yet)      vehicle-x-ride : Bodyguards (2 sentinels)
+  ;;   unlimited-turbos   : untouched (stock)                    big-head / little-head : bot head 2x / 0.5x
+  (let ((veh (= *blast-bot-merge-stage* 3)))
+    (set! *blast-bot-damage-mult* (if (and veh (blast-bot-secret? vehicle-hit-points)) 0.5 1.0))
+    (set! *blast-bot-veh-shield* (and veh (blast-bot-secret? vehicle-fox)))
+    (set! *blast-bodyguards-want* (and veh (blast-bot-secret? vehicle-x-ride)))
     )
+  (set! *blast-bot-head-scale-goal*
+        (cond
+          ((blast-bot-secret? big-head) 2.0)
+          ((blast-bot-secret? little-head) 0.5)
+          (else 1.0)
+          )
+        )
   (when *blast-bot-secrets-debug*
     (let ((sig (+ (* 1000 *spydroid-ally-count*) (* 100 *sentinel-ally-count*) (* 10 *roboguard-ally-count*)
                   (if *blast-bot-unlimited-ammo* 1 0))))
@@ -1601,8 +1616,28 @@
   (none)
   )
 
+(defun blast-bot-bodyguard-update ((this blast-bot-player))
+  ;; vehicle secret Bodyguards: two permanent sentinels while merged, removed again when the merge ends. Checked twice a second.
+  (when (>= (current-time) (+ *blast-bodyguard-check* (seconds 0.5)))
+    (set! *blast-bodyguard-check* (current-time))
+    (let ((n (sentinel-bodyguard-count)))
+      (cond
+        ((and *blast-bodyguards-want* (< n 2) (< 0.0 (-> this health)))
+         (sentinel-bodyguard-clear)
+         (sentinel-bodyguard-launch this)
+         )
+        ((and (not *blast-bodyguards-want*) (> n 0))
+         (sentinel-bodyguard-clear)
+         )
+        )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-fire-input ((this blast-bot-player))
   (blast-bot-secrets-apply)
+  (blast-bot-bodyguard-update this)
   (blast-bot-lifesteal-apply this)
   (blast-bot-auto-toggle)
   (let ((blue (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 2) (blast-bot-gun-owned? 2)

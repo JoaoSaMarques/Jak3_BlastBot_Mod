@@ -221,6 +221,19 @@
 ;; damage per lava tick; ticks are paced by *blast-bot-invuln-time*
 (define *blast-bot-lava-damage* 10.0)
 (define *blast-bot-god-mode* #f)
+;; health regeneration: +*blast-bot-regen-rate* health per second once *blast-bot-regen-delay* seconds have passed since the last
+;; incoming hit (shield-absorbed hits count too)
+(define *blast-bot-regen-rate* 10.0)
+(define *blast-bot-regen-delay* 5.0)
+(define *blast-bot-last-combat* (the-as time-frame 0))
+;; set every frame by blast-bot-secrets-apply (blastbot_guns.gc)
+(define *blast-bot-damage-mult* 1.0)        ;; vehicle secret Hero Toughness: 0.5 while merged with a vehicle
+(define *blast-bot-veh-shield* #f)          ;; vehicle secret Dark Marker Shield: Circle shield works while merged
+;; Bighead / Smallhead: the joint that is scaled (4 = head with turret and gun, 3 = the body the legs hang on, which scales the legs too)
+(define *blast-bot-head-joint* 4)
+(define *blast-bot-head-scale-turret* #f)   ;; #t: swivel + gun are drawn at the head size too (went wild in a first test, so off)
+(define *blast-bot-head-scale* 1.0)         ;; current, eases towards the goal
+(define *blast-bot-head-scale-goal* 1.0)    ;; 2.0 big, 0.5 small
 ;; prints every attack event that reaches the bot and what was done with it
 ;; BISECT SWITCHES for the junk-format crash (both came in with ShieldUpdate). #f = old behaviour (MarauderFix).
 (define *blast-bot-touch-attack* #t) ;; ATTACK TEST   ;; enemy melee via 'touch + prims-touching-action? (logs "Bogus cshape value!")
@@ -681,6 +694,13 @@
   out
   )
 
+(defun blast-bot-scale-joint! ((arg1 transformq) (joint int))
+  (when (and (= joint *blast-bot-head-joint*) (!= *blast-bot-head-scale* 1.0))
+    (vector-float*! (-> arg1 scale) (-> arg1 scale) *blast-bot-head-scale*)
+    )
+  (none)
+  )
+
 (defun blast-bot-body-callback ((arg0 cspace) (arg1 transformq))
   ;; Joint 3: the body the legs are attached to. Leans with the same tilt as the head.
   (let ((this (the-as blast-bot-player (-> arg0 param1)))
@@ -693,6 +713,7 @@
     (quaternion-copy! base-q (-> arg1 quat))
     (quaternion*! (-> arg1 quat) tilt-q base-q)
     (quaternion-normalize! (-> arg1 quat))
+    (blast-bot-scale-joint! arg1 3)
     )
   (cspace<-parented-transformq-joint! arg0 arg1)
   0
@@ -714,6 +735,7 @@
     (quaternion*! (-> this top-quat) tilt-q yaw-q)
     (quaternion-normalize! (-> this top-quat))
     (quaternion-copy! (-> arg1 quat) (-> this top-quat))
+    (blast-bot-scale-joint! arg1 4)
     )
   (cspace<-parented-transformq-joint! arg0 arg1)
   0
@@ -736,6 +758,12 @@
     (quaternion-vector-angle! rot *up-vector* (-> this angle-turret))
     (quaternion->matrix (-> arg0 bone transform) rot)
     (vector-copy! (-> arg0 bone transform trans) pos)
+    ;; the matrix above was rebuilt from a pure rotation: give it the scale of the scaled joint again (axes only, pos is already scaled)
+    (when (and *blast-bot-head-scale-turret* (!= *blast-bot-head-scale* 1.0))
+      (vector-float*! (-> arg0 bone transform rvec) (-> arg0 bone transform rvec) *blast-bot-head-scale*)
+      (vector-float*! (-> arg0 bone transform uvec) (-> arg0 bone transform uvec) *blast-bot-head-scale*)
+      (vector-float*! (-> arg0 bone transform fvec) (-> arg0 bone transform fvec) *blast-bot-head-scale*)
+      )
     )
   0
   (none)
@@ -930,6 +958,34 @@
 ;; Hold X again while airborne (after letting go once) to burn fuel and slow the fall.
 ;; Fuel recharges while standing.
 
+(define-extern blast-bot-merge-vehicle (function object))
+;; What the wall sweep of blast-bot-move-xz looks at. The Haven awnings (wascity-awning-*) were walked through, and they are not `obstacle`.
+;;   0 = level geometry, pushers (platforms / doors), hit-by-others actors (the old filter)
+;;   1 = 0 + obstacle
+;;   2 = every collide-spec except the characters (jak bot enemy civilian shield), and the surface flags nojak / noentity are no
+;;       longer skipped. Catches whatever the awning collides as. Can also snag on invisible blockers (camera blockers ...).
+(define *blast-bot-wall-mode* 0)
+;; The awnings are `bouncer` actors (waswide-obs.gc) that collide as `crate` and sit in the hit-by-player list. Real crates must stay
+;; passable (the bot smashes them by touching them), so only a `crate` hit whose process is a bouncer counts as a wall.
+(define *blast-bot-wall-bouncers* #t)
+(define *blast-bot-bouncer-height* 8192.0)    ;; the awning probe starts this high above the bot's feet (2 m): the normal wall probe starts at 6.5 m and misses low awnings
+(define *blast-bot-bouncer-radius* 12288.0)   ;; ... and uses this radius (3 m)
+
+(defun blast-bot-wall-broad ()
+  (let ((m (the-as collide-spec #xffffffff)))
+    (logclear! m (collide-spec jak bot enemy civilian shield))
+    m
+    )
+  )
+
+(defmacro blast-bot-wall-spec ()
+  `(cond
+     ((= *blast-bot-wall-mode* 2) (blast-bot-wall-broad))
+     ((= *blast-bot-wall-mode* 1) (collide-spec backgnd pusher hit-by-others-list obstacle))
+     (else (collide-spec backgnd pusher hit-by-others-list))
+     )
+  )
+
 (defun blast-bot-move-xz ((this blast-bot-player) (dx float) (dz float))
   ;; Move the bot horizontally by (dx, dz). Steep surfaces (walls, and pusher actors such as platforms, elevators and
   ;; doors) stop it and it slides along them.
@@ -938,6 +994,8 @@
          (move (new 'stack-no-clear 'vector))
          (n (new 'stack-no-clear 'vector))
          (ext (new 'stack-no-clear 'vector))
+         (nrm (new 'stack-no-clear 'vector))
+         (nb (new 'stack-no-clear 'vector))
          (start (new 'stack-no-clear 'vector))
          (before-x (-> this root trans x))
          (before-z (-> this root trans z))
@@ -950,11 +1008,16 @@
       (set-vector! start (-> this root trans x) (+ (-> this root trans y) *blast-bot-wall-height*) (-> this root trans z) 1.0)
       (vector-! (-> q bbox min) start ext)
       (vector+! (-> q bbox max) start ext)
-      (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+      (set! (-> q collide-with)
+            (the-as collide-spec (logior (the-as int (blast-bot-wall-spec)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate)) 0))))
       (set! (-> q ignore-process0) this)
-      (set! (-> q ignore-process1) #f)
+      (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))   ;; the car the bot is merged with is not a wall
       (set! (-> q ignore-pat)
-            (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+            (if (>= *blast-bot-wall-mode* 2)
+                (new 'static 'pat-surface :probe #x1 :noendlessfall #x1 :board #x1)
+                (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1)
+                )
+            )
       (fill-using-bounding-box *collide-cache* q)
       ;; two passes: move up to a wall, then slide along it with what is left
       (dotimes (iter 2)
@@ -963,23 +1026,51 @@
           (vector-copy! (-> q start-pos) start)
           (vector-copy! (-> q move-dist) move)
           (set! (-> q radius) *blast-bot-wall-radius*)
-          (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+          (set! (-> q collide-with) (blast-bot-wall-spec))
           (set! (-> q action-mask) (collide-action solid))
-          (let ((hit (if (< 0 (-> *collide-cache* num-tris))
-                         (probe-using-line-sphere *collide-cache* q)
-                         -1.0
-                         )
-                     )
+          (let ((hit -1.0)
+                (hitb -1.0)
+                (bw #f)
                 )
+            (when (< 0 (-> *collide-cache* num-tris))
+              ;; awnings first (a crate-only probe, kept only when the thing hit is a bouncer), then the normal wall probe
+              (when *blast-bot-wall-bouncers*
+                (set! (-> q collide-with) (collide-spec crate))
+                (set! (-> q start-pos y) (+ (-> this root trans y) *blast-bot-bouncer-height*))
+                (set! (-> q radius) *blast-bot-bouncer-radius*)
+                (let ((h (probe-using-line-sphere *collide-cache* q)))
+                  (when (>= h 0.0)
+                    (let ((prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim)))
+                      (when (and prim (type? (-> prim cshape process) bouncer))
+                        (set! hitb h)
+                        (vector-copy! nb (-> q best-other-tri normal))
+                        )
+                      )
+                    )
+                  )
+                (set! (-> q start-pos y) (-> start y))
+                (set! (-> q radius) *blast-bot-wall-radius*)
+                (set! (-> q collide-with) (blast-bot-wall-spec))
+                )
+              (set! hit (probe-using-line-sphere *collide-cache* q))
+              (if (>= hit 0.0)
+                  (vector-copy! nrm (-> q best-other-tri normal))
+                  )
+              (when (and (>= hitb 0.0) (or (< hit 0.0) (< hitb hit)))
+                (set! hit hitb)
+                (set! bw #t)   ;; an awning is a wall whatever its slope
+                (vector-copy! nrm nb)
+                )
+              )
             (cond
-              ((and (>= hit 0.0) (< (fabs (-> q best-other-tri normal y)) 0.7))
+              ((and (>= hit 0.0) (or bw (< (fabs (-> nrm y)) 0.7)))
                ;; a wall: walk up to it...
                (let ((frac0 (fmax 0.0 (- hit 0.03))))
                  (+! (-> this root trans x) (* (-> move x) frac0))
                  (+! (-> this root trans z) (* (-> move z) frac0))
                  )
                ;; ...and keep only the part of the leftover movement that runs along the wall
-               (vector-copy! n (-> q best-other-tri normal))
+               (vector-copy! n nrm)
                (set! (-> n y) 0.0)
                (if (< 0.01 (vector-length n))
                    (vector-normalize! n 1.0)
@@ -1014,6 +1105,51 @@
       )
     )
   )
+
+(defun blast-bot-wall-probe ((this blast-bot-player) (up float))
+  ;; REPL: stand facing the thing the bot walks through, then
+  ;;   (blast-bot-wall-probe (the-as blast-bot-player (blast-bot-find)) 8192.0)     (8192 = 2 m above the bot's feet; try other heights)
+  ;; Probes 10 m straight ahead with every collide-spec and no surface filter and prints what it hits: the collide-as of the
+  ;; primitive, the pat (mode / material / event) and the process. Send me the line.
+  (let ((q (new 'stack-no-clear 'collide-query))
+        (dir (new 'stack-no-clear 'vector))
+        )
+    (vector-z-quaternion! dir (-> this root quat))
+    (set! (-> dir y) 0.0)
+    (vector-normalize! dir 40960.0)
+    (vector-copy! (-> q start-pos) (-> this root trans))
+    (+! (-> q start-pos y) up)
+    (vector-copy! (-> q move-dist) dir)
+    (set! (-> q radius) 40.96)
+    (set! (-> q collide-with) (the-as collide-spec #xffffffff))
+    (set! (-> q ignore-process0) this)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat) (new 'static 'pat-surface))
+    (set! (-> q action-mask) (collide-action solid))
+    (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
+      (if (>= hit 0.0)
+          (let* ((pat (-> q best-other-tri pat))
+                 (prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim))
+                 )
+            (format 0 "wall probe: hit at ~f of 10 m, pat mode ~D material ~D event ~D~%"
+                    hit
+                    (the-as int (-> pat mode))
+                    (the-as int (-> pat material))
+                    (the-as int (-> pat event))
+                    )
+            (format 0 "wall probe: prim ~A collide-as #x~X, process ~A~%"
+                    (if prim #t #f)
+                    (if prim (the-as int (-> prim prim-core collide-as)) 0)
+                    (if prim (-> prim cshape process type) #f)
+                    )
+            )
+          (format 0 "wall probe: nothing within 10 m~%")
+          )
+      )
+    )
+  (none)
+  )
+
 
 (defun blast-bot-ground-y ((this blast-bot-player) (up float))
   ;; Height of the ground under the bot (probing down from 'up' units above it), or -1e9 if none found.
@@ -1817,6 +1953,7 @@
   (none)
   )
 
+(define-extern blast-bot-merge-vehicle (function object))
 (defmethod shield-event-handler ((this shield-sphere) (arg0 process) (arg1 int) (arg2 symbol) (arg3 event-message-block))
   (case arg2
     (('shield-detach)
@@ -1854,7 +1991,10 @@
      )
     (('impact-impulse)
      (let ((v1-12 (the-as object (-> arg3 param 0))))
-       (when (< 40960.0 (* (-> (the-as rigid-body-impact v1-12) impulse) (get-inv-mass this)))
+       ;; the car the bot is merged with sits inside the sphere: bumping it must not pop the shield
+       (when (and (< 40960.0 (* (-> (the-as rigid-body-impact v1-12) impulse) (get-inv-mass this)))
+                  (!= arg0 (the-as process (blast-bot-merge-vehicle)))
+                  )
          (logior! (-> this root penetrated-by) (penetrate vehicle))
          (go (method-of-object this explode))
          #t
@@ -1869,6 +2009,7 @@
 (#when BLAST_BOT_SHIELD_OWNER_ATTACK
 (defmethod send-shield-attack ((this shield-sphere) (arg0 process-focusable) (arg1 touching-shapes-entry) (arg2 int))
   (let ((t0-0 0))
+    (when (!= (the-as process arg0) (the-as process (blast-bot-merge-vehicle)))   ;; never shove / hit the car the bot is merged with
     (send-event
       arg0
       'attack
@@ -1884,6 +2025,7 @@
                                                           )
                           )
       )
+    )
     )
   )
   )
@@ -2351,6 +2493,10 @@
           )
         )
       )
+    ;; the car the bot is merged with never hurts it (shield bumps, impacts)
+    (when (and proc (= (the-as object proc) (blast-bot-merge-vehicle)))
+      (set! friendly #t)
+      )
     ;; the bot's own shield bumping into things sends 'attack back at its owner (0 damage): not an enemy hit
     (when (as-type proc shield-sphere)
       (set! friendly #t)
@@ -2371,6 +2517,7 @@
         )
     (cond
       (friendly 0)
+      ((begin (set! *blast-bot-last-combat* (current-time)) #f) 0)   ;; not friendly: combat. Falls through to the checks below
       ((or *blast-bot-god-mode*
            (and (-> this shield-on) (handle->process (-> this shield-handle)))
            (< (current-time) (-> this hit-until))
@@ -2384,7 +2531,7 @@
               (+ (current-time) (the int (* *blast-bot-invuln-time* (the float (seconds 1)))))
               )
         (set! (-> this hit-flash) 1.0)
-        (set! (-> this health) (fmax 0.0 (- (-> this health) (* amount *blast-bot-damage-scale*))))
+        (set! (-> this health) (fmax 0.0 (- (-> this health) (* amount *blast-bot-damage-scale* *blast-bot-damage-mult*))))
         (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 768.0 37 60 1.0 0.99 (-> this clock)))
         (cpad-set-buzz! (-> *cpad-list* cpads 0) 1 200 (seconds 0.2))
         (format 0 "Blast Bot: hit for ~f, health ~f / ~f~%" amount (-> this health) (-> this max-health))
@@ -2687,6 +2834,14 @@
           )
       (set! (-> self input-active) #f)
       (seek! (-> self hit-flash) 0.0 (* dt 3.0))
+      (seek! *blast-bot-head-scale* *blast-bot-head-scale-goal* (* 2.0 dt))
+      ;; health regeneration
+      (when (and (< 0.0 (-> self health))
+                 (< (-> self health) (-> self max-health))
+                 (>= (current-time) (+ *blast-bot-last-combat* (the int (* 300.0 *blast-bot-regen-delay*))))
+                 )
+        (set! (-> self health) (fmin (-> self max-health) (+ (-> self health) (* *blast-bot-regen-rate* dt))))
+        )
       (when (and (< 0.05 speed) (not *blast-bot-spy-active*) (not (blast-bot-ride?)))
         (let ((move (new 'stack-no-clear 'vector)))
           (vector-copy! move (-> *math-camera* inv-camera-rot fvec))
@@ -2821,7 +2976,7 @@
       (set! (-> self hover-lift) (* (-> self hover-blend) *blast-bot-hover-height*))
       ;; Circle (held): the mech's shield. Movement is not touched.
       (blast-bot-update-shield-break self)
-      (let ((want (and (cpad-hold? 0 circle) (not *blast-bot-spy-active*) (not (blast-bot-ride?)) (zero? (-> self shield-broken-until)))))
+      (let ((want (and (cpad-hold? 0 circle) (not *blast-bot-spy-active*) (or (not (blast-bot-ride?)) *blast-bot-veh-shield*) (zero? (-> self shield-broken-until)))))
         (when (!= want (-> self shield-on))
           (set! (-> self shield-on) want)
           (format 0 "Blast Bot: shield ~A (handle ok: ~A)~%" (if want 'on 'off) (if (handle->process (-> self shield-handle)) #t #f))
