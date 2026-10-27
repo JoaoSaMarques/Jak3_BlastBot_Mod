@@ -1104,7 +1104,7 @@
    (last-r         float)             ;; ring radius last frame
    (wave-id        uint32)            ;; one attack id for the whole bomb
    (hit-count      int32)
-   (hits           uint64  24)        ;; handles of the enemies already hurt by this bomb
+   (hits           uint64  48)        ;; handles of the enemies already hurt by this bomb (+ the failed attempts, see blast-bomb-hurt)
    (scale          float)             ;; 1.0 normal, smaller for the split bombs (shockwave max radius)
    (damage         float)
    )
@@ -1134,31 +1134,46 @@
   )
 
 (defun blast-bomb-hurt ((this blast-peace-wave) (p process-focusable))
-  ;; damages p, once per bomb
-  (let ((key (the-as uint64 (process->handle p)))
-        (seen #f)
-        )
+  ;; damages p, once per bomb. An enemy that refuses the attack (still flinching from the last bomb, a state that ignores hits...)
+  ;; is tried again on the next frames while the ring is still on it (up to 4 tries); only an accepted hit ends it. Before, the
+  ;; single try was final, so an enemy standing right at the impact could be missed completely.
+  (let* ((key (the-as uint64 (process->handle p)))
+         (fail-key (+ key (the-as uint64 #x4000000000000000)))
+         (seen #f)
+         (fails 0)
+         )
     (dotimes (i (-> this hit-count))
       (if (= (-> this hits i) key)
           (set! seen #t)
           )
+      (if (= (-> this hits i) fail-key)
+          (+! fails 1)
+          )
       )
-    (when (and (not seen) (< (-> this hit-count) 24))
-      (set! (-> this hits (-> this hit-count)) key)
-      (+! (-> this hit-count) 1)
-      (blast-lifesteal-dealt (-> this damage) #f)
-      (send-event
-        p
-        'attack
-        #f
-        (static-attack-info ((id (-> this wave-id))
-                             (damage (-> this damage))
-                             (vehicle-damage-factor *blast-bomb-vehicle-factor*)
-                             (vehicle-impulse-factor 1.0)
-                             (mode 'explode)
-                             (attacker (blast-ord-attacker (handle->process (-> this owner-handle))))
-                             )
-                            )
+    (when (and (not seen) (< fails 4) (< (-> this hit-count) 48))
+      (if (zero? fails)
+          (blast-lifesteal-dealt (-> this damage) #f)
+          )
+      (let ((res (send-event
+                   p
+                   'attack
+                   #f
+                   (static-attack-info ((id (-> this wave-id))
+                                        (damage (-> this damage))
+                                        (vehicle-damage-factor *blast-bomb-vehicle-factor*)
+                                        (vehicle-impulse-factor 1.0)
+                                        (mode 'explode)
+                                        (attacker (blast-ord-attacker (handle->process (-> this owner-handle))))
+                                        )
+                                       )
+                   )
+                 )
+            )
+        (set! (-> this hits (-> this hit-count)) (if res key fail-key))
+        (+! (-> this hit-count) 1)
+        (if (and *blast-ord-debug* (not res))
+            (format 0 "peace maker: ~A refused the attack (try ~D)~%" (-> p type) (+ fails 1))
+            )
         )
       )
     )

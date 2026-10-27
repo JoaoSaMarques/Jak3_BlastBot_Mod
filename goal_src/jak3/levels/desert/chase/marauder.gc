@@ -554,6 +554,8 @@
   (none)
   )
 
+(define-extern blast-bot-attacker? (function process symbol))
+
 (defmethod on-dying ((this marauder))
   (if (or (logtest? (penetrate jak-dark-nuke) (-> this incoming penetrate-using))
           (and (-> this target-last-attacker?) (< (+ (current-time) (seconds -5)) (-> this visible-last)))
@@ -583,7 +585,7 @@
      )
     (('hit 'hit-flinch 'hit-knocked)
      (let ((v1-5 (as-type (handle->process (-> this incoming attacker-handle)) process-focusable)))
-       (if (and v1-5 (= (-> v1-5 type) target))
+       (if (and v1-5 (or (= (-> v1-5 type) target) (blast-bot-attacker? v1-5)))   ;; the Blast Bot's shots count like Jak's
            (set! (-> this target-last-attacker?) #t)
            (set! (-> this target-last-attacker?) #f)
            )

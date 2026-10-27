@@ -1587,7 +1587,6 @@
              (set! *blast-bomb-charge-heat* want)
              )
            (set-time! *blast-bot-last-use*)
-           (format *stdcon* "PEACE MAKER CHARGE ~D%~%" (the int (* 100.0 f)))
            (when *blast-bot-overheated*
              (blast-bot-purple-release this f)      ;; the meter is full: it goes off now
              )

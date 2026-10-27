@@ -148,6 +148,11 @@
 (define-extern spybot-toggle (function none))
 
 
+(defun blast-bot-attacker? ((p process))
+  ;; marauder.gc counts a kill for the arena fights only when the last attacker is Jak (type target); the bot's own shots name the bot
+  (and p (type? p blast-bot-player))
+  )
+
 (defun blast-bot-credit-jak! ((info attack-info))
   ;; Name Jak as the attacker. Mission kill counters (e.g. the marauder arena fights) only count a kill when the
   ;; last attacker is a process of type target; the bot is its own process type, so without this nothing it kills counts.
@@ -234,6 +239,31 @@
 (define *blast-bot-head-scale-turret* #f)   ;; #t: swivel + gun are drawn at the head size too (went wild in a first test, so off)
 (define *blast-bot-head-scale* 1.0)         ;; current, eases towards the goal
 (define *blast-bot-head-scale-goal* 1.0)    ;; 2.0 big, 0.5 small
+;; Haven awnings (and any other `bouncer`) collide as `crate` in the hit-by-player list, which the bot's wall / ground / foot probes never
+;; looked at, so it sank through them although Jak walks up them like a ramp. #t: they count as walls and as ground.
+(define *blast-bot-wall-bouncers* #t)
+
+(defun blast-bot-probe-b ((q collide-query) (spec collide-spec))
+  ;; probe-using-line-sphere with `spec` on an already filled cache (filled with crate + hit-by-player-list as well),
+  ;; plus a crate-only probe whose hit counts only when the thing hit is a bouncer. Returns the nearer hit fraction (-1.0 = none).
+  (set! (-> q collide-with) spec)
+  (let ((hit (probe-using-line-sphere *collide-cache* q)))
+    (when *blast-bot-wall-bouncers*
+      (set! (-> q collide-with) (collide-spec crate))
+      (let ((h (probe-using-line-sphere *collide-cache* q)))
+        (when (and (>= h 0.0) (or (< hit 0.0) (< h hit)))
+          (let ((prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim)))
+            (when (and prim (type? (-> prim cshape process) bouncer))
+              (set! hit h)
+              )
+            )
+          )
+        )
+      (set! (-> q collide-with) spec)
+      )
+    hit
+    )
+  )
 ;; prints every attack event that reaches the bot and what was done with it
 ;; BISECT SWITCHES for the junk-format crash (both came in with ShieldUpdate). #f = old behaviour (MarauderFix).
 (define *blast-bot-touch-attack* #t) ;; ATTACK TEST   ;; enemy melee via 'touch + prims-touching-action? (logs "Bogus cshape value!")
@@ -448,7 +478,8 @@
       (vector-! (-> q bbox min) (-> this root trans) ext)
       (vector+! (-> q bbox max) (-> this root trans) ext)
       )
-    (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+    (set! (-> q collide-with)
+          (the-as collide-spec (logior (the-as int (collide-spec backgnd pusher hit-by-others-list)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate hit-by-player-list)) 0))))
     (set! (-> q ignore-process0) #f)
     (set! (-> q ignore-process1) #f)
     (set! (-> q ignore-pat)
@@ -592,7 +623,7 @@
               (set! (-> q radius) 40.96)
               (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
               (set! (-> q action-mask) (collide-action solid))
-              (let ((hit (probe-using-line-sphere *collide-cache* q)))
+              (let ((hit (blast-bot-probe-b q (collide-spec backgnd pusher hit-by-others-list))))
                 (when (>= hit 0.0)
                   (set! (-> this foot-pos i y) (+ (-> q start-pos y) (* hit (-> q move-dist y))))
                   )
@@ -967,9 +998,14 @@
 (define *blast-bot-wall-mode* 0)
 ;; The awnings are `bouncer` actors (waswide-obs.gc) that collide as `crate` and sit in the hit-by-player list. Real crates must stay
 ;; passable (the bot smashes them by touching them), so only a `crate` hit whose process is a bouncer counts as a wall.
+;; The cache fill also needs hit-by-player-list, or it never scans the list the awning is in (collide-list-enum hit-by-player).
 (define *blast-bot-wall-bouncers* #t)
-(define *blast-bot-bouncer-height* 8192.0)    ;; the awning probe starts this high above the bot's feet (2 m): the normal wall probe starts at 6.5 m and misses low awnings
-(define *blast-bot-bouncer-radius* 12288.0)   ;; ... and uses this radius (3 m)
+;; #t: once a second the bot probes ahead / up / down from 2 m above its feet with every collide-spec and prints what it hits
+;; (see blast-bot-wall-probe). Nothing to type: just stand in the thing it clips through and read the log. Set to #f when done.
+(define *blast-bot-wall-debug* #f)
+(define *blast-bot-wall-debug-next* (the-as time-frame 0))
+(define *blast-bot-bouncer-height* 12288.0)    ;; the awning probe starts this high above the bot's feet (3 m): the normal wall probe starts at 6.5 m and misses low awnings
+(define *blast-bot-bouncer-radius* 8192.0)   ;; ... and uses this radius (2 m), so the awning it stands on is not in the sweep
 
 (defun blast-bot-wall-broad ()
   (let ((m (the-as collide-spec #xffffffff)))
@@ -1009,7 +1045,7 @@
       (vector-! (-> q bbox min) start ext)
       (vector+! (-> q bbox max) start ext)
       (set! (-> q collide-with)
-            (the-as collide-spec (logior (the-as int (blast-bot-wall-spec)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate)) 0))))
+            (the-as collide-spec (logior (the-as int (blast-bot-wall-spec)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate hit-by-player-list)) 0))))
       (set! (-> q ignore-process0) this)
       (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))   ;; the car the bot is merged with is not a wall
       (set! (-> q ignore-pat)
@@ -1058,12 +1094,11 @@
                   )
               (when (and (>= hitb 0.0) (or (< hit 0.0) (< hitb hit)))
                 (set! hit hitb)
-                (set! bw #t)   ;; an awning is a wall whatever its slope
                 (vector-copy! nrm nb)
                 )
               )
             (cond
-              ((and (>= hit 0.0) (or bw (< (fabs (-> nrm y)) 0.7)))
+              ((and (>= hit 0.0) (< (fabs (-> nrm y)) 0.7))
                ;; a wall: walk up to it...
                (let ((frac0 (fmax 0.0 (- hit 0.03))))
                  (+! (-> this root trans x) (* (-> move x) frac0))
@@ -1106,10 +1141,10 @@
     )
   )
 
-(defun blast-bot-wall-probe ((this blast-bot-player) (up float))
+(defun blast-bot-wall-probe ((this blast-bot-player) (up float) (mode int))
   ;; REPL: stand facing the thing the bot walks through, then
-  ;;   (blast-bot-wall-probe (the-as blast-bot-player (blast-bot-find)) 8192.0)     (8192 = 2 m above the bot's feet; try other heights)
-  ;; Probes 10 m straight ahead with every collide-spec and no surface filter and prints what it hits: the collide-as of the
+  ;;   (blast-bot-wall-probe (the-as blast-bot-player (blast-bot-find)) 8192.0 0)     (8192 = 2 m above the bot's feet; try other heights)
+  ;; mode 0 = ahead, 1 = straight up, 2 = straight down.   Probes 10 m with every collide-spec and no surface filter and prints what it hits: the collide-as of the
   ;; primitive, the pat (mode / material / event) and the process. Send me the line.
   (let ((q (new 'stack-no-clear 'collide-query))
         (dir (new 'stack-no-clear 'vector))
@@ -1117,6 +1152,10 @@
     (vector-z-quaternion! dir (-> this root quat))
     (set! (-> dir y) 0.0)
     (vector-normalize! dir 40960.0)
+    (cond
+      ((= mode 1) (set-vector! dir 0.0 40960.0 0.0 1.0))
+      ((= mode 2) (set-vector! dir 0.0 -40960.0 0.0 1.0))
+      )
     (vector-copy! (-> q start-pos) (-> this root trans))
     (+! (-> q start-pos y) up)
     (vector-copy! (-> q move-dist) dir)
@@ -1143,7 +1182,9 @@
                     (if prim (-> prim cshape process type) #f)
                     )
             )
-          (format 0 "wall probe: nothing within 10 m~%")
+          (if (not *blast-bot-wall-debug*)
+              (format 0 "wall probe: nothing within 10 m~%")
+              )
           )
       )
     )
@@ -1163,11 +1204,31 @@
     (set! (-> q ignore-pat)
           (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
     (set! (-> q action-mask) (collide-action solid))
-    (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
-      (if (>= hit 0.0)
-          (+ (-> q start-pos y) (* hit (-> q move-dist y)))
-          -1000000000.0
+    (let* ((hit (fill-and-probe-using-line-sphere *collide-cache* q))
+           (gy (if (>= hit 0.0)
+                   (+ (-> q start-pos y) (* hit (-> q move-dist y)))
+                   -1000000000.0
+                   )
+               )
+           )
+      ;; an awning the bot can step onto (at most 1.5 m above its feet) is ground too
+      (when *blast-bot-wall-bouncers*
+        (set! (-> q collide-with) (collide-spec crate hit-by-player-list))
+        (let ((h2 (fill-and-probe-using-line-sphere *collide-cache* q)))
+          (when (>= h2 0.0)
+            (let ((prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim)))
+              (when (and prim (type? (-> prim cshape process) bouncer))
+                (let ((by (+ (-> q start-pos y) (* h2 (-> q move-dist y)))))
+                  (when (and (< gy by) (< by (+ (-> this root trans y) 6144.0)))
+                    (set! gy by)
+                    )
+                  )
+                )
+              )
+            )
           )
+        )
+      gy
       )
     )
   )
@@ -2835,6 +2896,13 @@
       (set! (-> self input-active) #f)
       (seek! (-> self hit-flash) 0.0 (* dt 3.0))
       (seek! *blast-bot-head-scale* *blast-bot-head-scale-goal* (* 2.0 dt))
+      (when (and *blast-bot-wall-debug* (>= (current-time) *blast-bot-wall-debug-next*))
+        (set! *blast-bot-wall-debug-next* (+ (current-time) (seconds 1.0)))
+        (format 0 "wall probes (ahead / up / down):~%")
+        (blast-bot-wall-probe self 8192.0 0)
+        (blast-bot-wall-probe self 8192.0 1)
+        (blast-bot-wall-probe self 8192.0 2)
+        )
       ;; health regeneration
       (when (and (< 0.0 (-> self health))
                  (< (-> self health) (-> self max-health))
