@@ -6,7 +6,7 @@
 ;; dgos: GAME
 
 ;; Everything the Blast Bot does while Jak rides an elevator that changes level (camera sequence, level loads, the skip that
-;; jumps the platform ahead, putting the bot back on the platform). It used to sit in blastbot-main-mod.gc.
+;; jumps the platform ahead, putting the bot back on the platform).
 ;;
 ;; game.gd: this file goes right after blastbot-main-mod.o (it needs the blast-bot-player type and blast-bot-teleport-to from
 ;; there) and before blastbot-vehicle.o. elevator.gc loads much earlier and reaches the functions below through its
@@ -91,11 +91,11 @@
 ;; state and settings
 ;; ---------------------------------------------------------------------------------------------------------------------
 ;; Elevator cameras (elevator.gc 'use-camera): while a scripted elevator camera is active the bot must not pull the camera back
-;; onto itself (that was the hard cut in the middle of the ride). Time it started, 0 = none. Ignored after 30 s as a safety net
+;; onto itself (that causes a hard cut in the middle of the ride). Time it started, 0 = none. Ignored after 30 s as a safety net
 ;; in case the elevator never sends the release. (blastbot-main-mod.gc reads this one.)
 (define *blast-bot-elev-cam* 0)
 ;; #f = after an elevator camera the camera just stays on Jak (he is at the bot's position anyway), so there is no retarget cut.
-;; #t = point the camera at the bot again *blast-bot-cam-delay* after the elevator camera ends (the old behaviour).
+;; #t = point the camera at the bot again *blast-bot-cam-delay* after the elevator camera ends.
 (define *blast-bot-elev-retarget* #f)
 ;; #t = (OFF by default) when the elevator gives its camera back, the follow camera is placed straight at the destination
 ;; (camera 'teleport) instead of blending from the shaft camera.
@@ -114,8 +114,8 @@
 (define *blast-bot-elev-instant* #f)
 (define *blast-bot-elev-jump-to* 0.935)   ;; the jump fraction in use, set per ride (elevator.gc reads it)
 (define *blast-bot-lift-y* 0.0)           ;; fallback height for the bot after the jump
-(define *blast-bot-lift-off* 0.0)         ;; bot height above the platform when the lift was asked for
-(define *blast-bot-lift-time* 0)          ;; when the lift was asked for (0 = none); applied on a LATER frame, after the platform moved
+(define *blast-bot-lift-off* 0.0)         ;; bot height above the platform when the lift is requested
+(define *blast-bot-lift-time* 0)          ;; when the lift is requested (0 = none); applied on a LATER frame, after the platform moved
 (define *blast-bot-elev-dir* 0)           ;; latched on the first call of a ride: 0 = not latched, 1 = up, 2 = down
 (define *blast-bot-elev-stage* 0)         ;; highest stage fired so far in this ride; a stage never goes back
 
@@ -125,7 +125,7 @@
 (defun blast-bot-elevator-lift ((dy float))
   ;; the elevator is about to jump DY up: remember where the bot has to end up. The final height is taken from the platform
   ;; itself on the next frame (offset above it), because the path interpolation used for DY does not match where the platform
-  ;; really ends up (going down the bot was left several metres off and fell through).
+  ;; really ends up (going down, the bot would end up several metres off and fall through).
   (let ((bot (the-as blast-bot-player (blast-bot-find)))
         (el (process-by-ename "waspala-elevator-2"))
         )

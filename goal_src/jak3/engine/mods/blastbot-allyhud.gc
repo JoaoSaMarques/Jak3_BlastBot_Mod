@@ -7,15 +7,14 @@
 
 ;; The minion part of the Blast Bot's HUD (spydroid-ally, sentinel-ally, roboguard-ally).
 ;;
-;; COMPACT VERSION. The old version gave every minion a numbered slot (handle array), a floating label and an icon with a
-;; bar under it. That is gone. Now:
+;; COMPACT VERSION: no per-minion slots, labels or icons. Instead:
 ;;   - once a frame the entity pool is walked and the living minions of each kind are COUNTED (no slots, no handles);
 ;;   - the top-left of the screen shows one square box per kind that has at least one minion alive:
 ;;         [red square]  10     [yellow triangle]  2     [blue X]  4
 ;;     the boxes sit next to each other and close up when a kind is empty; the number is centred under its box.
 ;;   - the boxes are drawn by their OWN small hud process (blast-ally-hud, below), a child of the bot, so they have all 30 hud
 ;;     sprites and 4 text strings to themselves. blast-ally-hud-update spawns it. blast-bot-hud still calls ahud-draw-boxes
-;;     with its own sprites 15..29, which is now a no-op (it only draws on a blast-ally-hud), so blastbot-main-mod.gc needs NO change.
+;;     with its own sprites 15..29, which is a no-op (it only draws on a blast-ally-hud), so blastbot-main-mod.gc needs NO change.
 ;;
 ;; Needs, in game.gd:  "blastbot-allyhud.o"  after spydroid-ally.o, sentinel-ally.o, roboguard-ally.o, bombbot-ally.o
 ;; and before blastbot-main-mod.o (which calls blast-ally-hud-update and ahud-draw-boxes).

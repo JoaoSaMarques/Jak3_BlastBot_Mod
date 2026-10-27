@@ -5,14 +5,13 @@
 ;; name in dgo: blastbot-vehicle
 ;; dgos: GAME
 
-;; The Blast Bot's vehicle code, moved out of blastbot-main-mod.gc unchanged: merging with / riding a vehicle (the merge
+;; The Blast Bot's vehicle code: merging with / riding a vehicle (the merge
 ;; stages, the camera and hud handling, the vehicle-mission checks, the ride) and the "vehicles bump into the bot like a wall"
 ;; code. Compiled AFTER blastbot-main-mod.o (needs the blast-bot-player type and blast-bot-jak-state from there) and before
-;; blastbot_guns.o / blastbot-spybot.o. blastbot-main-mod.gc reaches it through the define-extern lines at the place where
-;; this code used to be.
+;; blastbot_guns.o / blastbot-spybot.o. blastbot-main-mod.gc reaches it through the define-extern lines.
 ;;
-;; NOTE: the vehicle wall has its own radius, *blast-bot-vehicle-wall-radius*. It used to share the name *blast-bot-wall-radius* with the
-;; bot's own wall sweep (blastbot-main-mod.gc); this file loads later, so this value silently replaced the sweep's one.
+;; NOTE: the vehicle wall has its own radius, *blast-bot-vehicle-wall-radius*, separate from the bot's own wall sweep
+;; (*blast-bot-wall-radius*, blastbot-main-mod.gc).
 
 
 ;; ---- Vehicle merge ----
@@ -577,8 +576,7 @@
   )
 
 ;; ---- Flut (the Leaper Lizard) ----
-;; While Jak is a flut (any target-flut-* state) he used to be teleported to the bot's feet by the regrab watchdog and stood
-;; there, drawn. Now he is hidden and held inside the bot, *blast-bot-flut-y-offset* above its origin (16384 = 4 m, about half
+;; While Jak is a flut (any target-flut-* state) he is hidden and held inside the bot, *blast-bot-flut-y-offset* above its origin (16384 = 4 m, about half
 ;; way up the bot): target-flut-grab (pad ignored) + a position pin every frame. He stays a flut, so missions that need the
 ;; flut still see it. blast-bot-jak-busy? (blastbot-main-mod.gc) counts the flut states as busy so the regrab watchdog leaves him alone.
 (define *blast-bot-flut-y-offset* 16384.0)
@@ -642,20 +640,20 @@
 
 ;; ---- Car weapons from the bot's barrel ----
 ;; The car's own weapon code (wvehicle-method-169 of each v-* type) lives in the level dgos and can not be changed from here.
-;; Moving a car shot after it has spawned did not work (its trail / flash / impact were already made at the car's gun), so now
+;; Moving a car shot after it has spawned does not work (its trail / flash / impact are already made at the car's gun), so
 ;; each shot the merged car spawns is removed on the spot and an identical one (same type, owner, damage settings, timeout and
 ;; speed) is spawned at the bot's muzzle (bone 6, the same point the bot's own shots use) flying along the barrel direction, i.e.
 ;; wherever the bot's turret is aiming (manual aim or locked target). The new shot ignores the bot, so it can not hit the bot it
 ;; starts inside; shots that already ignore the bot are the new ones and are left alone.
-;; #f: car shots come out of the car like before.
+;; #f: car shots come out of the car.
 (define *blast-bot-car-shots-from-barrel* #t)
 (define *blast-bot-carshot-site* 1)   ;; debug: 1 = caught in the bot's update (merge-update), 2 = caught at the end of its :post
 
-;; ---- Spawn-time hook (the real fix for car shots still showing at the car's barrels) ----
+;; ---- Spawn-time hook (rewrites the shot before it is built) ----
 ;; A car shot is created INSIDE the car's own update (wvehicle-method-169 -> spawn-projectile). projectile-init-by-other runs
 ;; right there, so the muzzle flash, trail, sound and the first collision test all happen at the car's gun, before any of
 ;; our code can run. Catching the shot afterwards (the scan below) is always too late: that is why the log shows shots in
-;; state 'impact / 'moving and why it was always "caught at 1" (the bot's update) and never at 2 (the end of its :post).
+;; state 'impact / 'moving and why it is always "caught at 1" (the bot's update) and never at 2 (the end of its :post).
 ;; So the params are rewritten BEFORE the shot is built: the very first form of projectile-init-by-other (projectile.gc) calls
 ;;   (blast-bot-carshot-params <its params argument>)
 ;; which moves the start to the bot's muzzle, aims it along the barrel and makes the shot ignore the bot. Everything the

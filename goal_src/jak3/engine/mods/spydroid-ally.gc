@@ -29,14 +29,14 @@
 (define *spydroid-ally-boom-damage* 2.0)        ;; damage of the death explosion
 (define *spydroid-ally-boom-radius* 24576.0)    ;; 6 m
 (define *spydroid-ally-reach* 24576.0)          ;; 6 m (+ the target's radius): how close an enemy must be to eat a headbutt
-(define *spydroid-ally-scan-range* 409600.0)    ;; 100 m: how far they look for enemies (was 50 m)
+(define *spydroid-ally-scan-range* 409600.0)    ;; 100 m: how far they look for enemies
 (define *spydroid-ally-life* 15.0)              ;; seconds before they blow up on their own. 0 = never
 (define *spydroid-ally-child-prims* #f)         ;; #f = leave the two child spheres alone (test), #t = full collision retune
 (define *spydroid-ally-credit-jak* #t)          ;; #t = their kills count as Jak's (mission kill counters), same idea as *blast-bot-credit-jak*
 (define *spydroid-ally-mesh-range* 61440.0)         ;; 15 m: a nav mesh must lie this close to the owner, or nothing is launched
 (define *spydroid-ally-collide-each-other* #t)    ;; #t: droids block / push each other instead of piling up (adds 'bot' to their collide-with)
-;; nav avoidance radius. Stock is 8192 (2 m). It was 12288, but a big radius makes the droids shove each other (and the
-;; target's own nav sphere) out into a ring, so they never reach melee range and circle. Spacing is now done by
+;; nav avoidance radius. Stock is 8192 (2 m). A big radius makes the droids shove each other (and the
+;; target's own nav sphere) out into a ring, so they never reach melee range and circle. Spacing is done by
 ;; spydroid-ally-separate instead.
 (define *spydroid-ally-nav-radius* 8192.0)
 (define *spydroid-ally-sep-dist* 12288.0)         ;; 3 m: droids closer than this (xz) push each other apart
@@ -61,9 +61,9 @@
 
 ;; ---- pop-out launch, shared by spydroid-ally / roboguard-ally / sentinel-ally ----
 ;; The minions start inside the bot's body instead of at their final spot. Sentinels simply fly out from there;
-;; droids and roboguards hop along an arc to the spot they used to appear at.
-(define *blast-emerge-on* #t)           ;; #f = old behaviour (appear at the final spot)
-(define *blast-emerge-immune* 0.0)      ;; extra seconds of damage immunity after spawning (0 = off). Did not stop the leg damage, which is fixed in the bot's 'touched handler instead
+;; droids and roboguards hop along an arc to their final spot.
+(define *blast-emerge-on* #t)           ;; #f = appear at the final spot
+(define *blast-emerge-immune* 0.0)      ;; extra seconds of damage immunity after spawning (0 = off). Does not stop the leg damage, which is handled in the bot's 'touched handler instead
 ;; height above the bot's origin that each kind comes out at (the middle of the body)
 (define *spydroid-ally-emerge-height* 16384.0)   ;; 4 m
 (define *roboguard-ally-emerge-height* 16384.0)  ;; 4 m
@@ -123,7 +123,7 @@
    (emerge-fx     float)      ;; hop start (the bot's muzzle)
    (emerge-fy     float)
    (emerge-fz     float)
-   (emerge-tx     float)      ;; hop end (where it used to appear)
+   (emerge-tx     float)      ;; hop end (final spot)
    (emerge-ty     float)
    (emerge-tz     float)
    (immune-start  time-frame) ;; spawn immunity: when it began (0 = none)
@@ -168,7 +168,7 @@
   )
 
 ;; Scratch for every actor scan. The droid's own stack is ":stack 0/256" and a 64-entry collide-shape array alone is 272
-;; bytes, so the old (new 'stack-no-clear 'array 'collide-shape 64) in the droid's methods could overrun it.
+;; bytes, so a (new 'stack-no-clear 'array 'collide-shape 64) in the droid's methods could overrun it.
 (define *spydroid-ally-find-box* (new 'global 'vector))
 (define *spydroid-ally-find-hits* (new 'global 'array 'collide-shape 128))
 (define *spydroid-ally-hb-box* (new 'global 'vector))
@@ -224,8 +224,8 @@
 ;; SHARED BY THE WHOLE BLAST BOT MOD (this file loads first, so every other file can use these)
 ;; ---------------------------------------------------------------------------------------------------------------
 
-;; "Already dead" filter. The stock focus-status dead bit is set late (or never) for a lot of enemies, so a target that was
-;; already dying / exploding kept being picked. A target counts as dead when ANY of these is true:
+;; "Already dead" filter. The stock focus-status dead bit is set late (or never) for a lot of enemies, so a target that is
+;; already dying / exploding keeps being picked. A target counts as dead when ANY of these is true:
 ;;   - it is in one of the states in *blast-dead-states* (compared by name, like the ignore list)
 ;;   - it is an enemy whose hit-points are 0 or less (*blast-dead-use-hp*; set to #f if some enemy type that should be
 ;;     shootable is being skipped)
@@ -465,7 +465,7 @@
   )
 
 (defun spydroid-ally-separate ((this spydroid-ally))
-  ;; Soft push-apart. Collision between droids was not enough (they still sank into each other), so every droid nudges
+  ;; Soft push-apart. Collision between droids is not enough (they still sink into each other), so every droid nudges
   ;; itself away from any other droid closer than *spydroid-ally-sep-dist* (xz). Skipped mid-jump so the headbutt arc is untouched.
   (when (and (not (logtest? (-> this enemy-flags) (enemy-flag lock-focus)))
              (not (logtest? (-> this focus-status) (focus-status dangerous)))

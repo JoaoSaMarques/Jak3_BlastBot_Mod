@@ -5,7 +5,7 @@
 ;; name in dgo: blastbot-main-mod
 ;; dgos: GAME
 
-;; Everything about the player's Blast Bot (the bombbot mech) that used to sit in mod-common-functions.gc:
+;; Everything about the player's Blast Bot (the bombbot mech):
 ;; the blast-bot-player process (legs, body, turret, jump, hover, dash, shield, health, death), its HUD, the spawn /
 ;; despawn functions (spawn-my-bombbot, despawn-my-bombbot, blast-bot-pad-check) and the touch / attack handling.
 ;; mod-common-functions.gc is back to the stock mod template.
@@ -122,7 +122,7 @@
 
 ;; #t = everything the bot kills counts as Jak's kill (mission kill counters). Side effect: enemies see Jak as their
 ;; attacker. #f = the bot is its own attacker, which is the old behaviour where enemies fought back at the bot.
-(define *blast-bot-credit-jak* #t) ;; ATTACK TEST
+(define *blast-bot-credit-jak* #t)
 ;; #t = the bot's guard-shot is also credited to Jak. Kept separate because crediting shots made the NPCs' own guard shots stop firing.
 ;; not crediting morphgun for kills in arena
 ;; when this is #t and blast-bot-use-morphgun is #f, npcs stop firing. If both are #t, npcs are able to fire again but morphgun still doesn't give credit
@@ -178,15 +178,15 @@
 ;; how fast the body turns toward the stick direction (rotation units/sec, 21845 = 120 deg/s)
 (define *blast-bot-body-turn-rate* 21845.0)
 ;; wall blocking: radius of the sweep sphere, and how high above the ground it is centred
-(define *blast-bot-wall-radius* 17408.0)   ;; was 14336.0 in this file, but blastbot-vehicle.gc redefined it to 20480.0 later, so 20480.0 is what was really used; now this is the only definition
+(define *blast-bot-wall-radius* 17408.0)
 ;; Half-size of the boxes the bot fills the collide cache with. The cache holds only ~460 triangles; in dense places (the palace
 ;; elevator frame, planks, pots) the old 10 m boxes overflowed it ("Exceeded collide cache max # of tris (blast-bot-player)") and
 ;; the triangles dropped included the platform floor, so the feet / body fell through it. Smaller boxes still cover the 4.5 m wall
 ;; sphere + a frame of movement, and the feet's reach. Raise them if feet or walls get missed, lower them if the message returns.
-(define *blast-bot-leg-fill-xz* 32768.0)    ;; 8 m   (was 10 m)
-(define *blast-bot-wall-fill-xz* 30720.0)   ;; 7.5 m (was 10 m)
-(define *blast-bot-wall-fill-y* 28672.0)    ;; 7 m   (was 8 m)
-(define *blast-bot-wall-height* 26624.0)   ;; was 20480.0. Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
+(define *blast-bot-leg-fill-xz* 32768.0)    ;; 8 m
+(define *blast-bot-wall-fill-xz* 30720.0)   ;; 7.5 m
+(define *blast-bot-wall-fill-y* 28672.0)    ;; 7 m
+(define *blast-bot-wall-height* 26624.0)   ;; Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
 ;; how much of the leg-lift tilt goes into the body the legs hang from. The head gets the rest,
 ;; so the head's total tilt is unchanged and the body tilts too (it also carries the head).
 (define *blast-bot-body-tilt-share* 0.5)
@@ -236,7 +236,7 @@
 (define *blast-bot-veh-shield* #f)          ;; vehicle secret Dark Marker Shield: Circle shield works while merged
 ;; Bighead / Smallhead: the joint that is scaled (4 = head with turret and gun, 3 = the body the legs hang on, which scales the legs too)
 (define *blast-bot-head-joint* 4)
-(define *blast-bot-head-scale-turret* #f)   ;; #t: swivel + gun are drawn at the head size too (went wild in a first test, so off)
+(define *blast-bot-head-scale-turret* #f)   ;; #t: swivel + gun are drawn at the head size too
 (define *blast-bot-head-scale* 1.0)         ;; current, eases towards the goal
 (define *blast-bot-head-scale-goal* 1.0)    ;; 2.0 big, 0.5 small
 ;; Haven awnings (and any other `bouncer`) collide as `crate` in the hit-by-player list, which the bot's wall / ground / foot probes never
@@ -265,14 +265,14 @@
     )
   )
 ;; prints every attack event that reaches the bot and what was done with it
-;; BISECT SWITCHES for the junk-format crash (both came in with ShieldUpdate). #f = old behaviour (MarauderFix).
-(define *blast-bot-touch-attack* #t) ;; ATTACK TEST   ;; enemy melee via 'touch + prims-touching-action? (logs "Bogus cshape value!")
-(define *blast-bot-hud-shield-bar* #t)  ;; HUD sprites 6-8 + 'heat-ratio poll (came in with ShieldUpdate)
-(defglobalconstant BLAST_BOT_SHIELD_OWNER_ATTACK #t) ;; ATTACK TEST ;; #t = send-shield-attack override below (ShieldUpdate); #f = stock method
-(define *blast-bot-aggro-on* #t)     ;; MINIMAL TEST: #f = no aggro collider (enemies will ignore the bot)
-(define *blast-bot-shield-spawn* #t) ;; MINIMAL TEST: #f = the shield process is never spawned
-(define *blast-bot-leg-spheres* 3) ;; spheres per leg bone (2 bones per leg). 4 = the old layout (8 per leg, 36 prims total), which produced the junk text; 3 = 6 per leg, 28 prims total
-(define *blast-bot-leg-limbs* 4)  ;; BISECT: how many legs get collision spheres (0..4). Set 0 to test the crash without any leg prims.
+;; Switches: #f turns the feature off.
+(define *blast-bot-touch-attack* #t) ;; enemy melee via 'touch + prims-touching-action? (logs "Bogus cshape value!")
+(define *blast-bot-hud-shield-bar* #t)  ;; HUD sprites 6-8 + 'heat-ratio poll
+(defglobalconstant BLAST_BOT_SHIELD_OWNER_ATTACK #t) ;; #t = send-shield-attack override below; #f = stock method
+(define *blast-bot-aggro-on* #t)     ;; #f = no aggro collider (enemies will ignore the bot)
+(define *blast-bot-shield-spawn* #t) ;; #f = the shield process is never spawned
+(define *blast-bot-leg-spheres* 3) ;; spheres per leg bone (2 bones per leg). 3 = 6 per leg, 28 prims total
+(define *blast-bot-leg-limbs* 4)  ;; how many legs get collision spheres (0..4)
 (define *blast-bot-reach-hack* #t)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
 
 (define *blast-bot-attack-debug* #f)
@@ -602,7 +602,7 @@
               (set! (-> this foot-pos i x) (+ (-> rest x) (-> diff x)))
               (set! (-> this foot-pos i z) (+ (-> rest z) (-> diff z)))
               )
-            ;; v5: planted feet also get the same safety limits swinging feet always had. Without these,
+            ;; planted feet also get the same safety limits swinging feet always had. Without these,
             ;; a sudden change of body height/heading left a planted foot too close (legs fold up
             ;; "like tinfoil") or too far above/below the body (legs implode) until it stepped again.
             (vector-! diff (-> this foot-pos i) (-> this root trans))
@@ -857,7 +857,7 @@
        (blast-bot-valid-target? this p)
        (-> p draw)
        (logtest? (-> p draw status) (draw-control-status on-screen))
-       ;; v5: the turret only tracks things it can actually see
+       ;; the turret only tracks things it can actually see
        (blast-bot-los? this (get-trans p 3))
        )
   )
@@ -1907,8 +1907,7 @@
       (vector-copy! (-> q start-pos) start)
       (vector-copy! (-> q move-dist) beam)
       (set! (-> q radius) 40.96)
-      ;; same filter as bombbot-method-204: level + enemies (the old version only saw backgnd, so the dot
-      ;; went through enemies and landed on the floor behind them)
+      ;; same filter as bombbot-method-204: level + enemies
       (set! (-> q collide-with) (collide-spec backgnd enemy bot civilian hit-by-others-list))
       (set! (-> q ignore-process0) this)
       (set! (-> q ignore-process1) #f)
@@ -2767,8 +2766,7 @@
     (case message
       (('touched)
        ;; A leg/body sphere overlapped something. Like Jak's punch, hit whatever it is and let the other side decide
-       ;; (crates, walls, pickups and enemies each have their own 'attack handler). The old version only attacked
-       ;; things whose process-mask was enemy/guard/crate, so any destructible with a different mask was skipped.
+       ;; (crates, walls, pickups and enemies each have their own 'attack handler).
        ;; Pickups answer 'attack by sending 'get-pickup back, which the handler below forwards to Jak.
        ;; One attack id per 0.4s.
         (when (and proc
@@ -3446,7 +3444,7 @@
   )
 
 ;; Called from target-handler.gc the moment the game sends Jak a 'continue (elevators / level doors teleport him that way): the
-;; bot goes to the same spot right then. (This used to live in blastbot-spybot.gc; that file was reverted, so it is here now.)
+;; bot goes to the same spot right then.
 (defun blast-bot-follow-continue ((cp continue-point))
   (when (and cp
              *target*

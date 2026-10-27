@@ -71,7 +71,7 @@
    (emerge-fx     float)      ;; hop start (the bot's muzzle)
    (emerge-fy     float)
    (emerge-fz     float)
-   (emerge-tx     float)      ;; hop end (where it used to appear)
+   (emerge-tx     float)      ;; hop end (final spot)
    (emerge-ty     float)
    (emerge-tz     float)
    (immune-start  time-frame) ;; spawn immunity: when it began (0 = none)

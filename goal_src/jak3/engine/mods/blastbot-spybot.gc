@@ -711,7 +711,7 @@
       (spybot-summon bot sb)
       )
     ;; Jak rides back: his grab-ride goes to the bot (after a summon the bot already stands at the droid, so he does not move).
-    ;; Without a bot he was already released by the despawn / death code.
+    ;; Without a bot he is already released by the despawn / death code.
     (when (and sb bot (nonzero? (-> sb jak-held)) *target*)
       (move-to-point! (-> *target* control) (-> bot root trans))
       )

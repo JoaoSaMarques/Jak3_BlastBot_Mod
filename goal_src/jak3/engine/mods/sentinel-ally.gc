@@ -43,7 +43,7 @@
 (define *sentinel-ally-muzzle-joint* -1)
 (define *sentinel-ally-muzzle-x* 0.0)
 (define *sentinel-ally-muzzle-y* -3072.0)   ;; 0.75 m down
-(define *sentinel-ally-muzzle-z* 6144.0)    ;; 1.5 m forward (was 2 m): 0.5 m inwards, towards the body
+(define *sentinel-ally-muzzle-z* 6144.0)    ;; 1.5 m forward: 0.5 m inwards, towards the body
 (define *sentinel-ally-debug* #f)                ;; #t: print spawn / state / target / shoot lines (set to #f once they work)
 (define *sentinel-ally-status-time* (the-as time-frame 0))
 

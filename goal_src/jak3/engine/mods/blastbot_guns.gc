@@ -462,8 +462,7 @@
 
 (defun blast-bot-fire-concussor ((this blast-bot-player))
   ;; Launch each grenade outside the bot's body/shield, then throw it radially outward.
-  ;; The old code spawned every grenade at the bot centre, so its proximity fuse
-  ;; could trigger immediately against the bot's own collision.
+  ;; (spawning at the bot centre would trigger the proximity fuse against the bot's own collision)
   (let ((center (new 'stack-no-clear 'vector))
         (start (new 'stack-no-clear 'vector))
         (flat (new 'stack-no-clear 'vector))

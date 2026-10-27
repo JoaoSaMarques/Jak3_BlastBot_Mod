@@ -1135,8 +1135,7 @@
 
 (defun blast-bomb-hurt ((this blast-peace-wave) (p process-focusable))
   ;; damages p, once per bomb. An enemy that refuses the attack (still flinching from the last bomb, a state that ignores hits...)
-  ;; is tried again on the next frames while the ring is still on it (up to 4 tries); only an accepted hit ends it. Before, the
-  ;; single try was final, so an enemy standing right at the impact could be missed completely.
+  ;; is tried again on the next frames while the ring is still on it (up to 4 tries); only an accepted hit ends it.
   (let* ((key (the-as uint64 (process->handle p)))
          (fail-key (+ key (the-as uint64 #x4000000000000000)))
          (seen #f)
