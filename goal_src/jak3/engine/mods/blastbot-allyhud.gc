@@ -60,9 +60,6 @@
   )
 (define *ahud-hud-handle* (the-as handle #f))
 (define *ahud-hud-retry* (the-as time-frame 0))
-(define *ahud-hud-fails* 0)                   ;; spawns in a row that did not leave a living hud (the retry delay doubles each time)
-(define *ahud-kill-strays* #t)                ;; #t: remove every blast-ally-hud except the current one (see ahud-remove-strays)
-(define *ahud-stray-next* (the-as time-frame 0))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; One coloured rectangle on a hud sprite
@@ -329,70 +326,20 @@
   )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Stray cleanup
-;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-;; Every blast-ally-hud holds a gui-engine connection (add-process in init-callback). The engine has a fixed number of them: when
-;; huds of earlier bots stay alive ("rogue level entity ... blast-ally-hud ... still alive" in the console) the engine fills up and
-;; then the RACE HUD (laps), the win cutscene's scene-player and Jak himself fail with "could not connection ... to gui engine".
-;; So every 2 seconds every blast-ally-hud that is not the current one is deactivated (which frees its connection).
-(define-extern ahud-remove-strays (function process-tree process int))
-(defun ahud-remove-strays ((tree process-tree) (keep process))
-  (let ((n 0)
-        (p (-> tree child))
-        )
-    (while p
-      (let ((next (-> p 0 brother))
-            (is-stray (and (= (-> p 0 type symbol) 'blast-ally-hud)
-                           (!= (the-as process (-> p 0)) keep)
-                           )
-                      )
-            )
-        (+! n (ahud-remove-strays (-> p 0) keep))
-        (when is-stray
-          (deactivate (the-as process (-> p 0)))
-          (+! n 1)
-          )
-        (set! p next)
-        )
-      )
-    n
-    )
-  )
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Called every frame by blast-bot-update-hud (blastbot-main-mod.gc)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun blast-ally-hud-update ((owner process))
   (when *ahud-enabled*
     (ahud-count-allies owner)
-    ;; throw away every blast-ally-hud that is not the current one (leaked huds fill the gui engine)
-    (when (and *ahud-kill-strays* (>= (current-time) *ahud-stray-next*))
-      (set! *ahud-stray-next* (+ (current-time) (seconds 2)))
-      (let ((n (+ (ahud-remove-strays *active-pool* (handle->process *ahud-hud-handle*))
-                  (ahud-remove-strays *entity-pool* (handle->process *ahud-hud-handle*))
-                  )
+    ;; spawn the box hud as a child of the bot (it goes away with the bot)
+    (when (and (not (handle->process *ahud-hud-handle*))
+               (>= (current-time) *ahud-hud-retry*)
                )
+      (set! *ahud-hud-retry* (+ (current-time) (seconds 1)))
+      (set! *ahud-hud-handle*
+            (ppointer->handle (process-spawn blast-ally-hud :init hud-init-by-other :name "blast-ally-hud" :to owner))
             )
-        (if (> n 0)
-            (format 0 "Ally HUD: removed ~D stray ally huds~%" n)
-            )
-        )
-      )
-    (cond
-      ((handle->process *ahud-hud-handle*)
-       (set! *ahud-hud-fails* 0)
-       )
-      ((>= (current-time) *ahud-hud-retry*)
-       ;; spawn the box hud as a child of the bot (it goes away with the bot). When a spawn does not stick (for example the gui
-       ;; engine is full) the next try waits twice as long, up to 32 s, so this can never turn into a flood of failing spawns
-       (set! *ahud-hud-retry* (+ (current-time) (* (seconds 1) (ash 1 (min 5 *ahud-hud-fails*)))))
-       (+! *ahud-hud-fails* 1)
-       (set! *ahud-hud-handle*
-             (ppointer->handle (process-spawn blast-ally-hud :init hud-init-by-other :name "blast-ally-hud" :to owner))
-             )
-       )
       )
     )
   0
