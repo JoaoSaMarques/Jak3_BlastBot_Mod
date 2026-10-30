@@ -27,6 +27,7 @@
    (foot-pos         vector       4 :inline) ;; where each foot is planted
    (foot-next        vector       4 :inline) ;; where each foot is stepping to
    (foot-speed       vector       4 :inline) ;; smoothed foot lead velocity
+   (ride-foot-offset float        4) ;; smoothed vertical correction, relative to vehicle pose
    (foot-moving      symbol       4)
    (last-trans       vector       :inline)
    (linear-speed     vector       :inline)
@@ -209,7 +210,17 @@
 (define *blast-bot-ride-front-z* 4096.0)    ;; front pair: positive = ahead of the body, 0 = level with it, negative = behind (the lower leg folds back under the knee)
 (define *blast-bot-ride-back-y* -3072.0)
 (define *blast-bot-ride-back-z* -26624.0)
+;; Keep the folded vehicle pose; only adapt feet to nearby terrain.
+(define *blast-bot-ride-terrain* #t)
+(define *blast-bot-ride-foot-up* 12288.0)    ;; maximum rise from the pose (3 m)
+(define *blast-bot-ride-foot-down* 16384.0)  ;; maximum reach below the pose (4 m)
+(define *blast-bot-ride-foot-adjust* 12288.0) ;; allow 3 m upward travel over rocks
+(define *blast-bot-ride-foot-speed* 61440.0) ;; lift promptly over obstacles (15 m/s)
+(define *blast-bot-ride-foot-settle* 16384.0) ;; settle gently after clearing them (4 m/s)
+(define *blast-bot-ride-foot-drop* 6144.0) ;; maximum downward adaptation (1.5 m)
+(define *blast-bot-ride-foot-radius* 1024.0) ;; 25 cm clearance for leg thickness
 (define-extern blast-bot-ride? (function symbol))
+(define-extern blast-bot-merge-vehicle (function object))
 (define *blast-bot-bunker-depth* 10240.0)   ;; how far the body dips while the spy droid is out (10240 = same dip as the jump crouch)
 (define *blast-bot-bunker-speed* 20480.0)   ;; how fast it dips (same speed as the jump crouch)
 ;; Circle shield size (the stock shield's hit sphere radius is 1m x this).
@@ -326,11 +337,15 @@
   out
   )
 
+(define-extern blast-bot-ride-leg-callback (function cspace transformq none :behavior process))
+
 (defun blast-bot-init-legs ((this blast-bot-player))
   ;; Call once, right after initialize-skeleton."
   (dotimes (i 4)
     (set! (-> this joint-ik i)
           (new 'process 'joint-mod-ik this (-> *blast-bot-elbows* i) (-> *blast-bot-hand-dist* i)))
+    ;; Retain the stock IK callback data (param1 / param2); wrap its result.
+    (set! (-> this node-list data (-> *blast-bot-elbows* i) param0) blast-bot-ride-leg-callback)
     (set! (-> this joint-ik i elbow-pole-vector-axis) (the-as uint 2))
     (set! (-> this joint-ik i elbow-rotation-axis) (the-as uint 0))
     (logior! (-> this joint-ik i flags) (joint-mod-ik-flags elbow-rot-neg))
@@ -351,6 +366,7 @@
     (vector-reset! (-> this foot-speed i))
     (set! (-> this foot-moving i) #f)
     (set! (-> this foot-cool i) 0)
+    (set! (-> this ride-foot-offset i) 0.0)
     )
   (vector-copy! (-> this last-trans) (-> this root trans))
   (vector-reset! (-> this linear-speed))
@@ -513,8 +529,8 @@
       )
     (set! (-> q collide-with)
           (the-as collide-spec (logior (the-as int (collide-spec backgnd pusher hit-by-others-list)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate hit-by-player-list)) 0))))
-    (set! (-> q ignore-process0) #f)
-    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-process0) this)
+    (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))
     (set! (-> q ignore-pat)
           (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
     (fill-using-bounding-box *collide-cache* q)
@@ -540,6 +556,12 @@
         (vector-orient-by-quat! rel local (-> this root quat))
         (vector+! rest rel (-> this root trans))
         (cond
+          ((blast-bot-ride?)
+           ;; No walking gait or stomp events while driving. The pose below owns the feet.
+           (set! (-> this foot-moving i) #f)
+           (vector-reset! (-> this foot-speed i))
+           (vector-copy! cur rest)
+           )
           ((= (-> this jump-mode) 2)
            ;; the bot is airborne: legs hang below the body (blended in from where they were planted)
            (let ((b (fmin 1.0 (/ (the float (- (current-time) (-> this jump-timer))) 45.0))))
@@ -687,8 +709,64 @@
               )
           (vector-orient-by-quat! hov hov (-> this root quat))
           (vector+! hov hov (-> this root trans))
+          (when (blast-bot-ride?)
+            (let ((offset 0.0))
+              (when (and *blast-bot-ride-terrain* (< 0 (-> *collide-cache* num-tris)))
+                ;; Sample underneath the outer half of the leg as well as the tip.
+                ;; A rock under the shin must lift the leg even if the foot is clear.
+                ;; These are conservative samples of the body-to-foot span; IK still
+                ;; determines the final knee position.
+                (let ((found #f)
+                      (required (- *blast-bot-ride-foot-drop*)))
+                  (dotimes (sample 3)
+                    (let* ((t0 (+ 0.5 (* 0.25 (the float sample))))
+                           (point (new 'stack-no-clear 'vector)))
+                      (vector-! diff hov (-> this root trans))
+                      (vector+*! point (-> this root trans) diff t0)
+                      (vector+*! (-> q start-pos) point *y-vector* *blast-bot-ride-foot-up*)
+                      (vector-float*! (-> q move-dist) *y-vector*
+                                     (- (+ *blast-bot-ride-foot-up* *blast-bot-ride-foot-down*)))
+                      (set! (-> q radius) *blast-bot-ride-foot-radius*)
+                      (set! (-> q action-mask) (collide-action solid))
+                      (let ((hit (blast-bot-probe-b q (collide-spec backgnd pusher hit-by-others-list))))
+                        (when (>= hit 0.0)
+                          (set! found #t)
+                          ;; Raising the foot moves a point along the span by t0
+                          ;; times that amount, so scale the required clearance.
+                          (set! required
+                                (fmax required
+                                      (/ (- (+ (-> q start-pos y) (* hit (-> q move-dist y)))
+                                            (-> point y)) t0)))
+                          )
+                        )
+                      )
+                    )
+                  (when found
+                    (set! offset (fmin *blast-bot-ride-foot-adjust* required))
+                    )
+                  )
+                )
+              ;; Filter a relative height only: the pose follows the car without lagging
+              ;; behind in world space. Keep X/Z intact; never retract toward the body.
+              (when (< 128.0 (fabs (- offset (-> this ride-foot-offset i))))
+                (seek! (-> this ride-foot-offset i) offset
+                       (* (if (< (-> this ride-foot-offset i) offset)
+                              *blast-bot-ride-foot-speed*
+                              *blast-bot-ride-foot-settle*)
+                          (seconds-per-frame)))
+                )
+              ;; Do not move the IK target: the callback lifts the completed leg
+              ;; as one rigid pose, preserving its knee angle.
+
+              )
+            )
           (vector-! diff hov cur)
           (vector+*! cur cur diff (-> this hover-blend))
+          )
+        (when (blast-bot-ride?)
+          ;; Keep transition / dismount targets in sync with the actual folded feet.
+          (vector-copy! (-> this foot-pos i) cur)
+          (vector-copy! (-> this foot-next i) cur)
           )
         (set! (-> cur w) 1.0)
         (enable-set! (-> this joint-ik i) #t)
@@ -706,12 +784,80 @@
       )
     ;; body height: follow the ground under the body (dip for a jump crouch, rise for hover).
     ;; While airborne the jump code owns it.
-    (when (!= (-> this jump-mode) 2)
+    (when (and (!= (-> this jump-mode) 2) (not (blast-bot-ride?)))
       (let ((target (+ (- (-> this ground-y) (-> this crouch-depth)) (-> this hover-lift))))
         (if (< (-> this root trans y) target)
             (seek! (-> this root trans y) target (* 61440.0 (seconds-per-frame)))  ;; climb fast: slopes, stairs
             (seek! (-> this root trans y) target (* 40960.0 (seconds-per-frame)))  ;; settle down gently
             )
+        )
+      )
+    )
+  (none)
+  )
+
+;; The engine's IK callback builds the folded vehicle pose first. Rotate both
+;; resulting segment matrices by ONE world-space hinge rotation about the hip.
+;; The knee angle and the leg's horizontal heading remain unchanged.
+(defbehavior blast-bot-ride-leg-callback process ((arg0 cspace) (arg1 transformq))
+  (joint-mod-ik-callback arg0 arg1)
+  (let* ((ik (the-as joint-mod-ik (-> arg0 param1)))
+         (this (the-as blast-bot-player (-> ik process))))
+    (when (and *blast-bot-ride-terrain* (blast-bot-ride?)
+               (< 0.001 (-> this hover-blend)))
+      (let ((limb -1))
+        (dotimes (i 4)
+          (when (= (the-as int (-> arg0 param2)) (-> *blast-bot-elbows* i))
+            (set! limb i)
+            )
+          )
+        (when (>= limb 0)
+          (let* ((hip (-> arg0 parent bone transform))
+                 (knee (-> arg0 bone transform))
+                 (pivot (new 'stack-no-clear 'vector))
+                 (tip (new 'stack-no-clear 'vector))
+                 (arm (new 'stack-no-clear 'vector))
+                 (axis (new 'stack-no-clear 'vector))
+                 (angles (new 'stack-no-clear 'vector))
+                 (rot (new 'stack-no-clear 'quaternion)))
+            ;; Use the final blended IK matrices, including their real hip pivot.
+            (matrix->trans hip pivot)
+            (matrix->trans knee tip)
+            (vector+*! tip tip (-> knee uvec) (-> ik hand-dist))
+            (vector-! arm tip pivot)
+            (let* ((flat (sqrtf (+ (* (-> arm x) (-> arm x)) (* (-> arm z) (-> arm z)))))
+                   (reach (vector-length arm)))
+              (when (and (< 1.0 flat) (< 1.0 reach))
+                (let ((new-y (fmax (- (* 0.95 reach))
+                                  (fmin (* 0.95 reach)
+                                        (+ (-> arm y) (* (-> this hover-blend) (-> this ride-foot-offset limb)))))))
+                  (set-vector! angles (-> arm y) 0.0 flat 1.0)
+                  (let ((old-angle (vector-y-angle angles)))
+                    (set-vector! angles new-y 0.0
+                                 (sqrtf (fmax 1.0 (- (* reach reach) (* new-y new-y)))) 1.0)
+                    (let ((angle (fmax -8192.0 (fmin 8192.0 (deg- (vector-y-angle angles) old-angle)))))
+                      (set-vector! axis (- (-> arm z)) 0.0 (-> arm x) 1.0)
+                      (vector-normalize! axis 1.0)
+                      (quaternion-vector-angle! rot axis angle)
+                      ;; A shared rotation preserves the relative segment orientation.
+                      (vector-orient-by-quat! (-> hip rvec) (-> hip rvec) rot)
+                      (vector-orient-by-quat! (-> hip uvec) (-> hip uvec) rot)
+                      (vector-orient-by-quat! (-> hip fvec) (-> hip fvec) rot)
+                      (vector-orient-by-quat! (-> knee rvec) (-> knee rvec) rot)
+                      (vector-orient-by-quat! (-> knee uvec) (-> knee uvec) rot)
+                      (vector-orient-by-quat! (-> knee fvec) (-> knee fvec) rot)
+                      (matrix->trans knee arm)
+                      (vector-! arm arm pivot)
+                      (vector-orient-by-quat! arm arm rot)
+                      (vector+! (-> knee trans) pivot arm)
+                      (vector-copy! (-> hip trans) pivot)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
         )
       )
     )
@@ -1246,8 +1392,8 @@
     (vector-float*! (-> q move-dist) *y-vector* -163840.0)
     (set! (-> q radius) 40.96)
     (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
-    (set! (-> q ignore-process0) #f)
-    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-process0) this)
+    (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))
     (set! (-> q ignore-pat)
           (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
     (set! (-> q action-mask) (collide-action solid))

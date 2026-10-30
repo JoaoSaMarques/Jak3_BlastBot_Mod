@@ -416,6 +416,7 @@
 (define *blast-bot-ride-in-missions* #t)      ;; #t: during a vehicle mission the merge becomes a ride (#f: merge is refused instead)
 (define *blast-bot-ride-always* #t)           ;; #t: every merge is a ride, even outside missions
 (define *blast-bot-ride-y-offset* -4096.0)    ;; bot origin relative to the car origin (4096 = 1 m): tune if it floats / sinks
+(define *blast-bot-ride-height-adjust* 0.0) ;; smoothed offset relative to the car
 (define *blast-bot-ride-hover-was* #f)
 (define *blast-bot-ride-cam-restore* #f)      ;; set when the ride ends: the state's :trans gives the bot's camera settings back
 
@@ -425,6 +426,8 @@
 
 (defun blast-bot-ride-start ((this blast-bot-player) (v rigid-body-object))
   (set! *blast-bot-ride-hover-was* (-> this hover-on))
+  (set! *blast-bot-ride-height-adjust* 0.0)
+  (dotimes (i 4) (set! (-> this ride-foot-offset i) 0.0))
   (set! (-> this hover-on) #t)
   ;; the bot's weapons, explosions and legs must not hurt the car it rides (this also stops everything else hurting it)
   (send-event v 'ignore-damage #t)
@@ -444,11 +447,41 @@
   (none)
   )
 
+(define-extern blast-bot-ground-y (function blast-bot-player float float))
+(define-extern *blast-bot-ride-terrain* symbol)
+(define-extern *blast-bot-ride-pose* symbol)
+(define-extern *blast-bot-ride-front-y* float)
+(define-extern *blast-bot-ride-back-y* float)
+(define *blast-bot-ride-ground-offset* 0.0) ;; extra clearance above the grounded vehicle pose
+
 (defun blast-bot-ride-follow ((this blast-bot-player) (v rigid-body-object))
   ;; the bot sits on the car: same position, same heading (yaw only), legs in the hover pose
   (let ((fwd (new 'stack-no-clear 'vector)))
     (vector-copy! (-> this root trans) (-> v root trans))
     (+! (-> this root trans y) *blast-bot-ride-y-offset*)
+    (let ((want 0.0))
+      (when *blast-bot-ride-terrain*
+        (let* ((car-y (-> this root trans y))
+               (gy (blast-bot-ground-y this 12288.0)))
+          (when (and (< -900000000.0 gy) (< (fabs (- gy car-y)) 20480.0))
+            ;; Vehicle mode uses hover-on to select its animation, not to float.
+            ;; Center the two foot heights on the floor so the small per-foot
+            ;; corrections can reach it without unfolding the vehicle pose.
+            (let ((clearance (if *blast-bot-ride-pose*
+                                 (- (* 0.5 (+ *blast-bot-ride-front-y* *blast-bot-ride-back-y*)))
+                                 11264.0))) ;; midpoint of the fallback hover foot heights
+              (set! want (- (+ gy clearance *blast-bot-ride-ground-offset*) car-y))
+              )
+            )
+          )
+        )
+      ;; Smooth the offset even when a probe misses. Do not alternate between an
+      ;; absolute floor height and an unfiltered car height at the probe boundary.
+      (when (< 128.0 (fabs (- want *blast-bot-ride-height-adjust*)))
+        (seek! *blast-bot-ride-height-adjust* want (* 16384.0 (seconds-per-frame)))
+        )
+      (+! (-> this root trans y) *blast-bot-ride-height-adjust*)
+      )
     (vector-z-quaternion! fwd (-> v root quat))
     (set! (-> fwd y) 0.0)
     (when (< 0.01 (vector-length fwd))
