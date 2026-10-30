@@ -195,6 +195,21 @@
 (define *blast-bot-ramp-time* 4.0)
 ;; R2 hover: how high (in game units, 4096 = 1m) the body floats
 (define *blast-bot-hover-height* 12288.0)
+;; Vehicle (ride) mode pose: lower and longer than the hover pose. The legs sweep back and lie nearly flat behind the body, and the
+;; body joint is dropped *blast-bot-ride-body-lower* (negative = down, 4096 = 1 m). Only the body joint moves (body, head, turret and the
+;; leg hips come down with it); the bot's origin, the camera and everything that reads the bot's position stay where they were.
+;; Foot targets are relative to the bot's origin (x = side, y = height, z = forward, negative = behind). Set *blast-bot-ride-pose* to #f for the old hover pose.
+(define *blast-bot-ride-pose* #t)
+(define *blast-bot-ride-body-lower* -8192.0)
+;; unused leftover: an older blastbot-vehicle.gc moved the bot's origin by this (that put the camera under the floor). 0 = harmless if that file is still in use.
+(define *blast-bot-ride-body-drop* 0.0)
+(define *blast-bot-ride-foot-x* 10240.0)
+(define *blast-bot-ride-front-y* -6144.0)
+(define *blast-bot-ride-front-x* 12288.0)   ;; front pair: how far out to the sides the feet are (3 m)
+(define *blast-bot-ride-front-z* 4096.0)    ;; front pair: positive = ahead of the body, 0 = level with it, negative = behind (the lower leg folds back under the knee)
+(define *blast-bot-ride-back-y* -3072.0)
+(define *blast-bot-ride-back-z* -26624.0)
+(define-extern blast-bot-ride? (function symbol))
 (define *blast-bot-bunker-depth* 10240.0)   ;; how far the body dips while the spy droid is out (10240 = same dip as the jump crouch)
 (define *blast-bot-bunker-speed* 20480.0)   ;; how fast it dips (same speed as the jump crouch)
 ;; Circle shield size (the stock shield's hit sphere radius is 1m x this).
@@ -389,10 +404,28 @@
       )
   )
 
+;; Desert rescue (wland-passenger.gc / desert-rescue.gc): the wastelanders waiting for the transport and the transport itself are
+;; never hit by the legs, stomps or the dash. Those types live in the DESRESC level DGO and are not visible from the mods folder,
+;; so they are matched by type name (children included).
+(defun blast-bot-spared? ((p process))
+  (let ((found #f)
+        (ty (-> p type))
+        )
+    (while (and (not found) ty)
+      (if (or (= (-> ty symbol) 'wland-passenger) (= (-> ty symbol) 'desert-rescue-transport))
+          (set! found #t)
+          )
+      (set! ty (if (= ty (-> ty parent)) (the-as type #f) (-> ty parent)))
+      )
+    found
+    )
+  )
+
 (defun blast-bot-valid-target? ((this blast-bot-player) (p process-focusable))
   ;; Things the bot may stomp / lock on to.
   (and p
        (!= this p)
+       (not (blast-bot-spared? p))
        (not (blast-bot-ally? p))
        (not (focus-test? p inactive))
        (not (focus-test? p disable))
@@ -637,11 +670,21 @@
         ;; R2 hover: blend every foot toward a pose swept back behind the body. The front pair (0, 3)
         ;; hangs low, the back pair (1, 2) is held higher, so the legs never overlap.
         (when (< 0.001 (-> this hover-blend))
-          (set-vector! hov
-                       (if (< i 2) 10240.0 -10240.0)
-                       (if (or (= i 0) (= i 3)) -14336.0 -8192.0)
-                       (if (or (= i 0) (= i 3)) -10240.0 -20480.0)
-                       1.0)
+          (if (and *blast-bot-ride-pose* (blast-bot-ride?))
+              ;; vehicle mode: legs aimed backwards, nearly flat, body lower
+              (set-vector! hov
+                           (let ((fx (if (or (= i 0) (= i 3)) *blast-bot-ride-front-x* *blast-bot-ride-foot-x*)))
+                             (if (< i 2) fx (- fx))
+                             )
+                           (if (or (= i 0) (= i 3)) *blast-bot-ride-front-y* *blast-bot-ride-back-y*)
+                           (if (or (= i 0) (= i 3)) *blast-bot-ride-front-z* *blast-bot-ride-back-z*)
+                           1.0)
+              (set-vector! hov
+                           (if (< i 2) 10240.0 -10240.0)
+                           (if (or (= i 0) (= i 3)) -14336.0 -8192.0)
+                           (if (or (= i 0) (= i 3)) -10240.0 -20480.0)
+                           1.0)
+              )
           (vector-orient-by-quat! hov hov (-> this root quat))
           (vector+! hov hov (-> this root trans))
           (vector-! diff hov cur)
@@ -744,6 +787,10 @@
     (quaternion-copy! base-q (-> arg1 quat))
     (quaternion*! (-> arg1 quat) tilt-q base-q)
     (quaternion-normalize! (-> arg1 quat))
+    ;; vehicle mode: lower the body (eases in with the hover blend)
+    (if (and *blast-bot-ride-pose* (blast-bot-ride?))
+        (+! (-> arg1 trans y) (* (-> this hover-blend) *blast-bot-ride-body-lower*))
+        )
     (blast-bot-scale-joint! arg1 3)
     )
   (cspace<-parented-transformq-joint! arg0 arg1)
@@ -1264,6 +1311,54 @@
   (none)
   )
 
+;; ---- Pit deaths ----
+;; The bot moves itself (no collide-shape-moving ground reaction), so the engine's endless-fall death never reaches it, and the
+;; old landing code snapped it back up to its last ground height when the ground probe found nothing under a pit.
+;; Now: no ground for *blast-bot-pit-time* seconds of falling = dead (shield / invulnerability do not matter, like Jak), and a floor
+;; whose pat event is `endlessfall` (2) kills on touch (checked in blast-bot-hazard-check).
+(define-extern *blast-bot-merge-stage* int)
+(define *blast-bot-pit-kill* #t)
+(define *blast-bot-pit-time* 2.5)           ;; seconds of falling with no ground at all under the bot
+(define *blast-bot-pit-since* (the-as time-frame 0))
+(define *blast-bot-nofloor-frames* 0)       ;; frames in a row the walking probe found no floor
+
+;; A pit only kills when there is NO floor at all within *blast-bot-pit-depth* below the bot. The normal ground probe only
+;; reaches 40 m, so jumping off a very high ledge used to count as "no ground" and killed the bot in mid-air.
+(define *blast-bot-pit-depth* 819200.0)      ;; 200 m
+(define *blast-bot-pit-check-frames* 99)     ;; frames since the deep probe last ran (99 = run on the next no-ground frame)
+(define *blast-bot-pit-floor-below* #f)      ;; result of the last deep probe
+
+(defun blast-bot-deep-floor? ((this blast-bot-player))
+  ;; Same filters as blast-bot-ground-y, but looks down *blast-bot-pit-depth*. #t = some floor exists below.
+  (let ((q (new 'stack-no-clear 'collide-query)))
+    (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 12288.0)
+    (vector-float*! (-> q move-dist) *y-vector* (- *blast-bot-pit-depth*))
+    (set! (-> q radius) 40.96)
+    (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+    (set! (-> q ignore-process0) #f)
+    (set! (-> q ignore-process1) #f)
+    (set! (-> q ignore-pat)
+          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q action-mask) (collide-action solid))
+    (>= (fill-and-probe-using-line-sphere *collide-cache* q) 0.0)
+    )
+  )
+
+(defun blast-bot-pit-kill ((this blast-bot-player) (why symbol))
+  (when (and *blast-bot-pit-kill*
+             (not *blast-bot-god-mode*)
+             (< 0.0 (-> this health))
+             (zero? *blast-bot-merge-stage*)
+             (not *blast-bot-on-elevator*)
+             *target* (-> *target* next-state)
+             (= (-> *target* next-state name) 'target-grab-ride)
+             )
+    (format 0 "Blast Bot: fell into a pit (~A), instant death~%" why)
+    (set! (-> this health) 0.0)
+    )
+  (none)
+  )
+
 ;; Debug: why did the bot decide it walked off a ledge? Probes straight down with NOTHING filtered (every collide-spec, no pat
 ;; ignore) and prints what is really under the bot next to what the normal ground probe found.
 (define *blast-bot-fall-debug* #t)
@@ -1311,9 +1406,13 @@
     ;; where is the ground right under the body? (probes from 5m above, so slopes and stairs are caught)
     (when (and *blast-bot-ground-follow* (!= (-> this jump-mode) 2))
       (let ((gy (blast-bot-ground-y this 12288.0)))
-        (when (< -900000000.0 gy)
-          (set! (-> this ground-y) gy)
-          )
+        (if (< -900000000.0 gy)
+            (begin
+              (set! (-> this ground-y) gy)
+              (set! *blast-bot-nofloor-frames* 0)
+              )
+            (+! *blast-bot-nofloor-frames* 1)
+            )
         )
       )
     ;; bunker down while the spy droid is out: the same dip as the jump crouch (body down, feet planted, head nods
@@ -1328,8 +1427,14 @@
       ((0)
        (set! (-> this jump-fuel) (fmin 1.0 (+ (-> this jump-fuel) (* 0.4 dt))))
        (cond
-         ((< (-> this ground-y) (- (- (-> this root trans y) (-> this hover-lift)) 20480.0))
+         ((or (< (-> this ground-y) (- (- (-> this root trans y) (-> this hover-lift)) 20480.0))
+              ;; no floor at all for ~0.4 s (walked out over a pit deeper than the probe reaches): the stale ground height
+              ;; used to keep the bot hovering over the hole
+              (and (< 24 *blast-bot-nofloor-frames*) (zero? *blast-bot-merge-stage*)))
           ;; walked off a ledge (more than 5m drop): fall, thruster works like after a jump
+          (set! *blast-bot-nofloor-frames* 0)
+          (set! *blast-bot-pit-since* 0)
+          (set! *blast-bot-pit-check-frames* 99)
           (blast-bot-fall-debug this)
           (set! (-> this jump-mode) 2)
           (set! (-> this jump-timer) (current-time))
@@ -1406,9 +1511,40 @@
        (when (>= 0.0 (-> this jump-vy))
          (let* ((gy0 (blast-bot-ground-y this 8192.0))
                 (gy (if (< gy0 -900000000.0) (-> this ground-y) gy0))
+                (noground (< gy0 -900000000.0))
                 )
-           (when (or (<= (-> this root trans y) gy)
+           (if noground
+               (begin
+                 ;; the short probe found nothing: is there a floor anywhere within 200 m? (re-checked every 4th frame)
+                 (+! *blast-bot-pit-check-frames* 1)
+                 (when (< 3 *blast-bot-pit-check-frames*)
+                   (set! *blast-bot-pit-check-frames* 0)
+                   (set! *blast-bot-pit-floor-below* (blast-bot-deep-floor? this))
+                   )
+                 (cond
+                   (*blast-bot-pit-floor-below*
+                    ;; just a long drop, the ground is further down: no pit
+                    (set! *blast-bot-pit-since* 0)
+                    )
+                   (else
+                     (if (zero? *blast-bot-pit-since*)
+                         (set! *blast-bot-pit-since* (current-time))
+                         )
+                     (if (>= (- (current-time) *blast-bot-pit-since*) (the int (* 300.0 *blast-bot-pit-time*)))
+                         (blast-bot-pit-kill this 'no-ground)
+                         )
+                     )
+                   )
+                 )
+               (begin
+                 (set! *blast-bot-pit-since* 0)
+                 (set! *blast-bot-pit-check-frames* 99)
+                 )
+               )
+           ;; no ground under the bot = keep falling (landing on the stale height teleported it back up above the pit)
+           (when (or (and (not noground) (<= (-> this root trans y) gy))
                      (>= (- (current-time) (-> this jump-timer)) (seconds 10)))
+             (set! *blast-bot-pit-since* 0)
              (blast-bot-land this gy)
              )
            )
@@ -2275,7 +2411,7 @@
 (defun blast-bot-jak-busy? ((st object))
   ;; states we must NOT fight: cutscene grabs, death/respawn, and the bot's own ride state
   (or (!= *blast-bot-merge-stage* 0) (= st 'target-grab-ride) (= st 'target-grab) (= st 'target-clone-anim)
-      (and (blast-bot-pilot-state? st) (blast-bot-vehicle-mission?))   ;; Jak is driving for a mission / race
+      (blast-bot-pilot-state? st)   ;; Jak is in a vehicle (mission / race / scripted ride): never fight for him, blast-bot-merge-update turns it into a ride
       (blast-bot-flut-state? st)   ;; Jak is a flut: blast-bot-flut-update (blastbot-vehicle.gc) holds him in the bot, leave him alone
       (= st 'target-hit) (= st 'target-death) (= st 'target-continue))
   )
@@ -2684,6 +2820,7 @@
                   )
           ;; C: the floor itself. Measured: metalhead valley = pat event 19,arena lava = pat event 18, volcano lava = pat event 6
           (lava-c (let ((ev (blast-bot-floor-probe this (and *blast-bot-hazard-debug* (zero? (logand (current-time) 63))))))
+                    (if (= ev 2) (blast-bot-pit-kill this 'endlessfall-floor))   ;; pat event 2 = endlessfall
                     (or (= ev 19) (= ev 18) (= ev 6)) 
                     )
                   )
@@ -2775,6 +2912,7 @@
                   (!= proc (handle->process (-> self shield-handle)))
                   (!= proc (the-as process (blast-bot-merge-vehicle)))
                   (not (logtest? (process-mask civilian) (-> proc mask)))
+                  (not (blast-bot-spared? proc))   ;; desert rescue passengers / transport
                   ;; the bot's own minions (spy droids, roboguards, sentinels) are never hurt by its legs
                   (not (blast-bot-ally? (the-as process-focusable proc)))
                   ;; let an attacker finish its swing/lunge: its hit lands first, the legs get it afterwards

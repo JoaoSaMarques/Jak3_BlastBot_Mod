@@ -332,11 +332,26 @@
 (defun blast-ally-hud-update ((owner process))
   (when *ahud-enabled*
     (ahud-count-allies owner)
+    ;; The box hud is only wanted while Jak sits in the bot (target-grab-ride) and no cutscene stream is loading / playing.
+    ;; In the flut / pilot states and during scenes (Flut Flut lizard pen) the gui engine is needed by the scene-player and
+    ;; the talker; a hud spawned then can not connect ("could not connection blast-ally-hud to gui engine"), dies, is respawned
+    ;; every second and starves the scene: black screen. So: no spawn then, and a living hud is removed.
+    (let* ((jst (if (and *target* (-> *target* next-state)) (-> *target* next-state name) #f))
+           (ok (and (= jst 'target-grab-ride) (not (-> *art-control* active-stream))))
+           )
+      (when (and (not ok) (handle->process *ahud-hud-handle*))
+        (send-event (handle->process *ahud-hud-handle*) 'hide-and-die)
+        (set! *ahud-hud-handle* (the-as handle #f))
+        )
+      (when (not ok)
+        (set! *ahud-hud-retry* (+ (current-time) (seconds 2)))
+        )
+      )
     ;; spawn the box hud as a child of the bot (it goes away with the bot)
     (when (and (not (handle->process *ahud-hud-handle*))
                (>= (current-time) *ahud-hud-retry*)
                )
-      (set! *ahud-hud-retry* (+ (current-time) (seconds 1)))
+      (set! *ahud-hud-retry* (+ (current-time) (seconds 3)))
       (set! *ahud-hud-handle*
             (ppointer->handle (process-spawn blast-ally-hud :init hud-init-by-other :name "blast-ally-hud" :to owner))
             )

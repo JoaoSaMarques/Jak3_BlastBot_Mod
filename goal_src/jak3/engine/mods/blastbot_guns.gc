@@ -460,20 +460,26 @@
   (none)
   )
 
-(defun blast-bot-fire-concussor ((this blast-bot-player))
-  ;; Launch each grenade outside the bot's body/shield, then throw it radially outward.
+(define *blast-wave-charge-time* 1.2)       ;; seconds of holding R1 for a full ring
+(define *blast-wave-min-fraction* 0.5)      ;; a tap throws this share of the full ring (half)
+(define *blast-wave-charge-start* (the-as time-frame 0))   ;; 0 = not charging
+(define *blast-wave-charge-fx* #t)          ;; the Peace Maker's glowing ball grows at the muzzle while charging; #f = no visual
+
+(defun blast-bot-fire-concussor-n ((this blast-bot-player) (n int))
+  ;; Launch n grenades per ring outside the bot's body/shield, then throw them radially outward.
   ;; (spawning at the bot centre would trigger the proximity fuse against the bot's own collision)
   (let ((center (new 'stack-no-clear 'vector))
         (start (new 'stack-no-clear 'vector))
         (flat (new 'stack-no-clear 'vector))
         (vel (new 'stack-no-clear 'vector))
+        (step (/ 360.0 (the float n)))
         )
     (vector-copy! center (-> this root trans))
     (+! (-> center y) 24576.0)
-    (dotimes (i 8)
-      (set! (-> flat x) (sin (* 182.04445 (* 45.0 (the float i)))))
+    (dotimes (i n)
+      (set! (-> flat x) (sin (* 182.04445 (* step (the float i)))))
       (set! (-> flat y) 0.0)
-      (set! (-> flat z) (cos (* 182.04445 (* 45.0 (the float i)))))
+      (set! (-> flat z) (cos (* 182.04445 (* step (the float i)))))
       ;; Start beyond the large circle shield and bot collision, in the same direction as travel.
       (vector-copy! start center)
       (vector+*! start start flat 16384.0)
@@ -481,15 +487,65 @@
       (blast-bot-spawn-grenade this start vel)
       )
     (when *blast-bot-wave-inner-ring*
-      (dotimes (i 8)
-        (set! (-> flat x) (sin (* 182.04445 (+ 22.5 (* 45.0 (the float i))))))
+      (dotimes (i n)
+        (set! (-> flat x) (sin (* 182.04445 (* step (+ 0.5 (the float i))))))
         (set! (-> flat y) 0.0)
-        (set! (-> flat z) (cos (* 182.04445 (+ 22.5 (* 45.0 (the float i))))))
+        (set! (-> flat z) (cos (* 182.04445 (* step (+ 0.5 (the float i))))))
         (vector-copy! start center)
         (vector+*! start start flat 32768.0)
         (blast-bot-grenade-vel vel flat *blast-bot-wave-inner-speed*)
         (blast-bot-spawn-grenade this start vel)
         )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-fire-concussor ((this blast-bot-player))
+  (blast-bot-fire-concussor-n this 8)
+  (none)
+  )
+
+(defun blast-bot-wave-charge-update ((this blast-bot-player))
+  ;; Wave Concussor: hold R1 to charge, release to throw. A tap = half the grenades, a full charge = the full ring(s).
+  ;; One use of heat per throw, paid on release.
+  (let* ((held (the float (- (current-time) *blast-wave-charge-start*)))
+         (f (if (= *blast-wave-charge-start* 0)
+                0.0
+                (fmax 0.0 (fmin 1.0 (/ held (* 300.0 *blast-wave-charge-time*))))
+                ))
+         )
+    (cond
+      ((cpad-hold? 0 r1)
+       (cond
+         ((= *blast-wave-charge-start* 0)
+          (when (and (not (and *blast-bot-overheated* (not *blast-bot-unlimited-ammo*)))
+                     (>= (+ (current-time) (seconds -0.02)) (-> this next-shot)))
+            (set! *blast-wave-charge-start* (current-time))
+            )
+          )
+         (*blast-wave-charge-fx*
+           (let* ((m (matrix-copy! (new 'stack-no-clear 'matrix) (-> this node-list data 6 bone transform)))
+                  (pos (matrix->trans m (new 'stack-no-clear 'vector)))
+                  (dir (vector-normalize-copy! (new 'stack-no-clear 'vector) (-> m fvec) 1.0))
+                  )
+             (vector+*! pos pos dir 8192.0)
+             (blast-bomb-charge-ball pos dir f)
+             )
+           )
+         )
+       )
+      ((!= *blast-wave-charge-start* 0)
+       (set! *blast-wave-charge-start* 0)
+       (set! (-> this next-shot) (+ (current-time) (seconds 0.2)))
+       (when (blast-bot-heat-try-use 1.0)
+         (blast-bot-fire-concussor-n
+           this
+           (max 1 (the int (+ 0.5 (* 8.0 (+ *blast-wave-min-fraction* (* (- 1.0 *blast-wave-min-fraction*) f))))))
+           )
+         (set! (-> this shield-open-until) (+ (current-time) (seconds 0.15)))
+         )
+       )
       )
     )
   (none)
@@ -503,9 +559,7 @@
          )
      )
     ((2)
-     (if (blast-bot-heat-try-use 1.0)        ;; one shot before overheating
-         (blast-bot-fire-concussor this)
-         )
+     #f        ;; Wave Concussor is charge-and-release (blast-bot-wave-charge-update)
      )
     (else
       (if (blast-bot-heat-try-use 1.0)      ;; one use before overheating
@@ -1656,6 +1710,14 @@
         (blast-bot-purple-charge-update this)
         (set! *blast-bomb-charge-start* 0)
         )
+    (let ((wave (and *blast-bot-use-morphgun* *target* (= *blast-bot-gun-mode* 0) (blast-bot-gun-owned? 0)
+                     (= *blast-bot-red-weapon* 2))))
+      (if wave
+          (blast-bot-wave-charge-update this)
+          (set! *blast-wave-charge-start* 0)
+          )
+      (when wave (set! purple #t))     ;; keeps the press-to-fire code below off for it
+      )
     (when (and (not purple)
                (or blue (cpad-pressed? 0 r1))
                (>= (+ (current-time) (seconds -0.02)) (-> this next-shot)))

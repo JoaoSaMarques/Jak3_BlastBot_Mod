@@ -769,6 +769,17 @@
   (none)
   )
 
+;; The game seats Jak in the car itself after a scene / continue, but the mission (Flut Flut lizards) only goes on when Jak gets in
+;; for real (the car receives pilot-on from Jak): leaving and re-entering by hand fixed it. So an auto ride that started from a
+;; game-seated Jak does that by itself: ride 1 s, get out, get back in with the normal merge.
+;; 0 none | 1 get out soon | 2 out, waiting for Jak to be back in the bot, then merge again
+(define *blast-bot-remount* 0)
+(define *blast-bot-remount-time* (the-as time-frame 0))
+(define *blast-bot-remount-on* #t)
+(define *blast-bot-remount-tries* 0)   ;; remount cycles started that did not reach the re-merge yet: at most 3 in a row (no loops)
+(define *blast-bot-pgrab-since* (the-as time-frame 0))
+(define *blast-bot-pgrab-timeout* (seconds 3))   ;; Jak stuck in target-pilot-grab with no scene playing: end the grab
+
 (defun blast-bot-merge-update ((this blast-bot-player))
   (blast-bot-merge-hp-update this)
   (blast-bot-flut-update this)
@@ -785,11 +796,44 @@
       (cond
         ((zero? stage)
          ;; a race / training puts Jak in the car by itself: ride it right away instead of fighting over him
-         (when (and *blast-bot-ride-in-missions* (blast-bot-vehicle-mission?) (not *blast-bot-spy-active*)
-                    (= st 'target-pilot-stance) (focus-test? *target* pilot-riding))
+         ;; Jak left in target-pilot-grab after a scripted scene (the Flut Flut / lizard pen): nothing else frees him and the old
+         ;; regrab loop could never take him back (grab-ride is refused in pilot-grab). Free him, he then lands in pilot-stance
+         ;; and the auto ride below puts the bot back on the car.
+         (if (and (= st 'target-pilot-grab) (not (-> *art-control* active-stream)) (not (blast-bot-scene-active?)))
+             (begin
+               (if (zero? *blast-bot-pgrab-since*)
+                   (set! *blast-bot-pgrab-since* (current-time))
+                   )
+               (when (> (- (current-time) *blast-bot-pgrab-since*) *blast-bot-pgrab-timeout*)
+                 (format 0 "Blast Bot: Jak stuck in target-pilot-grab, ending the grab~%")
+                 (set! *blast-bot-pgrab-since* 0)
+                 (send-event *target* 'end-mode 'grab)
+                 )
+               )
+             (set! *blast-bot-pgrab-since* 0)
+             )
+         ;; any time Jak is put in a car by the game (not only the listed vehicle missions): ride it
+         ;; The game seats Jak itself after a scene / continue (target-continue -> pilot-start -> pilot-impact -> pilot-daxter-perch),
+         ;; so pilot-stance is often never reached: the calm perch state counts too. The car is the one Jak is mounted on; if the
+         ;; game has not filled that in, the last car the bot rode, else the nearest one.
+         (when (and *blast-bot-ride-in-missions* (not *blast-bot-spy-active*)
+                    (> (- (current-time) *blast-bot-merge-time*) (seconds 3))   ;; not right after you pressed Triangle to get out
+                    (or (= st 'target-pilot-stance) (= st 'target-pilot-daxter-perch)))
            (let ((pv (as-type (handle->process (-> *target* pilot vehicle)) rigid-body-object)))
+             (if (not pv)
+                 (set! pv (the-as rigid-body-object (blast-bot-merge-vehicle)))
+                 )
+             (if (or (not pv) (focus-test? pv dead))
+                 (set! pv (the-as rigid-body-object (blast-bot-merge-find this)))
+                 )
              (when pv
                (format 0 "Blast Bot: riding (auto) ~A~%" pv)
+               (when (and *blast-bot-remount-on* (not (blast-bot-vehicle-mission?))
+                          (< *blast-bot-remount-tries* 3))
+                 (set! *blast-bot-remount* 1)
+                 (set! *blast-bot-remount-time* (current-time))
+                 (+! *blast-bot-remount-tries* 1)
+                 )
                (set! *blast-bot-merge-pp* (process->ppointer (the-as process pv)))
                (set! *blast-bot-merge-ride* #t)
                (set! *blast-bot-merge-time* (current-time))
@@ -798,7 +842,15 @@
                )
              )
            )
-         (when (and (cpad-pressed? 0 triangle) (not *blast-bot-spy-active*) (= st 'target-grab-ride))
+         (if (and (= *blast-bot-remount* 2) (> (- (current-time) *blast-bot-remount-time*) (seconds 12)))
+             (set! *blast-bot-remount* 0)
+             )
+         (when (and (or (cpad-pressed? 0 triangle) (= *blast-bot-remount* 2)) (not *blast-bot-spy-active*) (= st 'target-grab-ride))
+           (when (= *blast-bot-remount* 2)
+             (format 0 "Blast Bot: getting back into the car for real~%")
+             (set! *blast-bot-remount* 0)
+             (set! *blast-bot-remount-tries* 0)
+             )
            (if (and (blast-bot-vehicle-mission?) (not *blast-bot-ride-in-missions*))
                (format 0 "Blast Bot: merge is disabled while a vehicle training / race mission is running~%")
                )
@@ -902,6 +954,8 @@
            ((or (not v) (focus-test? v dead)
                 (if *blast-bot-merge-ride* (not (blast-bot-pilot-state? st)) (!= st 'target-pilot-grab)))
             (format 0 "Blast Bot: ~A lost (~A)~%" (if *blast-bot-merge-ride* "ride" "merge") st)
+            (set! *blast-bot-remount* 0)
+            (set! *blast-bot-remount-tries* 0)
             (when v
               (if *blast-bot-merge-ride*
                   (if (not (blast-bot-vehicle-mission?)) (send-event v 'ignore-damage #f))
@@ -927,8 +981,16 @@
             (send-event *target* 'end-mode 'grab)
             )
            ((or (cpad-pressed? 0 triangle)
+                (and (= *blast-bot-remount* 1) (> (- (current-time) *blast-bot-remount-time*) (seconds 1)))
                 (and (blast-bot-vehicle-mission?) (not *blast-bot-merge-ride*)))
             (format 0 "Blast Bot: ~A~%" (if *blast-bot-merge-ride* "ending the ride" "unmerging"))
+            (if (= *blast-bot-remount* 1)
+                (begin
+                  (set! *blast-bot-remount* 2)
+                  (set! *blast-bot-remount-time* (current-time))
+                  )
+                (set! *blast-bot-remount* 0)
+                )
             (if *blast-bot-merge-ride*
                 (if (not (blast-bot-vehicle-mission?)) (send-event v 'ignore-damage #f))
                 (begin
@@ -955,7 +1017,7 @@
          )
         ((= stage 4)
          (cond
-           ((= st 'target-pilot-stance)
+           ((or (= st 'target-pilot-stance) (= st 'target-pilot-daxter-perch))   ;; perch uses the same pilot handler: it also gets the get-off
             (send-event *target* 'end-mode 'pilot)
             (set! *blast-bot-merge-stage* 5)
             (set! *blast-bot-merge-time* (current-time))
