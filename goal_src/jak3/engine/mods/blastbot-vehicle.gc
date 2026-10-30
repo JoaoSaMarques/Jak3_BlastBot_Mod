@@ -694,8 +694,8 @@
 ;; skips shots that already ignore the bot.
 ;; a pointer, NOT a handle: a handle is 64 bits and a global symbol only keeps 32, so the stored handle always read back as #f
 (define *blast-bot-carshot-bot* (the-as (pointer process) #f))   ;; the bot, set every frame by blast-bot-carshot-update
-(define *blast-bot-carshot-debug* #t)
-(define *blast-bot-carshot-trace* #t)   ;; #t: print one line per projectile spawned while merged (to see if the hook is called at all)
+(define *blast-bot-carshot-debug* #f)
+(define *blast-bot-carshot-trace* #f)   ;; #t: print one line per projectile spawned while merged (to see if the hook is called at all)
 
 (defun blast-bot-carshot-params ((params projectile-init-by-other-params))
   (when (and *blast-bot-car-shots-from-barrel* (= *blast-bot-merge-stage* 3))
@@ -806,6 +806,7 @@
 ;; for real (the car receives pilot-on from Jak): leaving and re-entering by hand fixed it. So an auto ride that started from a
 ;; game-seated Jak does that by itself: ride 1 s, get out, get back in with the normal merge.
 ;; 0 none | 1 get out soon | 2 out, waiting for Jak to be back in the bot, then merge again
+(define-extern *blast-bot-manual-enter-time* time-frame)   ;; defined in blastbot-main-mod.gc
 (define *blast-bot-remount* 0)
 (define *blast-bot-remount-time* (the-as time-frame 0))
 (define *blast-bot-remount-on* #t)
@@ -862,7 +863,12 @@
              (when pv
                (format 0 "Blast Bot: riding (auto) ~A~%" pv)
                (when (and *blast-bot-remount-on* (not (blast-bot-vehicle-mission?))
-                          (< *blast-bot-remount-tries* 3))
+                          (< *blast-bot-remount-tries* 3)
+                          ;; a hang glider has no get-off (sidekick-clone art error) and it flies: getting out drops Jak into the void
+                          (not (blast-bot-vehicle-type? (the-as process pv) 'h-glider))
+                          ;; not after Jak got in by himself (the bot was removed at pilot-start a moment ago and Jak lands in pilot-stance)
+                          (not (and (= st 'target-pilot-stance)
+                                    (< (- (current-time) *blast-bot-manual-enter-time*) (seconds 15)))))
                  (set! *blast-bot-remount* 1)
                  (set! *blast-bot-remount-time* (current-time))
                  (+! *blast-bot-remount-tries* 1)
@@ -882,7 +888,6 @@
            (when (= *blast-bot-remount* 2)
              (format 0 "Blast Bot: getting back into the car for real~%")
              (set! *blast-bot-remount* 0)
-             (set! *blast-bot-remount-tries* 0)
              )
            (if (and (blast-bot-vehicle-mission?) (not *blast-bot-ride-in-missions*))
                (format 0 "Blast Bot: merge is disabled while a vehicle training / race mission is running~%")
@@ -919,7 +924,7 @@
             (format 0 "Blast Bot: merge could not free Jak (~A), giving up~%" st)
             (set! *blast-bot-merge-stage* 0)
             )
-           ((= st 'target-stance)
+           ((or (= st 'target-stance) (= st 'target-gun-stance) (= st 'target-gun-walk))   ;; Jak has the gun out: he lands in target-gun-stance, never plain target-stance
             ;; same message the engine uses for 'get in this vehicle': param1 = vehicle, param3 = skip the get-on animation
             (send-event *target* 'change-mode 'pilot v #f #t)
             (set! *blast-bot-merge-stage* 1)

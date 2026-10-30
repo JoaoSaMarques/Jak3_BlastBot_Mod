@@ -807,7 +807,7 @@
                (< 0.001 (-> this hover-blend)))
       (let ((limb -1))
         (dotimes (i 4)
-          (when (= (the-as int (-> arg0 param2)) (-> *blast-bot-elbows* i))
+          (when (= ik (-> this joint-ik i))
             (set! limb i)
             )
           )
@@ -3782,6 +3782,10 @@
   (none)
   )
 
+;; set when the bot is removed because Jak is getting into a car himself (pilot-start / get-on). blastbot-vehicle.gc reads it
+;; so the "remount" workaround (meant for a game-seated Jak after a scene / continue) is not run after a normal entry.
+(define *blast-bot-manual-enter-time* (the-as time-frame 0))
+
 (defun despawn-my-bombbot ()
   ;; L1 + Triangle: puts Jak back to normal and removes the bot. The release takes a few frames (grab, then end-grab,
   ;; same two events the die state uses), so this only starts it; blast-bot-despawn-update (call it every frame)
@@ -3790,6 +3794,9 @@
     (let ((bot (the-as blast-bot-player (blast-bot-find))))
       (when bot
         (format 0 "Blast Bot: despawn requested (Jak ~A)~%" (blast-bot-jak-state))
+        (if (or (= (blast-bot-jak-state) 'target-pilot-start) (= (blast-bot-jak-state) 'target-pilot-get-on))
+            (set! *blast-bot-manual-enter-time* (current-time))
+            )
         (set! *blast-bot-despawn-time* (current-time))
         ;; drop the shield first, like the die state does
         (let ((sh (handle->process (-> bot shield-handle))))
