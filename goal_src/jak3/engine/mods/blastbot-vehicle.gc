@@ -516,6 +516,9 @@
 ;; missions can never progress: merging is refused while one of them is running and an active merge is dropped.
 (define *blast-bot-merge-block-missions* #t)
 
+;; next time the merge / ride re-sends 'ignore-damage #t to the car (see the stage 3 else branch)
+(define *blast-bot-damage-resend* (the-as time-frame 0))
+
 (define-extern blast-bot-vehicle-mission-in? (function process-tree symbol))
 (defun blast-bot-vehicle-mission-in? ((tree process-tree))
   (let ((p (-> tree child))
@@ -571,6 +574,19 @@
       )
     found
     )
+  )
+
+;; #t while the bot rides a hang glider (h-glider): the front legs are spread out like wings (blastbot-main-mod.gc)
+(defun blast-bot-glider? ()
+  ;; returns a real symbol: blastbot-main-mod.gc declares (function symbol)
+  (if (and (blast-bot-ride?)
+           (let ((v (blast-bot-merge-vehicle)))
+             (and v (blast-bot-vehicle-type? (the-as process v) 'h-glider))
+             )
+           )
+      #t
+      #f
+      )
   )
 
 (defun blast-bot-vehicle-hp-bonus ((v process))
@@ -1046,6 +1062,13 @@
             (set! *blast-bot-merge-time* (current-time))
             )
            (else
+             ;; Some task managers switch the car's damage back on from their own code (the tube ride in comb-travel.gc sends
+             ;; 'ignore-damage #f when the intro ends and again before the outro), so the car would take hits next to the bot.
+             ;; Outside the listed vehicle missions the car must stay immune while the bot is on it: say so again a few times a second.
+             (when (and v (>= (current-time) *blast-bot-damage-resend*) (not (blast-bot-vehicle-mission?)))
+               (set! *blast-bot-damage-resend* (+ (current-time) (seconds 0.25)))
+               (send-event v 'ignore-damage #t)
+               )
              (if *blast-bot-merge-ride*
                  (blast-bot-ride-follow this v)
                  (blast-bot-merge-follow this v)

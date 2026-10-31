@@ -7,6 +7,10 @@
 
 ;; DECOMP BEGINS
 
+(define-extern *beast-speed-up* float)             ;; des-beast.gc
+(define-extern *beast-speed-up-per-death* float)
+(define-extern *beast-speed-up-max* float)
+
 (deftype hud-beast (hud)
   ()
   )
@@ -77,6 +81,7 @@
     (t9-0 this)
     )
   (set! (-> this end-time) 0)
+  (set! *beast-speed-up* 1.0)
   (set! (-> this hud-counter)
         (ppointer->handle (process-spawn hud-beast :init hud-init-by-other :name "hud-beast" :to this))
         )
@@ -139,6 +144,13 @@
           ((4)
            (set! s4-0 2400)
            )
+          )
+        ;; every dead beast makes the survivors 25% faster (and shoot faster): des-beast.gc reads *beast-speed-up*
+        (let ((up 1.0))
+          (dotimes (i (- (length (-> this actor-group 0)) s5-1))
+            (set! up (* up *beast-speed-up-per-death*))
+            )
+          (set! *beast-speed-up* (fmin up *beast-speed-up-max*))
           )
         (dotimes (s3-1 (length (-> this actor-group 0)))
           (let ((v1-49 (-> this actor-group 0 data s3-1))

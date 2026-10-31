@@ -10,6 +10,13 @@
 (define-extern *curve-grenade-linear-trail* curve2d-fast)
 (define-extern *beast-grenade-trail* light-trail-composition)
 (define-extern *range-grenade-explo-dust-color* curve-color-fast)
+
+;; Every beast that dies makes the others faster (movement) and quicker to shoot. desert-hover.gc works the numbers out every frame
+;; (deaths = beasts in the task's actor group that are dead) and writes them here; 1.0 = normal.
+(define *beast-speed-up* 1.0)
+(define *beast-speed-up-per-death* 1.25)   ;; 25% faster per dead beast, compounding (1.5, 2.25, 3.4, ...)
+(define *beast-speed-up-max* 6.0)         ;; cap, so the animations / path following stay sane
+(define *beast-min-shoot-delay* 150)      ;; fastest firing interval, in ticks (300 = 1 s): 0.5 s
 (define-extern *range-grenade-explo-dust-alpha* curve2d-fast)
 (define-extern *range-grenade-explo-dust-scale-x* curve2d-fast)
 (define-extern *range-grenade-explo-dust-scale-y* curve2d-fast)
@@ -1446,7 +1453,7 @@
         (seconds 0.1)
         )
       (when (< (vector-vector-distance (-> self root trans) gp-0) 204800.0)
-        (+! (-> self path-pos) (* 10.0 (seconds-per-frame) (-> self path-pos-speed)))
+        (+! (-> self path-pos) (* 10.0 (seconds-per-frame) (-> self path-pos-speed) *beast-speed-up*))
         (des-beast-method-163 self)
         )
       (let ((s4-1 (vector-! (new 'stack-no-clear 'vector) gp-0 (-> self root trans)))
@@ -1479,7 +1486,10 @@
         )
       )
     (when (nonzero? (-> self shoot-delay))
-      (when (time-elapsed? (-> self next-shoot) (-> self shoot-delay))
+      ;; shoot-delay itself is left alone (die-run compares it with 2 s to tell the last beast); it is divided here
+      (when (time-elapsed? (-> self next-shoot)
+                           (max *beast-min-shoot-delay* (the int (/ (the float (-> self shoot-delay)) *beast-speed-up*)))
+                           )
         (set-time! (-> self next-shoot))
         (if (< (vector-vector-distance (-> self root trans) (target-pos 0)) 614400.0)
             (des-beast-method-164 self)
@@ -1512,7 +1522,7 @@
       (ja-frame-num 0)
       (until (< (ja-frame-num 0) f30-0)
         (set! f30-0 (ja-frame-num 0))
-        (ja :num! (loop! (* (-> self main-speed-factor) (-> self speed-factor))))
+        (ja :num! (loop! (* (-> self main-speed-factor) (-> self speed-factor) *beast-speed-up*)))
         (des-beast-method-162 self)
         (suspend)
         )
@@ -1554,7 +1564,7 @@
     (ja-channel-push! 1 0)
     (ja :group! des-beast-turn180-ja)
     (until (ja-done? 0)
-      (ja :num! (seek! max (* (-> self main-speed-factor) (-> self speed-factor))))
+      (ja :num! (seek! max (* (-> self main-speed-factor) (-> self speed-factor) *beast-speed-up*)))
       (des-beast-method-162 self)
       (suspend)
       )
@@ -1820,6 +1830,25 @@
 (defmethod enemy-touched-handler ((this des-beast) (arg0 process) (arg1 event-message-block))
   "General handler for when anything touches an enemy (automatic response)."
   (cond
+    ;; the blast bot (blastbot-main-mod.gc) is not of type target, so it fell into the generic 'touch branch and was never hurt.
+    ;; Same hit as Jak gets. Compared by type name: the bot's type does not exist yet when this level file is compiled.
+    ((= (-> arg0 type symbol) 'blast-bot-player)
+     (when (not (logtest? (-> this entity extra perm status) (entity-perm-status dead)))
+       (send-event
+         arg0
+         'attack
+         (-> arg1 param 0)
+         (static-attack-info :mask (vehicle-impulse-factor) ((id (-> this attack-id))
+                                                             (damage 20.0)
+                                                             (vehicle-damage-factor 1.0)
+                                                             (vehicle-impulse-factor 1.0)
+                                                             (shove-back (meters 10))
+                                                             (shove-up (meters 8))
+                                                             )
+                             )
+         )
+       )
+     )
     ((= (-> arg0 type) target)
      (let ((s4-0 (-> arg1 param 0)))
        (let ((s3-1 arg0))

@@ -151,7 +151,7 @@
 
 (defun blast-bot-attacker? ((p process))
   ;; marauder.gc counts a kill for the arena fights only when the last attacker is Jak (type target); the bot's own shots name the bot
-  (and p (type? p blast-bot-player))
+  (if (and p (type? p blast-bot-player)) #t #f)   ;; must return a symbol: other files declare (function process symbol)
   )
 
 (defun blast-bot-credit-jak! ((info attack-info))
@@ -179,7 +179,7 @@
 ;; how fast the body turns toward the stick direction (rotation units/sec, 21845 = 120 deg/s)
 (define *blast-bot-body-turn-rate* 21845.0)
 ;; wall blocking: radius of the sweep sphere, and how high above the ground it is centred
-(define *blast-bot-wall-radius* 17408.0)
+(define *blast-bot-wall-radius* 13312.0)   ;; was 17408 (4.25 m): the sphere was 8.5 m wide and reached 10.75 m up, so arches and ceilings stopped the bot (3.25 m now)
 ;; Half-size of the boxes the bot fills the collide cache with. The cache holds only ~460 triangles; in dense places (the palace
 ;; elevator frame, planks, pots) the old 10 m boxes overflowed it ("Exceeded collide cache max # of tris (blast-bot-player)") and
 ;; the triangles dropped included the platform floor, so the feet / body fell through it. Smaller boxes still cover the 4.5 m wall
@@ -187,7 +187,7 @@
 (define *blast-bot-leg-fill-xz* 32768.0)    ;; 8 m
 (define *blast-bot-wall-fill-xz* 30720.0)   ;; 7.5 m
 (define *blast-bot-wall-fill-y* 28672.0)    ;; 7 m
-(define *blast-bot-wall-height* 26624.0)   ;; Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
+(define *blast-bot-wall-height* 18432.0)   ;; Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
 ;; how much of the leg-lift tilt goes into the body the legs hang from. The head gets the rest,
 ;; so the head's total tilt is unchanged and the body tilts too (it also carries the head).
 (define *blast-bot-body-tilt-share* 0.5)
@@ -220,7 +220,13 @@
 (define *blast-bot-ride-foot-drop* 6144.0) ;; maximum downward adaptation (1.5 m)
 (define *blast-bot-ride-foot-radius* 1024.0) ;; 25 cm clearance for leg thickness
 (define-extern blast-bot-ride? (function symbol))
+(define-extern blast-bot-glider? (function symbol))   ;; blastbot-vehicle.gc: riding an h-glider
 (define-extern blast-bot-merge-vehicle (function object))
+;; Hang glider ride: the two FRONT legs (0 and 3) are spread out to the sides like wings. Foot targets are relative to the bot's origin
+;; (x = side, y = height, z = forward). The back legs keep the normal ride pose.
+(define *blast-bot-glider-arm-x* 28672.0)   ;; 7 m out to each side
+(define *blast-bot-glider-arm-y* -6144.0)   ;; height of the wing tips (the body joint is already lowered in ride mode)
+(define *blast-bot-glider-arm-z* 2048.0)    ;; slightly ahead of the body
 (define *blast-bot-bunker-depth* 10240.0)   ;; how far the body dips while the spy droid is out (10240 = same dip as the jump crouch)
 (define *blast-bot-bunker-speed* 20480.0)   ;; how fast it dips (same speed as the jump crouch)
 ;; Circle shield size (the stock shield's hit sphere radius is 1m x this).
@@ -692,6 +698,13 @@
         ;; R2 hover: blend every foot toward a pose swept back behind the body. The front pair (0, 3)
         ;; hangs low, the back pair (1, 2) is held higher, so the legs never overlap.
         (when (< 0.001 (-> this hover-blend))
+          (if (and (blast-bot-glider?) (or (= i 0) (= i 3)))
+              ;; hang glider: front legs spread wide like wings
+              (set-vector! hov
+                           (if (< i 2) *blast-bot-glider-arm-x* (- *blast-bot-glider-arm-x*))
+                           *blast-bot-glider-arm-y*
+                           *blast-bot-glider-arm-z*
+                           1.0)
           (if (and *blast-bot-ride-pose* (blast-bot-ride?))
               ;; vehicle mode: legs aimed backwards, nearly flat, body lower
               (set-vector! hov
@@ -706,12 +719,12 @@
                            (if (or (= i 0) (= i 3)) -14336.0 -8192.0)
                            (if (or (= i 0) (= i 3)) -10240.0 -20480.0)
                            1.0)
-              )
+              ))
           (vector-orient-by-quat! hov hov (-> this root quat))
           (vector+! hov hov (-> this root trans))
           (when (blast-bot-ride?)
             (let ((offset 0.0))
-              (when (and *blast-bot-ride-terrain* (< 0 (-> *collide-cache* num-tris)))
+              (when (and *blast-bot-ride-terrain* (not (blast-bot-glider?)) (< 0 (-> *collide-cache* num-tris)))
                 ;; Sample underneath the outer half of the leg as well as the tip.
                 ;; A rock under the shin must lift the leg even if the foot is clear.
                 ;; These are conservative samples of the body-to-foot span; IK still
@@ -1196,6 +1209,11 @@
 ;; #t: once a second the bot probes ahead / up / down from 2 m above its feet with every collide-spec and prints what it hits
 ;; (see blast-bot-wall-probe). Nothing to type: just stand in the thing it clips through and read the log. Set to #f when done.
 (define *blast-bot-wall-debug* #f)
+;; #t: print what blocks the bot (touch height, normal, owner) at most twice a second while it is stopped by a wall
+(define *blast-bot-wall-block-debug* #t)
+;; a surface whose normal points down more than this is a ceiling / underside of an arch: it never stops the bot walking (-1 = down, 0 = vertical wall)
+(define *blast-bot-wall-ceiling-y* -0.3)
+(define *blast-bot-wall-block-next* (the-as time-frame 0))
 (define *blast-bot-wall-debug-next* (the-as time-frame 0))
 (define *blast-bot-bouncer-height* 12288.0)    ;; the awning probe starts this high above the bot's feet (3 m): the normal wall probe starts at 6.5 m and misses low awnings
 (define *blast-bot-bouncer-radius* 8192.0)   ;; ... and uses this radius (2 m), so the awning it stands on is not in the sweep
@@ -1291,7 +1309,28 @@
                 )
               )
             (cond
-              ((and (>= hit 0.0) (< (fabs (-> nrm y)) 0.7))
+              ((and (>= hit 0.0) (< (fabs (-> nrm y)) 0.7) (< *blast-bot-wall-ceiling-y* (-> nrm y)))
+               ;; debug: what is blocking the bot (set *blast-bot-wall-block-debug* to #f to silence)
+               (when (and *blast-bot-wall-block-debug* (< hit 0.5))
+                 (let ((prim (as-type (-> q best-other-tri collide-ptr) collide-shape-prim))
+                       (pat (-> q best-other-tri pat))
+                       )
+                   (when (>= (current-time) *blast-bot-wall-block-next*)
+                     (set! *blast-bot-wall-block-next* (+ (current-time) (seconds 0.5)))
+                     ;; format takes at most 8 parameters in total, so this is two calls
+                     (format 0 "Blast Bot: wall block: touch point ~f m above the bot origin, sphere centre ~f m, radius ~f m~%"
+                             (/ (- (-> q best-other-tri intersect y) (-> this root trans y)) 4096.0)
+                             (/ *blast-bot-wall-height* 4096.0)
+                             (/ *blast-bot-wall-radius* 4096.0)
+                             )
+                     (format 0 "Blast Bot: wall block: normal ~f ~f ~f, pat mode ~D, owner ~A~%"
+                             (-> nrm x) (-> nrm y) (-> nrm z)
+                             (the-as int (-> pat mode))
+                             (if prim (-> prim cshape process type) "background")
+                             )
+                     )
+                   )
+                 )
                ;; a wall: walk up to it...
                (let ((frac0 (fmax 0.0 (- hit 0.03))))
                  (+! (-> this root trans x) (* (-> move x) frac0))
