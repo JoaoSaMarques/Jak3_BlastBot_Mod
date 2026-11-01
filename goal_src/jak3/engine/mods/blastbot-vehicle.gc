@@ -713,6 +713,22 @@
 (define *blast-bot-carshot-debug* #f)
 (define *blast-bot-carshot-trace* #f)   ;; #t: print one line per projectile spawned while merged (to see if the hook is called at all)
 
+;; projectile.gc asks this for the first ignore slot of every collision query of a shot. A shot only has two slots: the first used to be
+;; the shot itself (pointless: a shot never collides with itself) and the second is ignore-handle, which a barrel shot sets to the bot.
+;; The car that fired it sits right on top of the bot, so for a shot that ignores the bot and is owned by a vehicle the first slot
+;; ignores that car, and the shot passes through both. Every other shot: the shot itself, exactly as before.
+(defun blast-bot-carshot-ignore0 ((pj projectile))
+  (let ((own (handle->process (-> pj owner-handle))))
+    (if (and own
+             (as-type own rigid-body-object)
+             (as-type (handle->process (-> pj ignore-handle)) blast-bot-player)
+             )
+        own
+        (the-as process pj)
+        )
+    )
+  )
+
 (defun blast-bot-carshot-params ((params projectile-init-by-other-params))
   (when (and *blast-bot-car-shots-from-barrel* (= *blast-bot-merge-stage* 3))
     (let ((veh (the-as process (blast-bot-merge-vehicle)))
@@ -738,6 +754,8 @@
           (vector-copy! (-> params pos) start)
           (vector-float*! (-> params vel) dir speed)
           (set! (-> params ignore-handle) (process->handle bot))
+          ;; the shield's hit sphere is switched off for a moment so the shot can leave it (same as the bot's own shots)
+          (set! (-> (the-as blast-bot-player bot) shield-open-until) (+ (current-time) (seconds 0.25)))
           (if *blast-bot-carshot-debug*
               (format 0 "Blast Bot: car shot start moved to the barrel at spawn~%")
               )

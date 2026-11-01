@@ -187,6 +187,10 @@
 (define *blast-bot-leg-fill-xz* 32768.0)    ;; 8 m
 (define *blast-bot-wall-fill-xz* 30720.0)   ;; 7.5 m
 (define *blast-bot-wall-fill-y* 28672.0)    ;; 7 m
+;; The collide cache holds ~460 triangles and the temple has far more than that around the bot ("Exceeded collide cache max # of tris"):
+;; the overflow drops triangles, and the bot then misses the floor / props (the bouncers) it stands on. Both cache boxes (legs, walls)
+;; are multiplied by this: it shrinks quickly when a fill came back nearly full and grows back slowly when there is room.
+(define *blast-bot-fill-scale* 1.0)
 (define *blast-bot-wall-height* 19456.0)
 ;; The wall sweep is no longer one 4.25 m ball (that reached 10.75 m up and caught arches / ceilings). With *blast-bot-wall-capsule* it is
 ;; three smaller balls side by side across the walking direction: same total width (*blast-bot-wall-radius* each way), but only
@@ -297,7 +301,9 @@
 (define *blast-bot-ground-obstacles* #t)
 (defun blast-bot-ground-spec ()
   (if *blast-bot-ground-obstacles*
-      (collide-spec backgnd pusher hit-by-others-list obstacle)
+      ;; hit-by-player-list: the cache only visits an object list when its bit is in the query. bouncers / crates / props live in the
+      ;; hit-by-player list (collide-shape ... (collide-list-enum hit-by-player)), without the bit the probes never see them at all
+      (collide-spec backgnd pusher hit-by-others-list hit-by-player-list obstacle crate)   ;; crate: bouncer.gc props (and crates) are collide-as crate
       (collide-spec backgnd pusher hit-by-others-list)
       )
   )
@@ -537,6 +543,21 @@
 ;; the closest support within 2 m of the body's ground height wins, ties go to the one nearest where the foot stood before.
 ;; Moves `tgt` onto it and returns #t, or leaves `tgt` alone and returns #f.
 (define *blast-bot-rail-lock* #t)
+
+;; call right after a fill-using-bounding-box: adapts *blast-bot-fill-scale* to how full the cache got
+(defun blast-bot-fill-adapt ()
+  (let ((n (-> *collide-cache* num-tris)))
+    (cond
+      ((< 360 n)
+       (set! *blast-bot-fill-scale* (fmax 0.4 (* 0.8 *blast-bot-fill-scale*)))
+       )
+      ((< n 240)
+       (set! *blast-bot-fill-scale* (fmin 1.0 (+ 0.02 *blast-bot-fill-scale*)))
+       )
+      )
+    )
+  (none)
+  )
 (define *blast-bot-lock-reach* 14336.0)   ;; how far around the wanted foot spot a support is looked for: 3.5 m (planted feet are pulled back past ~3.5 m anyway)
 (define *blast-bot-lock-probe* 2048.0)    ;; radius of each probe: 0.5 m, so a thin beam / rail between two samples is still caught
 (define *blast-bot-grip-tick* 0)          ;; counts update-legs calls: a planted foot looks for a new grip only every 4th frame
@@ -619,7 +640,7 @@
       )
     ;; collect nearby ground triangles once, then probe per foot
     (let ((ext (new 'stack-no-clear 'vector)))
-      (set-vector! ext *blast-bot-leg-fill-xz* 24576.0 *blast-bot-leg-fill-xz* 1.0)
+      (set-vector! ext (* *blast-bot-leg-fill-xz* *blast-bot-fill-scale*) (* 24576.0 *blast-bot-fill-scale*) (* *blast-bot-leg-fill-xz* *blast-bot-fill-scale*) 1.0)
       (vector-! (-> q bbox min) (-> this root trans) ext)
       (vector+! (-> q bbox max) (-> this root trans) ext)
       )
@@ -629,6 +650,7 @@
     (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))
     (set! (-> q ignore-pat) (blast-bot-ground-pat))
     (fill-using-bounding-box *collide-cache* q)
+    (blast-bot-fill-adapt)
     (dotimes (i 4)
       (if (zero? i)
           (+! *blast-bot-grip-tick* 1)
@@ -1395,7 +1417,7 @@
     (set-vector! move dx 0.0 dz 1.0)
     (when (< 1.0 intended)
       ;; collect nearby static collision once
-      (set-vector! ext *blast-bot-wall-fill-xz* *blast-bot-wall-fill-y* *blast-bot-wall-fill-xz* 1.0)
+      (set-vector! ext (* *blast-bot-wall-fill-xz* *blast-bot-fill-scale*) (* *blast-bot-wall-fill-y* *blast-bot-fill-scale*) (* *blast-bot-wall-fill-xz* *blast-bot-fill-scale*) 1.0)
       (set-vector! start (-> this root trans x) (+ (-> this root trans y) *blast-bot-wall-height*) (-> this root trans z) 1.0)
       (vector-! (-> q bbox min) start ext)
       (vector+! (-> q bbox max) start ext)
@@ -1410,6 +1432,7 @@
                 )
             )
       (fill-using-bounding-box *collide-cache* q)
+      (blast-bot-fill-adapt)
       ;; two passes: move up to a wall, then slide along it with what is left
       (dotimes (iter 2)
         (when (< 1.0 (vector-length move))
@@ -1611,11 +1634,17 @@
 ;; Body height over a gap (two rails, no centre rail): the single probe under the body finds nothing, or the floor far below. The planted
 ;; feet stand on the rails, so when at least 3 of them have a floor near the body's height the average of those heights is the ground.
 ;; Returns -1e9 when the feet do not hold the bot up either (a real pit: it falls as before).
+;; With *blast-bot-feet-need-front-back* at least one FRONT foot (0, 3) AND one BACK foot (1, 2) must have a floor, otherwise the gap is
+;; too wide and the bot falls (before, any 2 feet were enough, e.g. both front feet with the back half hanging in the air).
+(define *blast-bot-feet-need-front-back* #t)
+(define *blast-bot-feet-grace* (the-as time-frame (seconds 0.12)))   ;; how long the old ground height is kept after the feet lose their support (was 0.5 s: stepping off a platform hung in the air that long)
 (define *blast-bot-feet-ok-time* (the-as time-frame -100000))
 
 (defun blast-bot-feet-support-y ((this blast-bot-player))
   (let ((sum 0.0)
         (n 0)
+        (n-front 0)
+        (n-back 0)
         (ref (-> this ground-y))
         (q (new 'stack-no-clear 'collide-query))
         )
@@ -1634,12 +1663,19 @@
             (when (< (fabs (- hy ref)) 8192.0)
               (+! sum hy)
               (+! n 1)
+              (if (or (= i 0) (= i 3))
+                  (+! n-front 1)
+                  (+! n-back 1)
+                  )
               )
             )
           )
         )
       )
-    (if (>= n 2)
+    (if (if *blast-bot-feet-need-front-back*
+            (and (< 0 n-front) (< 0 n-back))
+            (>= n 2)
+            )
         (/ sum (the float n))
         -1000000000.0
         )
@@ -1744,6 +1780,20 @@
 ;; ignore) and prints what is really under the bot next to what the normal ground probe found.
 (define *blast-bot-fall-debug* #f)
 (define *blast-bot-fall-max* 245760.0)   ;; fastest the bot falls: 60 m/s
+
+;; SUPER JUMP: hold L1 and the bot bunkers down a little deeper than for a normal jump (the legs shake harder the longer L1 is held),
+;; press X to launch. Let go of L1 without pressing X and it stands back up. X without L1 is the normal jump. Not in a vehicle, not in hover mode.
+(define *blast-bot-super-jump* #t)          ;; #f: no super jump
+(define *blast-bot-super* #f)               ;; the crouch that is going on is a super charge
+(define *blast-bot-super-shake* 0.0)        ;; the shake offset currently added to crouch-depth (taken back out every frame)
+(define *blast-bot-super-min* 0.8)          ;; seconds of holding L1 before the launch speed starts to ramp up (below that it is the minimum super jump)
+(define *blast-bot-super-full* 1.8)         ;; seconds of holding L1 for a full charge
+(define *blast-bot-super-depth* 12288.0)    ;; how deep the bot bunkers (normal jump crouch: 10240)
+(define *blast-bot-super-vy-min* 163840.0)  ;; launch speed at the minimum charge (a normal jump is 141000)
+(define *blast-bot-super-vy-max* 184320.0)  ;; launch speed at full charge (about 40 m high)
+(define *blast-bot-super-fuel-min* 0.25)    ;; thruster fuel the launch uses at the minimum charge (25%)
+(define *blast-bot-super-fuel-max* 0.5)     ;; thruster fuel the launch uses at full charge (50%)
+(define *blast-bot-super-shake-max* 2200.0) ;; strongest shake at full charge, in units (0.5 m)
 (defun blast-bot-fall-debug ((this blast-bot-player))
   (when *blast-bot-fall-debug*
     (let ((q (new 'stack-no-clear 'collide-query)))
@@ -1798,8 +1848,8 @@
                (set! gy fy)
                (set! *blast-bot-feet-ok-time* (current-time))
                )
-              ;; the feet lost the rails for a moment (a slight shift): keep the old height for half a second instead of dropping
-              ((< (- (current-time) *blast-bot-feet-ok-time*) (seconds 0.5))
+              ;; the feet lost the rails for a moment (a slight shift): keep the old height for *blast-bot-feet-grace* instead of dropping
+              ((< (- (current-time) *blast-bot-feet-ok-time*) *blast-bot-feet-grace*)
                (set! gy (-> this ground-y))
                )
               )
@@ -1843,14 +1893,77 @@
           (set! (-> this jump-x-released) (not (cpad-hold? 0 x)))
           (set! (-> this thrusting) #f)
           )
+         ;; L1 held: bunker down for a super jump (X launches it)
+         ((and *blast-bot-super-jump*
+               (cpad-hold? 0 l1)
+               (not *blast-bot-spy-active*)
+               (not (-> this hover-on))
+               (not (blast-bot-ride?))
+               (zero? *blast-bot-merge-stage*)
+               )
+          (set! *blast-bot-super* #t)
+          (set! (-> this jump-mode) 1)
+          (set! (-> this jump-timer) (current-time))
+          )
+         ;; X alone: the normal jump
          ((and (cpad-pressed? 0 x) (not *blast-bot-spy-active*))
+          (set! *blast-bot-super* #f)
           (set! (-> this jump-mode) 1)
           (set! (-> this jump-timer) (current-time))
           )
          )
        )
       ((1)
-       ;; crouch: dip the body; the stick only turns the head to pick the jump direction
+       ;; a vehicle / hover mode started while charging: it is a normal jump from here
+       (if (and *blast-bot-super* (or (-> this hover-on) (blast-bot-ride?) (!= *blast-bot-merge-stage* 0)))
+           (set! *blast-bot-super* #f)
+           )
+       ;; super charge: deeper and slower than the normal crouch, the legs shake harder the longer it goes on
+       (when *blast-bot-super*
+         (let* ((held (* 0.0033333334 (the float (- (current-time) (-> this jump-timer)))))
+                (charge (fmax 0.0 (fmin 1.0 (/ (- held *blast-bot-super-min*) (- *blast-bot-super-full* *blast-bot-super-min*)))))
+                (amp (* *blast-bot-super-shake-max* (fmin 1.0 (+ 0.15 (* 0.85 (/ held *blast-bot-super-full*))))))
+                (jit (* amp (sin (* 2621.0 (the float (- (current-time) (-> this jump-timer)))))))   ;; ~12 shakes a second
+                )
+           (seek! (-> this crouch-depth) (+ *blast-bot-super-depth* *blast-bot-super-shake*) (* 8192.0 dt))
+           (+! (-> this crouch-depth) (- jit *blast-bot-super-shake*))
+           (set! *blast-bot-super-shake* jit)
+           (cond
+             ((cpad-pressed? 0 x)
+              ;; launch
+              (let ((speed (-> *cpad-list* cpads 0 stick0-speed)))
+                (set! (-> this jump-vx) 0.0)
+                (set! (-> this jump-vz) 0.0)
+                (when (< 0.05 speed)
+                  (set! (-> this jump-vx) (* 30000.0 speed (sin (-> this head-yaw))))
+                  (set! (-> this jump-vz) (* 30000.0 speed (cos (-> this head-yaw))))
+                  )
+                )
+              (set! (-> this ground-y) (* 0.25 (+ (-> this foot-pos 0 y) (-> this foot-pos 1 y) (-> this foot-pos 2 y) (-> this foot-pos 3 y))))
+              (set! (-> this jump-vy) (+ *blast-bot-super-vy-min* (* charge (- *blast-bot-super-vy-max* *blast-bot-super-vy-min*))))
+              (set! (-> this jump-fuel)
+                    (fmax 0.0 (- (-> this jump-fuel)
+                                 (+ *blast-bot-super-fuel-min* (* charge (- *blast-bot-super-fuel-max* *blast-bot-super-fuel-min*))))))
+              (set! (-> this crouch-depth) 0.0)
+              (set! *blast-bot-super-shake* 0.0)
+              (set! *blast-bot-super* #f)
+              (set! (-> this jump-mode) 2)
+              (set! (-> this jump-timer) (current-time))
+              (set! (-> this jump-x-released) #f)
+              (set! (-> this thrusting) #f)
+              (activate! *camera-smush-control* 1024.0 37 60 1.0 0.99 (-> this clock))
+              )
+             ((not (cpad-hold? 0 l1))
+              ;; L1 let go without X: stand back up (jump-mode 0 seeks the crouch back to 0)
+              (+! (-> this crouch-depth) (- *blast-bot-super-shake*))
+              (set! *blast-bot-super-shake* 0.0)
+              (set! *blast-bot-super* #f)
+              (set! (-> this jump-mode) 0)
+              )
+             )
+           )
+         )
+       (when (and (not *blast-bot-super*) (= (-> this jump-mode) 1))   ;; (jump-mode 2 after the super launch above)
        (seek! (-> this crouch-depth) 10240.0 (* 20480.0 dt))
        (when (>= (- (current-time) (-> this jump-timer)) (seconds 0.6))
          (let ((speed (-> *cpad-list* cpads 0 stick0-speed)))
@@ -1870,6 +1983,7 @@
          (set! (-> this thrusting) #f)
          (if (not *blast-bot-spy-active*) (activate! *camera-smush-control* 512.0 37 60 1.0 0.99 (-> this clock)))
          )
+       )   ;; end of (when (not *blast-bot-super*)
        )
       ((2)
        (let ((hold (cpad-hold? 0 x)))
@@ -2722,6 +2836,7 @@
 ;; (vol-break-ground, volcano-obs2.gc) ask blast-bot-standing-on?: the engine only reports Jak as a rider, and the bot is not Jak.
 (define *blast-bot-ground-handle* (the-as handle #f))
 (define *blast-bot-ground-time* (the-as time-frame -100000))
+(define *blast-bot-bounce* #t)   ;; #f: bouncers are only stood on, they do not launch the bot
 (define *blast-bot-ground-log* #f)   ;; #t: print "now standing on <type>" when the bot steps onto a different prop
 
 (defun blast-bot-standing-on? ((p process))
@@ -2749,7 +2864,7 @@
       (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 8192.0)
       (vector-float*! (-> q move-dist) *y-vector* -61440.0)
       (set! (-> q radius) 40.96)
-      (set! (-> q collide-with) (collide-spec pusher hit-by-others-list obstacle))   ;; obstacle: breaking rocks etc. are plain obstacles
+      (set! (-> q collide-with) (collide-spec pusher hit-by-others-list hit-by-player-list obstacle crate))   ;; obstacle: breaking rocks etc. are plain obstacles, crate: bouncers
       (set! (-> q ignore-process0) this)
       (set! (-> q ignore-process1) #f)
       (set! (-> q ignore-pat)
@@ -2771,6 +2886,24 @@
                       )
                   (set! *blast-bot-ground-handle* (process->handle proc))
                   (set! *blast-bot-ground-time* (current-time))
+                  ;; a bouncer (bouncer.gc) launches Jak through his 'bonk / 'jump events; the bot has its own jump, so it launches itself
+                  (when (and *blast-bot-bounce*
+                             (type? proc bouncer)
+                             (zero? (-> this jump-mode))
+                             (>= (- (current-time) (-> this jump-timer)) (seconds 0.6))
+                             )
+                    (set! (-> this ground-y) (* 0.25 (+ (-> this foot-pos 0 y) (-> this foot-pos 1 y) (-> this foot-pos 2 y) (-> this foot-pos 3 y))))
+                    (set! (-> this jump-vx) 0.0)
+                    (set! (-> this jump-vz) 0.0)
+                    ;; v = sqrt(2 g h) with g = 163840 and h the bouncer's spring-height
+                    (set! (-> this jump-vy) (sqrtf (* 2.0 163840.0 (-> (the-as bouncer proc) spring-height))))
+                    (set! (-> this crouch-depth) 0.0)
+                    (set! (-> this jump-mode) 2)
+                    (set! (-> this jump-timer) (current-time))
+                    (set! (-> this jump-x-released) #f)
+                    (set! (-> this thrusting) #f)
+                    (sound-play "trampoline")
+                    )
                   (set! *blast-bot-ride-seen* (-> proc name))
                   ;; Elevator actors can use a non-'elevator process type.
                   ;; Treat a rideable moving platform detected beneath the bot as an elevator.
