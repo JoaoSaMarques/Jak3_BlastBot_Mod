@@ -2874,6 +2874,49 @@
   (none)
   )
 
+;; Dark maker idol (temple, target-invisible.gc): Jak parked in the bot cannot go through target-invisible-get-on, so the idol calls this instead.
+;; Jak gets the same `invisible` flag (enemies lose him) and the bot fades out like Jak does. dur is in ticks (300 = 1 s).
+;; REPL test: (blast-bot-go-invisible 3000)
+(define *blast-bot-invis-until* (the-as time-frame 0))
+(define *blast-bot-invis-interp* 0.0)
+
+(defun blast-bot-go-invisible ((dur int))
+  (if (and *target* (-> *target* next-state) (= (-> *target* next-state name) 'target-grab-ride) (< 0 dur))   ;; (blast-bot-jak-state) is defined further down
+      (begin
+        (set! *blast-bot-invis-until* (+ (current-time) dur))
+        (logior! (-> *target* target-flags) (target-flags invisible))
+        (set-time! (-> *target* invisible-start-time))
+        (set! (-> *target* invisible-duration) dur)
+        (format 0 "Blast Bot: invisible for ~D s~%" (/ dur 300))
+        #t
+        )
+      #f
+      )
+  )
+
+;; every frame while the bot lives: fade the bot while the idol effect lasts, drop Jak's flag when it ends
+(defun blast-bot-invis-update ((this blast-bot-player))
+  (let ((on (< (current-time) *blast-bot-invis-until*)))
+    (when (and (not on) (< 0 *blast-bot-invis-until*))
+      (set! *blast-bot-invis-until* 0)
+      (if *target*
+          (logclear! (-> *target* target-flags) (target-flags invisible))
+          )
+      )
+    (seek! *blast-bot-invis-interp* (if on 1.0 0.0) (* (if on 2.0 1.0) (seconds-per-frame)))
+    (cond
+      ((= *blast-bot-invis-interp* 0.0)
+       (logclear! (-> this draw status) (draw-control-status force-fade))
+       )
+      (else
+        (logior! (-> this draw status) (draw-control-status force-fade))
+        (set! (-> this draw force-fade) (the-as uint (the int (lerp-scale 128.0 16.0 *blast-bot-invis-interp* 0.0 1.0))))
+        )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-jak-busy? ((st object))
   ;; states we must NOT fight: cutscene grabs, death/respawn, and the bot's own ride state
   (or (!= *blast-bot-merge-stage* 0) (= st 'target-grab-ride) (= st 'target-grab) (= st 'target-clone-anim)
@@ -2984,6 +3027,7 @@
       (blast-bot-teleport-to this (-> *target* control trans))
       )
     (let ((st (if (-> *target* next-state) (-> *target* next-state name) #f)))
+      (blast-bot-invis-update this)
       (when (and (blast-bot-turret-state? st) *camera* (= (handle->process (-> *camera* focus handle)) this))
         (format 0 "Blast Bot: Jak is in a turret, camera back on Jak~%")
         (send-event *camera* 'change-target *target*)

@@ -306,6 +306,8 @@
   :post (-> target-grab post)
   )
 
+(define-extern blast-bot-go-invisible (function int symbol))   ;; blastbot-main-mod.gc
+
 (deftype dark-maker-idol (process-drawable)
   ((root           collide-shape :override)
    (humming-sound  ambient-sound)
@@ -364,13 +366,7 @@
           (bucket-id hud-draw-hud-alpha)
           )
         )
-      (if (and (cpad-pressed? 0 triangle)
-               (send-event
-                 *target*
-                 'change-mode
-                 'invisible
-                 self
-                 (the int (* 300.0 (res-lump-float
+      (let ((dur (the int (* 300.0 (res-lump-float
                                      (-> self entity)
                                      'duration
                                      :default (* 0.0033333334 (the float (-> *TARGET-bank* invisible-duration)))
@@ -378,9 +374,16 @@
                              )
                       )
                  )
-               )
-          (go-virtual active)
-          )
+            )
+        (if (and (cpad-pressed? 0 triangle)
+                 (or (send-event *target* 'change-mode 'invisible self dur)
+                     ;; blast bot: Jak is parked in the bot (target-grab-ride) and refuses 'change-mode 'invisible: the bot goes invisible instead
+                     (blast-bot-go-invisible dur)
+                     )
+                 )
+            (go-virtual active)
+            )
+        )
       3
       )
     (if *target*
