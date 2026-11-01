@@ -1136,6 +1136,60 @@
   (none)
   )
 
+;; MANUAL TURRET (R3 toggles, not together with L1): the camera moves to the turret (a bit above it, looking along the barrel) and the RIGHT STICK
+;; turns the turret and tilts the gun, so the shots go where you look. No lock-on in this mode. The left stick still walks (relative to the turret view).
+;; Switches itself off while the spy droid is out, when the bot dies / is despawned, and on the next R3.
+(define *blast-bot-manual-turret* #f)
+(define *blast-bot-turret-cam-on* #f)           ;; we are driving the camera
+(define *blast-bot-manual-yaw* 0.0)             ;; world heading the turret is asked to face
+(define *blast-bot-manual-pitch* 0.0)           ;; gun elevation asked for (65536 = 360 degrees, up is positive)
+(define *blast-bot-manual-yaw-speed* 32768.0)   ;; full stick turns the turret this fast (units per second: 32768 = 180 degrees/s)
+(define *blast-bot-manual-pitch-speed* 16384.0) ;; full stick tilts the gun this fast (90 degrees/s)
+;; The stick directions follow the game's own camera option (Settings: camera-stick-dir, off = stick up looks up / right turns right,
+;; on = both flipped). These two flip an axis ON TOP of that (#t = flipped relative to the game setting).
+(define *blast-bot-manual-stick-invert-y* #f)
+(define *blast-bot-manual-stick-invert-x* #f)
+(define *blast-bot-cam-last-pos* (new 'static 'vector))   ;; where the turret camera was last frame, to put the normal camera back behind it
+(define *blast-bot-cam-lead* 1.0)               ;; frames of the bot's own movement added to the turret camera position (the camera reads it a frame late; 0 = off)
+(define *blast-bot-laser-lead* 1.0)             ;; same for the start of the laser pointer
+;; where the laser starts, measured from the gun bone along the gun's own axes (4096 = 1 m)
+(define *blast-bot-laser-fwd* 3072.0)           ;; forward along the barrel (was 8192; less = further back inside the gun)
+(define *blast-bot-laser-down* 500.0)          ;; below the barrel axis
+(define *blast-bot-laser-side* 0.0)             ;; sideways (positive = the gun's right vector side); nudge if the box is off to one side
+(define *blast-bot-manual-pitch-up* 9102.0)     ;; most the gun tilts up (50 degrees)
+(define *blast-bot-manual-pitch-down* 5461.0)   ;; most the gun tilts down (30 degrees)
+(define *blast-bot-turret-cam-up* 6144.0)       ;; camera height above the turret swivel (1.5 m)
+(define *blast-bot-turret-cam-fwd* 0.0)         ;; camera distance in front of the swivel along the barrel (negative = behind)
+
+;; right-stick byte (0..255, 128 = centre) -> -1..1 with a dead zone
+(defun blast-bot-stick-axis ((raw int))
+  (let* ((v (/ (- (the float raw) 128.0) 128.0))
+         (a (fabs v))
+         )
+    (if (< a 0.2)
+        0.0
+        (* (if (< 0.0 v) 1.0 -1.0) (fmin 1.0 (/ (- a 0.2) 0.8)))
+        )
+    )
+  )
+
+(defun blast-bot-turret-cam-off ()
+  (when *blast-bot-turret-cam-on*
+    (set! *blast-bot-turret-cam-on* #f)
+    (set! *camera-look-through-other* 0)
+    ;; the normal camera kept turning with the right stick the whole time: put it back behind the turret, looking where it was aiming
+    (let ((v (new 'stack-no-clear 'vector)))
+      (set-vector! v
+                   (- (-> *blast-bot-cam-last-pos* x) (* 30000.0 (sin *blast-bot-manual-yaw*)))
+                   (+ (-> *blast-bot-cam-last-pos* y) 9000.0)
+                   (- (-> *blast-bot-cam-last-pos* z) (* 30000.0 (cos *blast-bot-manual-yaw*)))
+                   1.0)
+      (send-event *camera* 'teleport-to-vector-start-string v)
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-gun-callback ((arg0 cspace) (arg1 transformq))
   (cspace<-parented-transformq-joint! arg0 arg1)
   (let ((this (the-as blast-bot-player (-> arg0 param1)))
@@ -1148,14 +1202,23 @@
     (vector-! dir (-> this target-pos) pos)
     (rot-zxy-from-vector! cur (-> arg0 bone transform fvec))
     (rot-zxy-from-vector! want dir)
-    (let ((pitch (if (-> this locked)
-                     (fmax -4551.1113 (fmin 4551.1113 (deg- (-> want x) (-> cur x))))
-                     0.0
-                     )
+    (let ((pitch (cond
+                   (*blast-bot-manual-turret*
+                    ;; `cur` is read before this frame's gun angle is applied, so the difference already IS the angle the gun needs
+                    ;; (adding the current angle on top made it run away to the limits: it only moved after seconds and sat on fixed positions)
+                    (fmax (- *blast-bot-manual-pitch-down*)
+                          (fmin *blast-bot-manual-pitch-up*
+                                (deg- (-> want x) (-> cur x))))
+                    )
+                   ((-> this locked)
+                    (fmax -4551.1113 (fmin 4551.1113 (deg- (-> want x) (-> cur x))))
+                    )
+                   (else 0.0)
+                   )
                  )
           )
       (set! (-> this angle-gun)
-            (deg-seek (-> this angle-gun) pitch (* (-> this gun-rotation-speed) (seconds-per-frame))))
+            (deg-seek (-> this angle-gun) pitch (* (if *blast-bot-manual-turret* 36408.0 (-> this gun-rotation-speed)) (seconds-per-frame))))
       )
     (quaternion-vector-angle! (-> arg1 quat) *x-vector* (+ (-> this angle-gun) (-> this extra-angle-gun)))
     )
@@ -1235,6 +1298,8 @@
   (set! (-> this gun-rotation-speed) 7281.778)
   (set! (-> this lock-handle) (the-as handle #f))
   (set! (-> this locked) #f)
+  (set! *blast-bot-manual-turret* #f)
+  (blast-bot-turret-cam-off)
   (let ((fwd (new 'stack-no-clear 'vector)))
     (vector-z-quaternion! fwd (-> this root quat))
     (vector+*! (-> this target-pos) (-> this root trans) fwd 204800.0)
@@ -1258,18 +1323,244 @@
 
 (define-extern blast-bot-ride? (function symbol))
 
+;; The turret camera: the game's "other camera" (the one scenes use, pov-camera.gc / othercam) is fed every frame with a position and a
+;; matrix. Position: above the swivel; direction: the barrel as it really points (bone 6), so what you see is where the shots go.
+;; The camera / the particle system read what we hand them one frame after the bot has moved, so a moving bot drew them a little behind the
+;; turret (the camera sat inside the barrel). Adds `lead` frames of the bot's current movement to a point.
+(defun blast-bot-lead-point! ((this blast-bot-player) (pt vector) (lead float))
+  (when (< 0.0 lead)
+    (+! (-> pt x) (* lead (-> this linear-speed x)))
+    (+! (-> pt z) (* lead (-> this linear-speed z)))
+    (if (= (-> this jump-mode) 2)
+        (+! (-> pt y) (* lead (-> this jump-vy) (seconds-per-frame)))
+        )
+    )
+  (none)
+  )
+
+(defun blast-bot-turret-cam ((this blast-bot-player))
+  (let ((m (matrix-copy! (new 'stack-no-clear 'matrix) (-> this node-list data 6 bone transform)))
+        (pos (new 'stack-no-clear 'vector))
+        (f (new 'stack-no-clear 'vector))
+        (r (new 'stack-no-clear 'vector))
+        (u (new 'stack-no-clear 'vector))
+        (c (new 'stack-no-clear 'vector))
+        (cm (camera-matrix))
+        )
+    ;; the direction comes from the aim you ask for (stick), not from the barrel bone: the barrel trails it and twitches when the body turns while
+    ;; you walk, which made the view shake
+    (set-vector! f
+                 (* (sin *blast-bot-manual-yaw*) (cos *blast-bot-manual-pitch*))
+                 (sin *blast-bot-manual-pitch*)
+                 (* (cos *blast-bot-manual-yaw*) (cos *blast-bot-manual-pitch*))
+                 1.0)
+    (matrix->trans (-> this node-list data 5 bone transform) pos)
+    (+! (-> pos y) *blast-bot-turret-cam-up*)
+    (vector+*! pos pos f *blast-bot-turret-cam-fwd*)
+    (blast-bot-lead-point! this pos *blast-bot-cam-lead*)
+    (vector-copy! *blast-bot-cam-last-pos* pos)
+    ;; up = world up made square to the view direction
+    (vector-copy! u *up-vector*)
+    (vector--float*! u u f (vector-dot u f))
+    (vector-normalize! u 1.0)
+    ;; right = up x forward, with the sign the game's own camera matrix uses (left / right handed, whichever it is)
+    (vector-cross! r u f)
+    (vector-normalize! r 1.0)
+    (vector-cross! c (-> cm uvec) (-> cm fvec))
+    (if (< (vector-dot c (-> cm rvec)) 0.0)
+        (vector-negate! r r)
+        )
+    (vector-copy! *camera-other-trans* pos)
+    (vector-copy! *camera-other-root* (-> this root trans))
+    (vector-copy! (-> *camera-other-matrix* rvec) r)
+    (set! (-> *camera-other-matrix* rvec w) 0.0)
+    (vector-copy! (-> *camera-other-matrix* uvec) u)
+    (set! (-> *camera-other-matrix* uvec w) 0.0)
+    (vector-copy! (-> *camera-other-matrix* fvec) f)
+    (set! (-> *camera-other-matrix* fvec w) 0.0)
+    (vector-reset! (-> *camera-other-matrix* trans))
+    (othercam-calc 1.0)
+    (set! *camera-look-through-other* 2)
+    (set! *blast-bot-turret-cam-on* #t)
+    )
+  (none)
+  )
+
+;; SOFT LOCK (manual turret only): when the crosshair passes close to an enemy the aim is gently pulled onto it and kept there; push the stick
+;; and it lets go. The enemy goes into lock-handle, so the laser turns red and anything that follows the turret's lock-on (homing) uses it.
+(define *blast-bot-soft-lock* #t)
+(define *blast-bot-soft-lock-enter* 5.0)       ;; degrees: an enemy this close to the crosshair gets picked
+(define *blast-bot-soft-lock-release* 10.0)    ;; degrees: it is let go again when the crosshair is further away than this
+(define *blast-bot-soft-lock-pull* 6.0)        ;; how strongly the aim is drawn onto it (per second; the stick at full tilt turns far faster than this)
+(define *blast-bot-soft-lock-magnet* 2.5)      ;; degrees: the aim is only DRAWN onto the enemy once the crosshair is this close (picked / kept farther out, but not dragged)
+(define *blast-bot-soft-lock-friction* 0.5)    ;; stick turn speed while an enemy is picked (1.0 = no slowdown), so it is easier to rest the crosshair on it
+(define *blast-bot-soft-lock-range* 163840.0)  ;; only enemies within 40 m
+(define *blast-bot-soft-lock-pitch* #t)        ;; #f: the soft lock only pulls left / right, never up / down
+
+(defun blast-bot-soft-lock-update ((this blast-bot-player) (pos vector))
+  (let ((aim (new 'stack-no-clear 'vector))
+        (d (new 'stack-no-clear 'vector))
+        (cur (as-type (handle->process (-> this lock-handle)) process-focusable))
+        )
+    (set-vector! aim
+                 (* (sin *blast-bot-manual-yaw*) (cos *blast-bot-manual-pitch*))
+                 (sin *blast-bot-manual-pitch*)
+                 (* (cos *blast-bot-manual-yaw*) (cos *blast-bot-manual-pitch*))
+                 1.0)
+    ;; keep the current one while it is still valid and not too far from the crosshair
+    (when cur
+      (cond
+        ((not (blast-bot-lock-ok? this cur))
+         (set! cur (the-as process-focusable #f))
+         )
+        (else
+          (vector-! d (get-trans cur 3) pos)
+          (vector-normalize! d 1.0)
+          (if (< (vector-dot d aim) (cos (degrees *blast-bot-soft-lock-release*)))
+              (set! cur (the-as process-focusable #f))
+              )
+          )
+        )
+      )
+    ;; none: look for the enemy closest to the crosshair (every 4th frame)
+    (when (and (not cur) (= 0 (mod (-> this debug-frame-count) 4)))
+      (let ((best-dot (cos (degrees *blast-bot-soft-lock-enter*)))
+            (box (new 'stack-no-clear 'vector))
+            (hits (new 'stack-no-clear 'array 'collide-shape 64))
+            )
+        (vector-copy! box pos)
+        (set! (-> box w) *blast-bot-soft-lock-range*)
+        (countdown (i (fill-actor-list-for-box *actor-hash* box hits 64))
+          (let ((cs (as-type (-> hits i) collide-shape)))
+            (when cs
+              (let ((p (as-type (-> cs process) process-focusable)))
+                (when (and p (blast-bot-lock-ok? this p))
+                  (vector-! d (get-trans p 3) pos)
+                  (when (< (vector-length d) *blast-bot-soft-lock-range*)
+                    (vector-normalize! d 1.0)
+                    (when (< best-dot (vector-dot d aim))
+                      (set! best-dot (vector-dot d aim))
+                      (set! cur p)
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    (set! (-> this lock-handle) (if cur (process->handle cur) (the-as handle #f)))
+    ;; pull the aim onto it, only when the crosshair is already almost on it (a bigger pull dragged the view down whenever the bot walked towards enemies)
+    (when cur
+      (vector-! d (get-trans cur 3) pos)
+      (vector-normalize! d 1.0)
+      (when (< (cos (degrees *blast-bot-soft-lock-magnet*)) (vector-dot d aim))
+       (let ((k (fmin 1.0 (* *blast-bot-soft-lock-pull* (seconds-per-frame))))
+            (fv (new 'stack-no-clear 'vector))
+            )
+        (vector-! d d aim)
+        (let ((old-y (-> aim y)))
+          (vector+*! aim aim d k)
+          (vector-normalize! aim 1.0)
+          (set-vector! fv (-> aim x) 0.0 (-> aim z) 1.0)
+          (set! *blast-bot-manual-yaw* (vector-y-angle fv))
+          ;; pitch: the change of the height component divided by cos(pitch) is the change in radians (no atan: its unit here was a guess and a wrong
+          ;; unit slammed the pitch to the down limit, which looked like the turret being pushed down)
+          (when *blast-bot-soft-lock-pitch*
+            (set! *blast-bot-manual-pitch*
+                  (fmax (- *blast-bot-manual-pitch-down*)
+                        (fmin *blast-bot-manual-pitch-up*
+                              (+ *blast-bot-manual-pitch*
+                                 (* (/ (- (-> aim y) old-y) (fmax 0.3 (cos *blast-bot-manual-pitch*))) 10430.378)))))
+            )
+          )
+        )
+       )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-update-aim ((this blast-bot-player))
   ;; Call every frame from :post. Locks on to the nearest visible enemy, otherwise follows the camera's left/right.
   ;; While the spy droid is out (*blast-bot-spy-active*) the camera is on the droid, so with NO enemy to lock on to the turret
   ;; turns slowly through 360 degrees on its own instead. The lock-on (and the Blaster's auto-mode) work as usual.
-  (let ((p (as-type (handle->process (-> this lock-handle)) process-focusable)))
-    ;; drop a bad lock right away, and re-pick the nearest enemy every 20 frames
-    (when (or (not (blast-bot-lock-ok? this p))
-              (= 0 (mod (-> this debug-frame-count) 20)))
-      (set! p (blast-bot-find-lock this))
-      (set! (-> this lock-handle) (if p (process->handle p) (the-as handle #f)))
+  ;; R3 (without L1, which spawns / despawns the bot): manual turret on / off
+  (when (and (cpad-pressed? 0 r3) (not (cpad-hold? 0 l1)) (not *blast-bot-spy-active*))
+    (set! *blast-bot-manual-turret* (not *blast-bot-manual-turret*))
+    (when *blast-bot-manual-turret*
+      ;; start looking where the camera looks now
+      (let ((f (new 'stack-no-clear 'vector)))
+        (vector-copy! f (-> (camera-matrix) fvec))
+        (set! (-> f y) 0.0)
+        (vector-normalize! f 1.0)
+        (set! *blast-bot-manual-yaw* (vector-y-angle f))
+        (set! *blast-bot-manual-pitch* 0.0)
+        )
       )
+    (format 0 "Blast Bot: manual turret ~A~%" *blast-bot-manual-turret*)
+    )
+  (if *blast-bot-spy-active*
+      (set! *blast-bot-manual-turret* #f)
+      )
+  (if (not *blast-bot-manual-turret*)
+      (blast-bot-turret-cam-off)
+      )
+  (let ((p (the-as process-focusable (if *blast-bot-manual-turret* #f (as-type (handle->process (-> this lock-handle)) process-focusable)))))
+    ;; drop a bad lock right away, and re-pick the nearest enemy every 20 frames (never in manual mode)
+    (if *blast-bot-manual-turret*
+        (if (not *blast-bot-soft-lock*)
+            (set! (-> this lock-handle) (the-as handle #f))
+            )
+        (when (or (not (blast-bot-lock-ok? this p))
+                  (= 0 (mod (-> this debug-frame-count) 20)))
+          (set! p (blast-bot-find-lock this))
+          (set! (-> this lock-handle) (if p (process->handle p) (the-as handle #f)))
+          )
+        )
     (cond
+      ((and *blast-bot-manual-turret* (not (and (blast-bot-ride?) (cpad-hold? 0 l2))))
+        ;; manual: the right stick turns the turret and tilts the gun
+        (let* ((rx (blast-bot-stick-axis (the-as int (-> *cpad-list* cpads 0 rightx))))
+               (ry (blast-bot-stick-axis (the-as int (-> *cpad-list* cpads 0 righty))))
+               (dt (seconds-per-frame))
+               (pos (new 'stack-no-clear 'vector))
+               (dir (new 'stack-no-clear 'vector))
+               (cm (camera-matrix))
+               (tang (new 'stack-no-clear 'vector))
+               (yaw-sign 1.0)
+               (fric (if (and *blast-bot-soft-lock* (handle->process (-> this lock-handle))) *blast-bot-soft-lock-friction* 1.0))
+               )
+          (set! (-> this locked) #f)
+          ;; which way does a growing yaw turn on screen? That is a fixed property of the game's camera matrices (left / right handed), so it is read
+          ;; from the handedness only. (Before it compared against the real camera's right vector; the hidden normal camera keeps turning with the stick
+          ;; and once it was more than 90 degrees away from the turret view the sign flipped, which made the view jump.)
+          (vector-cross! tang (-> cm uvec) (-> cm fvec))
+          (if (< (vector-dot tang (-> cm rvec)) 0.0)
+              (set! yaw-sign -1.0)
+              )
+          (if (not (eq? (and (-> *setting-control* user-current camera-stick-dir) #t) *blast-bot-manual-stick-invert-x*))
+              (set! yaw-sign (- yaw-sign))
+              )
+          (+! *blast-bot-manual-yaw* (* yaw-sign rx fric *blast-bot-manual-yaw-speed* dt))
+          (set! *blast-bot-manual-pitch*
+                (fmax (- *blast-bot-manual-pitch-down*)
+                      (fmin *blast-bot-manual-pitch-up*
+                            (+ *blast-bot-manual-pitch*
+                               (* (if (eq? (and (-> *setting-control* user-current camera-stick-dir) #t) *blast-bot-manual-stick-invert-y*) (- ry) ry) fric *blast-bot-manual-pitch-speed* dt)))))
+          (matrix->trans (-> this node-list data 5 bone transform) pos)
+          (if *blast-bot-soft-lock*
+              (blast-bot-soft-lock-update this pos)
+              )
+          (set-vector! dir
+                       (* (sin *blast-bot-manual-yaw*) (cos *blast-bot-manual-pitch*))
+                       (sin *blast-bot-manual-pitch*)
+                       (* (cos *blast-bot-manual-yaw*) (cos *blast-bot-manual-pitch*))
+                       1.0)
+          (vector+*! (-> this target-pos) pos dir 204800.0)
+          )
+        )
       ((and (blast-bot-ride?) (cpad-hold? 0 l2))
         ;; riding + L2: the turret snaps to the back of the car, lock-on or not
         (let ((flat (new 'stack-no-clear 'vector))
@@ -2551,7 +2842,11 @@
           )
       (let ((m (matrix-copy! (new 'stack-no-clear 'matrix) (-> this node-list data 6 bone transform))))
         (matrix->trans m start)
-        (vector+*! start start (-> m fvec) 8192.0)
+        ;; the laser comes out of the small box under the barrels: a little below the barrel axis and set back from the barrel tips
+        (vector+*! start start (-> m fvec) *blast-bot-laser-fwd*)
+        (vector+*! start start (-> m uvec) (- *blast-bot-laser-down*))
+        (vector+*! start start (-> m rvec) *blast-bot-laser-side*)
+        (blast-bot-lead-point! this start *blast-bot-laser-lead*)
         (vector-normalize-copy! beam (-> m fvec) 819200.0)
         )
       (vector-copy! (-> q start-pos) start)
@@ -3916,6 +4211,10 @@
     (update-transforms (-> self root))
     (blast-bot-touch self)
     (blast-bot-draw-laser self)
+    ;; turret camera: after ja-post, so the swivel / gun bones it reads are this frame's
+    (if *blast-bot-manual-turret*
+        (blast-bot-turret-cam self)
+        )
     (vector-copy! (-> self ext-pos) (-> self root trans))
     ;; car shots are swapped for ones from the barrel here as well (after ja-post, so the muzzle bone is this frame's), see blastbot-vehicle.gc
     (set! *blast-bot-carshot-site* 2)
@@ -3962,6 +4261,8 @@
     )
   :enter (behavior ()
     (format 0 "Blast Bot: destroyed~%")
+    (set! *blast-bot-manual-turret* #f)
+    (blast-bot-turret-cam-off)
     (blast-bot-stock-huds #t)
     (set! *blast-bot-hud-health* 0.0)
     (format 0 "Blast Bot: die 1 - hud~%")
