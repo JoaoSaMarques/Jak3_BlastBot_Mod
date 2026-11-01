@@ -2668,6 +2668,23 @@
   (none)
   )
 
+(define *blast-bot-dash-break-doors* #t)
+
+(defun blast-bot-dark-door? ((p process))
+  ;; the Dark Jak doors (debug label: rub-dark-jak-door-3 -> type rub-dark-jak-door), matched by type name
+  (let ((found #f)
+        (ty (-> p type))
+        )
+    (while (and (not found) ty)
+      (if (= (-> ty symbol) 'rub-dark-jak-door)
+          (set! found #t)
+          )
+      (set! ty (if (= ty (-> ty parent)) (the-as type #f) (-> ty parent)))
+      )
+    found
+    )
+  )
+
 (defun blast-bot-dash-attack ((this blast-bot-player))
   ;; While charging: hurt every valid enemy in front of the bot (once per charge, the attack id is shared).
   (let ((fwd (new 'stack-no-clear 'vector))
@@ -2689,6 +2706,16 @@
               (send-event p 'attack #f
                           (blast-bot-credit-melee!
                             (static-attack-info ((id (-> this dash-id)) (damage 6.0) (mode 'explode))) p))
+              )
+            )
+          (let ((d (-> cs process)))
+            (when (and d *blast-bot-dash-break-doors* (blast-bot-dark-door? d))
+              (send-event d 'attack #f
+                          (blast-bot-credit-jak!
+                            (static-attack-info ((id (-> this dash-id))
+                                                 (damage 6.0)
+                                                 (mode 'dark-smack)
+                                                 (penetrate-using (penetrate dark-smack))))))
               )
             )
           )
