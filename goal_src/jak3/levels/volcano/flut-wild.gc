@@ -7,6 +7,8 @@
 
 ;; DECOMP BEGINS
 
+(define-extern *blast-bot-flut-pending* time-frame)   ;; blastbot-main-mod.gc
+
 (deftype flut-wild (nav-enemy)
   ((minimap             connection-minimap)
    (focus-ignore-timer  time-frame)
@@ -791,9 +793,30 @@
         (bucket-id hud-draw-hud-alpha)
         )
       )
-    (when (and (cpad-pressed? 0 triangle) (send-event *target* 'change-mode 'flut this 'fight (-> this color-index)))
-      (script-eval '(want-continue "volcano-flut-1"))
-      (go (method-of-object this disappear))
+    (let ((jak-state (if (-> *target* next-state)
+                         (-> *target* next-state name)
+                         #f
+                         )
+                     )
+          )
+      (cond
+        ((= jak-state 'target-grab-ride)
+         ;; blast bot: Jak is parked in the bot and refuses 'change-mode 'flut. Let him go on Triangle; the bot's regrab leaves him alone
+         ;; for a moment (*blast-bot-flut-pending*) and the branch below mounts the flut as soon as he stands free. The bot then holds
+         ;; him inside it as a flut (blastbot-vehicle.gc).
+         (when (cpad-pressed? 0 triangle)
+           (set! *blast-bot-flut-pending* (current-time))
+           (send-event *target* 'end-mode 'grab)
+           )
+         )
+        ((or (cpad-pressed? 0 triangle) (< (current-time) (+ *blast-bot-flut-pending* (seconds 2))))
+         (when (send-event *target* 'change-mode 'flut this 'fight (-> this color-index))
+           (set! *blast-bot-flut-pending* -100000)
+           (script-eval '(want-continue "volcano-flut-1"))
+           (go (method-of-object this disappear))
+           )
+         )
+        )
       )
     )
   ((method-of-type nav-enemy enemy-common-post) this)

@@ -10,6 +10,8 @@
 
 ;; DECOMP BEGINS
 
+(define-extern blast-bot-standing-on? (function process symbol))   ;; blastbot-main-mod.gc
+
 (deftype vol-lava-plat (rigid-body-platform)
   ((anchor-point  vector  :inline)
    (path-u        float)
@@ -281,7 +283,10 @@
     (logior! (-> self draw status) (draw-control-status no-draw))
     )
   :trans (behavior ()
-    (if (< (vector-vector-xz-distance (-> self root trans) (target-pos 0)) 81920.0)
+    ;; the rock's origin is at one end of the slab: the blast bot can be standing on its far end, further than 20 m from the origin
+    (if (or (< (vector-vector-xz-distance (-> self root trans) (target-pos 0)) 81920.0)
+            (blast-bot-standing-on? self)
+            )
         (go-virtual active)
         )
     )
@@ -301,11 +306,17 @@
       )
     )
   :trans (behavior ()
-    (if (< 122880.0 (vector-vector-xz-distance (-> self root trans) (target-pos 0)))
+    (if (and (< 122880.0 (vector-vector-xz-distance (-> self root trans) (target-pos 0)))
+             (not (blast-bot-standing-on? self))
+             )
         (go-virtual idle)
         )
     (set! (-> self ridden) #f)
     (rider-trans)
+    ;; the blast bot is not reported as a rider by the engine: ask it directly
+    (if (blast-bot-standing-on? self)
+        (set! (-> self ridden) #t)
+        )
     (if (not (-> self ridden))
         (set-time! (-> self ride-timer))
         )

@@ -177,7 +177,7 @@
   ;; is really not on the bot
   (when (and *camera* (!= (handle->process (-> *camera* focus handle)) self))
     (format 0 "Blast Bot: camera was on ~A, putting it back on the bot~%" (handle->process (-> *camera* focus handle)))
-    (send-event *camera* 'change-target self)
+    (blast-bot-aim-camera self)
     )
   (blast-bot-merge-cam-debug)
   (none)
@@ -434,7 +434,7 @@
   (blast-bot-ride-hitbox-on v)
   ;; the camera is handled exactly like the normal merge (free orbit camera on the bot, the vehicle's camera code is switched off)
   (if *camera*
-      (send-event *camera* 'change-target this)
+      (blast-bot-aim-camera this)
       )
   (none)
   )
@@ -987,7 +987,7 @@
             (send-event v 'ignore-impulse #t)
             (set! *blast-bot-merge-stage* 3)
             (if *camera*
-                (send-event *camera* 'change-target this)
+                (blast-bot-aim-camera this)
                 )
             )
            )

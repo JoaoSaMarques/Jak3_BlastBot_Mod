@@ -179,7 +179,7 @@
 ;; how fast the body turns toward the stick direction (rotation units/sec, 21845 = 120 deg/s)
 (define *blast-bot-body-turn-rate* 21845.0)
 ;; wall blocking: radius of the sweep sphere, and how high above the ground it is centred
-(define *blast-bot-wall-radius* 13312.0)   ;; was 17408 (4.25 m): the sphere was 8.5 m wide and reached 10.75 m up, so arches and ceilings stopped the bot (3.25 m now)
+(define *blast-bot-wall-radius* 17408.0)   ;; half-width of the wall sweep (4.25 m, the bot is 8.5 m wide)
 ;; Half-size of the boxes the bot fills the collide cache with. The cache holds only ~460 triangles; in dense places (the palace
 ;; elevator frame, planks, pots) the old 10 m boxes overflowed it ("Exceeded collide cache max # of tris (blast-bot-player)") and
 ;; the triangles dropped included the platform floor, so the feet / body fell through it. Smaller boxes still cover the 4.5 m wall
@@ -187,7 +187,13 @@
 (define *blast-bot-leg-fill-xz* 32768.0)    ;; 8 m
 (define *blast-bot-wall-fill-xz* 30720.0)   ;; 7.5 m
 (define *blast-bot-wall-fill-y* 28672.0)    ;; 7 m
-(define *blast-bot-wall-height* 18432.0)   ;; Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
+(define *blast-bot-wall-height* 19456.0)
+;; The wall sweep is no longer one 4.25 m ball (that reached 10.75 m up and caught arches / ceilings). With *blast-bot-wall-capsule* it is
+;; three smaller balls side by side across the walking direction: same total width (*blast-bot-wall-radius* each way), but only
+;; *blast-bot-wall-sphere-r* tall. *blast-bot-wall-height* is the centre height: bottom = height - sphere-r, top = height + sphere-r.
+;; (#f = the old single big ball, using *blast-bot-wall-radius*)
+(define *blast-bot-wall-capsule* #t)
+(define *blast-bot-wall-sphere-r* 10240.0)   ;; 2.5 m -> the sweep spans 2.25 m .. 7.25 m above the ground   ;; Higher = the sweep sphere starts higher above the ground, so small ledges no longer block the bot (the sphere bottom is height minus the radius that is really in use, see blastbot-vehicle.gc)
 ;; how much of the leg-lift tilt goes into the body the legs hang from. The head gets the rest,
 ;; so the head's total tilt is unchanged and the body tilts too (it also carries the head).
 (define *blast-bot-body-tilt-share* 0.5)
@@ -274,6 +280,27 @@
 ;; Haven awnings (and any other `bouncer`) collide as `crate` in the hit-by-player list, which the bot's wall / ground / foot probes never
 ;; looked at, so it sank through them although Jak walks up them like a ramp. #t: they count as walls and as ground.
 (define *blast-bot-wall-bouncers* #t)
+
+;; Which collision triangles the bot's feet / ground checks skip. On foot Jak skips board-only surfaces (flag `board`): the grind rails and
+;; halfpipes. With *blast-bot-walk-on-rails* the bot does not skip them, so it can walk along railings. (#f = like Jak on foot)
+(define *blast-bot-walk-on-rails* #t)
+(defun blast-bot-ground-pat ()
+  (if *blast-bot-walk-on-rails*
+      (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1)
+      (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1)
+      )
+  )
+
+;; What the bot's feet, ground height and pit checks treat as floor. `obstacle` = the solid props Jak walks on too (the breaking rocks
+;; vol-break-ground, lava-ripples-part ...); without it the bot ignored them and stood on the floor underneath, inside the prop.
+;; (define *blast-bot-ground-obstacles* #f) to go back to the old behaviour.
+(define *blast-bot-ground-obstacles* #t)
+(defun blast-bot-ground-spec ()
+  (if *blast-bot-ground-obstacles*
+      (collide-spec backgnd pusher hit-by-others-list obstacle)
+      (collide-spec backgnd pusher hit-by-others-list)
+      )
+  )
 
 (defun blast-bot-probe-b ((q collide-query) (spec collide-spec))
   ;; probe-using-line-sphere with `spec` on an already filled cache (filled with crate + hit-by-player-list as well),
@@ -505,6 +532,69 @@
 ;; edge never grabs the foot).
 (define *blast-bot-foot-stick* #t)
 
+;; Narrow supports (two grind rails with a gap between them, a plank): a foot that has no floor at the height of the body looks around
+;; for one. Rings of vertical probes (25 cm wide, so a thin rail is not missed between two samples) around the spot the foot wanted;
+;; the closest support within 2 m of the body's ground height wins, ties go to the one nearest where the foot stood before.
+;; Moves `tgt` onto it and returns #t, or leaves `tgt` alone and returns #f.
+(define *blast-bot-rail-lock* #t)
+(define *blast-bot-lock-reach* 14336.0)   ;; how far around the wanted foot spot a support is looked for: 3.5 m (planted feet are pulled back past ~3.5 m anyway)
+(define *blast-bot-lock-probe* 2048.0)    ;; radius of each probe: 0.5 m, so a thin beam / rail between two samples is still caught
+(define *blast-bot-grip-tick* 0)          ;; counts update-legs calls: a planted foot looks for a new grip only every 4th frame
+
+(defun blast-bot-foot-lock ((this blast-bot-player) (q collide-query) (tgt vector) (i int))
+  (let ((ref (-> this ground-y))
+        (found #f)
+        (bd 1000000000.0)
+        (bx 0.0)
+        (by 0.0)
+        (bz 0.0)
+        )
+    (set! (-> q radius) *blast-bot-lock-probe*)
+    (dotimes (ring 5)
+      (let* ((r (if (zero? ring) 1228.0 (* *blast-bot-lock-reach* (* 0.25 (the float ring)))))   ;; 0.3 m, then 4 rings out to the reach
+             (n (if (zero? ring) 8 (+ 8 (* 8 ring))))
+             (dstep (/ 65536.0 (the float n)))
+             )
+        (dotimes (k n)
+          (let* ((a (* dstep (the float k)))
+                 (sx (+ (-> tgt x) (* r (sin a))))
+                 (sz (+ (-> tgt z) (* r (cos a))))
+                 )
+            (set-vector! (-> q start-pos) sx (+ ref 16384.0) sz 1.0)
+            (set-vector! (-> q move-dist) 0.0 -32768.0 0.0 1.0)
+            (let ((h (probe-using-line-sphere *collide-cache* q)))
+              (when (>= h 0.0)
+                (let ((hy (- (+ (-> q start-pos y) (* h (-> q move-dist y))) *blast-bot-lock-probe*)))
+                  (when (< (fabs (- hy ref)) 8192.0)
+                    (let* ((dx (- sx (-> this foot-pos i x)))
+                           (dz (- sz (-> this foot-pos i z)))
+                           (d (+ r (* 0.3 (sqrtf (+ (* dx dx) (* dz dz))))))
+                           )
+                      (when (< d bd)
+                        (set! bd d)
+                        (set! bx sx)
+                        (set! by hy)
+                        (set! bz sz)
+                        (set! found #t)
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    (when found
+      (set! (-> tgt x) bx)
+      (set! (-> tgt y) by)
+      (set! (-> tgt z) bz)
+      )
+    found
+    )
+  )
+
 (defun blast-bot-update-legs ((this blast-bot-player))
   ;; Call every frame from :post BEFORE ja-post.
   (let ((q (new 'stack-no-clear 'collide-query))
@@ -534,13 +624,15 @@
       (vector+! (-> q bbox max) (-> this root trans) ext)
       )
     (set! (-> q collide-with)
-          (the-as collide-spec (logior (the-as int (collide-spec backgnd pusher hit-by-others-list)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate hit-by-player-list)) 0))))
+          (the-as collide-spec (logior (the-as int (blast-bot-ground-spec)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate hit-by-player-list)) 0))))
     (set! (-> q ignore-process0) this)
     (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))
-    (set! (-> q ignore-pat)
-          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q ignore-pat) (blast-bot-ground-pat))
     (fill-using-bounding-box *collide-cache* q)
     (dotimes (i 4)
+      (if (zero? i)
+          (+! *blast-bot-grip-tick* 1)
+          )
       (let* ((phase (+ (-> this gait-phase) (blast-bot-foot-phase i)))
              (f0 (- phase (the float (the int phase))))
              ;; while crouching / recovering from a jump every foot stays planted
@@ -615,7 +707,7 @@
              (vector+*! (-> q start-pos) tgt *y-vector* 16384.0)
              (vector-float*! (-> q move-dist) *y-vector* -40960.0)
              (set! (-> q radius) 40.96)
-             (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+             (set! (-> q collide-with) (blast-bot-ground-spec))
              (set! (-> q action-mask) (collide-action solid))
              (let ((hit (if (< 0 (-> *collide-cache* num-tris))
                             (probe-using-line-sphere *collide-cache* q)
@@ -627,6 +719,13 @@
                    (vector+*! tgt (-> q start-pos) (-> q move-dist) hit)
                    (set! (-> tgt y) (-> this foot-pos i y))
                    )
+               ;; nothing to stand on at the body's height (a gap between two rails): look around for a support
+               (when (and *blast-bot-rail-lock*
+                          (< 0 (-> *collide-cache* num-tris))
+                          (or (< hit 0.0) (< (-> tgt y) (- (-> this ground-y) 10240.0)))
+                          )
+                 (blast-bot-foot-lock this q tgt i)
+                 )
                )
              ;; never ask the IK for a foot far above/below the body
              (set! (-> tgt y) (fmax (+ -24576.0 (-> this root trans y))
@@ -682,12 +781,21 @@
               (vector+*! (-> q start-pos) (-> this foot-pos i) *y-vector* 12288.0)
               (vector-float*! (-> q move-dist) *y-vector* -28672.0)
               (set! (-> q radius) 40.96)
-              (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+              (set! (-> q collide-with) (blast-bot-ground-spec))
               (set! (-> q action-mask) (collide-action solid))
-              (let ((hit (blast-bot-probe-b q (collide-spec backgnd pusher hit-by-others-list))))
-                (when (>= hit 0.0)
-                  (set! (-> this foot-pos i y) (+ (-> q start-pos y) (* hit (-> q move-dist y))))
-                  )
+              (let ((hit (blast-bot-probe-b q (blast-bot-ground-spec))))
+                (if (>= hit 0.0)
+                    (set! (-> this foot-pos i y) (+ (-> q start-pos y) (* hit (-> q move-dist y))))
+                    ;; a planted foot lost its floor (the rail bent / the body shifted a little): slide it onto the nearest support
+                    (when (and *blast-bot-rail-lock* (= (logand *blast-bot-grip-tick* 3) i))
+                      (let ((g (new 'stack-no-clear 'vector)))
+                        (vector-copy! g (-> this foot-pos i))
+                        (if (blast-bot-foot-lock this q g i)
+                            (vector-copy! (-> this foot-pos i) g)
+                            )
+                        )
+                      )
+                    )
                 )
               )
             (set! (-> this foot-pos i y) (fmax (+ -24576.0 (-> this root trans y))
@@ -741,7 +849,7 @@
                                      (- (+ *blast-bot-ride-foot-up* *blast-bot-ride-foot-down*)))
                       (set! (-> q radius) *blast-bot-ride-foot-radius*)
                       (set! (-> q action-mask) (collide-action solid))
-                      (let ((hit (blast-bot-probe-b q (collide-spec backgnd pusher hit-by-others-list))))
+                      (let ((hit (blast-bot-probe-b q (blast-bot-ground-spec))))
                         (when (>= hit 0.0)
                           (set! found #t)
                           ;; Raising the foot moves a point along the span by t0
@@ -1048,8 +1156,7 @@
     (set! (-> q collide-with) (collide-spec backgnd))
     (set! (-> q ignore-process0) this)
     (set! (-> q ignore-process1) #f)
-    (set! (-> q ignore-pat)
-          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q ignore-pat) (blast-bot-ground-pat))
     (set! (-> q action-mask) (collide-action solid))
     (let ((hit (fill-and-probe-using-line-sphere *collide-cache* q)))
       (or (< hit 0.0) (>= hit 0.97))
@@ -1210,7 +1317,7 @@
 ;; (see blast-bot-wall-probe). Nothing to type: just stand in the thing it clips through and read the log. Set to #f when done.
 (define *blast-bot-wall-debug* #f)
 ;; #t: print what blocks the bot (touch height, normal, owner) at most twice a second while it is stopped by a wall
-(define *blast-bot-wall-block-debug* #t)
+(define *blast-bot-wall-block-debug* #f)
 ;; a surface whose normal points down more than this is a ceiling / underside of an arch: it never stops the bot walking (-1 = down, 0 = vertical wall)
 (define *blast-bot-wall-ceiling-y* -0.3)
 (define *blast-bot-wall-block-next* (the-as time-frame 0))
@@ -1229,8 +1336,45 @@
   `(cond
      ((= *blast-bot-wall-mode* 2) (blast-bot-wall-broad))
      ((= *blast-bot-wall-mode* 1) (collide-spec backgnd pusher hit-by-others-list obstacle))
-     (else (collide-spec backgnd pusher hit-by-others-list))
+     (else (blast-bot-ground-spec))
      )
+  )
+
+;; Sweep the wall check along `move` from `start`. Fills q like probe-using-line-sphere (best-other-tri of the nearest hit) and returns the hit fraction.
+(defun blast-bot-wall-sweep ((q collide-query) (start vector) (move vector))
+  (let* ((r (if *blast-bot-wall-capsule* *blast-bot-wall-sphere-r* *blast-bot-wall-radius*))
+         (n (if *blast-bot-wall-capsule* 3 1))
+         (off (fmax 0.0 (- *blast-bot-wall-radius* r)))
+         (side (new 'stack-no-clear 'vector))
+         (best -1.0)
+         (best-m 0.0)
+         )
+    (set-vector! side (-> move z) 0.0 (- (-> move x)) 1.0)
+    (if (< 0.01 (vector-length side))
+        (vector-normalize! side off)
+        (vector-reset! side)
+        )
+    (set! (-> q radius) r)
+    (dotimes (k n)
+      (let ((m (if (= n 1) 0.0 (- (the float k) 1.0))))
+        (vector+*! (-> q start-pos) start side m)
+        (vector-copy! (-> q move-dist) move)
+        (let ((h (probe-using-line-sphere *collide-cache* q)))
+          (when (and (>= h 0.0) (or (< best 0.0) (< h best)))
+            (set! best h)
+            (set! best-m m)
+            )
+          )
+        )
+      )
+    (when (and (>= best 0.0) (< 1 n))
+      ;; run the winning ball again so q holds its triangle
+      (vector+*! (-> q start-pos) start side best-m)
+      (vector-copy! (-> q move-dist) move)
+      (probe-using-line-sphere *collide-cache* q)
+      )
+    best
+    )
   )
 
 (defun blast-bot-move-xz ((this blast-bot-player) (dx float) (dz float))
@@ -1299,7 +1443,7 @@
                 (set! (-> q radius) *blast-bot-wall-radius*)
                 (set! (-> q collide-with) (blast-bot-wall-spec))
                 )
-              (set! hit (probe-using-line-sphere *collide-cache* q))
+              (set! hit (blast-bot-wall-sweep q start move))
               (if (>= hit 0.0)
                   (vector-copy! nrm (-> q best-other-tri normal))
                   )
@@ -1321,7 +1465,7 @@
                      (format 0 "Blast Bot: wall block: touch point ~f m above the bot origin, sphere centre ~f m, radius ~f m~%"
                              (/ (- (-> q best-other-tri intersect y) (-> this root trans y)) 4096.0)
                              (/ *blast-bot-wall-height* 4096.0)
-                             (/ *blast-bot-wall-radius* 4096.0)
+                             (/ (if *blast-bot-wall-capsule* *blast-bot-wall-sphere-r* *blast-bot-wall-radius*) 4096.0)
                              )
                      (format 0 "Blast Bot: wall block: normal ~f ~f ~f, pat mode ~D, owner ~A~%"
                              (-> nrm x) (-> nrm y) (-> nrm z)
@@ -1430,11 +1574,10 @@
     (vector+*! (-> q start-pos) (-> this root trans) *y-vector* up)
     (vector-float*! (-> q move-dist) *y-vector* -163840.0)
     (set! (-> q radius) 40.96)
-    (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+    (set! (-> q collide-with) (blast-bot-ground-spec))
     (set! (-> q ignore-process0) this)
     (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))
-    (set! (-> q ignore-pat)
-          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q ignore-pat) (blast-bot-ground-pat))
     (set! (-> q action-mask) (collide-action solid))
     (let* ((hit (fill-and-probe-using-line-sphere *collide-cache* q))
            (gy (if (>= hit 0.0)
@@ -1462,6 +1605,44 @@
         )
       gy
       )
+    )
+  )
+
+;; Body height over a gap (two rails, no centre rail): the single probe under the body finds nothing, or the floor far below. The planted
+;; feet stand on the rails, so when at least 3 of them have a floor near the body's height the average of those heights is the ground.
+;; Returns -1e9 when the feet do not hold the bot up either (a real pit: it falls as before).
+(define *blast-bot-feet-ok-time* (the-as time-frame -100000))
+
+(defun blast-bot-feet-support-y ((this blast-bot-player))
+  (let ((sum 0.0)
+        (n 0)
+        (ref (-> this ground-y))
+        (q (new 'stack-no-clear 'collide-query))
+        )
+    (dotimes (i 4)
+      (set-vector! (-> q start-pos) (-> this foot-pos i x) (+ ref 8192.0) (-> this foot-pos i z) 1.0)
+      (set-vector! (-> q move-dist) 0.0 -16384.0 0.0 1.0)
+      (set! (-> q radius) 2048.0)   ;; 50 cm wide: a rail that moved a few cm under the foot still counts
+      (set! (-> q collide-with) (blast-bot-ground-spec))
+      (set! (-> q ignore-process0) this)
+      (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))
+      (set! (-> q ignore-pat) (blast-bot-ground-pat))
+      (set! (-> q action-mask) (collide-action solid))
+      (let ((h (fill-and-probe-using-line-sphere *collide-cache* q)))
+        (when (>= h 0.0)
+          (let ((hy (- (+ (-> q start-pos y) (* h (-> q move-dist y))) 2048.0)))
+            (when (< (fabs (- hy ref)) 8192.0)
+              (+! sum hy)
+              (+! n 1)
+              )
+            )
+          )
+        )
+      )
+    (if (>= n 2)
+        (/ sum (the float n))
+        -1000000000.0
+        )
     )
   )
 
@@ -1519,13 +1700,28 @@
     (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 12288.0)
     (vector-float*! (-> q move-dist) *y-vector* (- *blast-bot-pit-depth*))
     (set! (-> q radius) 40.96)
-    (set! (-> q collide-with) (collide-spec backgnd pusher hit-by-others-list))
+    (set! (-> q collide-with) (blast-bot-ground-spec))
     (set! (-> q ignore-process0) #f)
     (set! (-> q ignore-process1) #f)
-    (set! (-> q ignore-pat)
-          (new 'static 'pat-surface :noentity #x1 :nojak #x1 :probe #x1 :noendlessfall #x1 :board #x1))
+    (set! (-> q ignore-pat) (blast-bot-ground-pat))
     (set! (-> q action-mask) (collide-action solid))
-    (>= (fill-and-probe-using-line-sphere *collide-cache* q) 0.0)
+    (let ((found (>= (fill-and-probe-using-line-sphere *collide-cache* q) 0.0)))
+      ;; Two grind rails with a gap: the line straight down from the body centre finds nothing, but the rails are floor too. Look
+      ;; under each foot as well (25 cm wide probes, from just above where the foot stands).
+      (when (and (not found) *blast-bot-rail-lock*)
+        (dotimes (i 4)
+          (when (not found)
+            (set-vector! (-> q start-pos) (-> this foot-pos i x) (+ (-> this foot-pos i y) 8192.0) (-> this foot-pos i z) 1.0)
+            (vector-float*! (-> q move-dist) *y-vector* (- *blast-bot-pit-depth*))
+            (set! (-> q radius) 1024.0)
+            (if (>= (fill-and-probe-using-line-sphere *collide-cache* q) 0.0)
+                (set! found #t)
+                )
+            )
+          )
+        )
+      found
+      )
     )
   )
 
@@ -1546,7 +1742,8 @@
 
 ;; Debug: why did the bot decide it walked off a ledge? Probes straight down with NOTHING filtered (every collide-spec, no pat
 ;; ignore) and prints what is really under the bot next to what the normal ground probe found.
-(define *blast-bot-fall-debug* #t)
+(define *blast-bot-fall-debug* #f)
+(define *blast-bot-fall-max* 245760.0)   ;; fastest the bot falls: 60 m/s
 (defun blast-bot-fall-debug ((this blast-bot-player))
   (when *blast-bot-fall-debug*
     (let ((q (new 'stack-no-clear 'collide-query)))
@@ -1591,6 +1788,23 @@
     ;; where is the ground right under the body? (probes from 5m above, so slopes and stairs are caught)
     (when (and *blast-bot-ground-follow* (!= (-> this jump-mode) 2))
       (let ((gy (blast-bot-ground-y this 12288.0)))
+        (when (and *blast-bot-rail-lock*
+                   (or (< gy -900000000.0) (< gy (- (-> this ground-y) 8192.0)))
+                   (zero? *blast-bot-merge-stage*)
+                   )
+          (let ((fy (blast-bot-feet-support-y this)))
+            (cond
+              ((< -900000000.0 fy)
+               (set! gy fy)
+               (set! *blast-bot-feet-ok-time* (current-time))
+               )
+              ;; the feet lost the rails for a moment (a slight shift): keep the old height for half a second instead of dropping
+              ((< (- (current-time) *blast-bot-feet-ok-time*) (seconds 0.5))
+               (set! gy (-> this ground-y))
+               )
+              )
+            )
+          )
         (if (< -900000000.0 gy)
             (begin
               (set! (-> this ground-y) gy)
@@ -1674,7 +1888,8 @@
                 )
             )
            (else
-             (set! (-> this jump-vy) (- (-> this jump-vy) (* g dt)))
+             ;; terminal velocity: the engine resets Jak's velocity (and spams "target vel is 400 m/s") when the bot falls for long
+             (set! (-> this jump-vy) (fmax (- *blast-bot-fall-max*) (- (-> this jump-vy) (* g dt))))
              )
            )
          )
@@ -2503,6 +2718,26 @@
 (define-extern *blast-bot-carshot-site* int)
 
 
+;; What the bot stands on (set every frame by blast-bot-ride-update). Props that break / fall when somebody stands on them
+;; (vol-break-ground, volcano-obs2.gc) ask blast-bot-standing-on?: the engine only reports Jak as a rider, and the bot is not Jak.
+(define *blast-bot-ground-handle* (the-as handle #f))
+(define *blast-bot-ground-time* (the-as time-frame -100000))
+(define *blast-bot-ground-log* #f)   ;; #t: print "now standing on <type>" when the bot steps onto a different prop
+
+(defun blast-bot-standing-on? ((p process))
+  (if (and p
+           (< (- (current-time) *blast-bot-ground-time*) (seconds 0.25))
+           (= (handle->process *blast-bot-ground-handle*) p)
+           )
+      #t
+      #f
+      )
+  )
+
+;; Jak pressed Triangle next to the wild flut while parked in the bot (flut-wild.gc): he is released, the flut then takes him.
+;; While this is recent the bot's regrab leaves him alone (blast-bot-jak-busy?).
+(define *blast-bot-flut-pending* (the-as time-frame -100000))
+
 (defun blast-bot-ride-update ((this blast-bot-player))
   ;; Elevators / platforms learn that someone stands on them from a 'ridden event with a rider of type target
   ;; (elevator.gc), so look for a platform under the feet and send it 'ridden ourselves with Jak as the rider.
@@ -2514,7 +2749,7 @@
       (vector+*! (-> q start-pos) (-> this root trans) *y-vector* 8192.0)
       (vector-float*! (-> q move-dist) *y-vector* -61440.0)
       (set! (-> q radius) 40.96)
-      (set! (-> q collide-with) (collide-spec pusher hit-by-others-list))
+      (set! (-> q collide-with) (collide-spec pusher hit-by-others-list obstacle))   ;; obstacle: breaking rocks etc. are plain obstacles
       (set! (-> q ignore-process0) this)
       (set! (-> q ignore-process1) #f)
       (set! (-> q ignore-pat)
@@ -2531,6 +2766,11 @@
                     (f (new 'stack-no-clear 'focus))
                     )
                 (when proc
+                  (if (and *blast-bot-ground-log* (!= (process->handle proc) *blast-bot-ground-handle*))
+                      (format 0 "Blast Bot: now standing on ~A~%" (-> proc type))
+                      )
+                  (set! *blast-bot-ground-handle* (process->handle proc))
+                  (set! *blast-bot-ground-time* (current-time))
                   (set! *blast-bot-ride-seen* (-> proc name))
                   ;; Elevator actors can use a non-'elevator process type.
                   ;; Treat a rideable moving platform detected beneath the bot as an elevator.
@@ -2538,7 +2778,10 @@
                     (set! *blast-bot-on-elevator* #t)
                     )
                   (set! (-> f handle) (process->handle *target*))
-                  (send-event proc 'ridden f)
+                  ;; as before only platforms get the event (an obstacle prop is read through blast-bot-standing-on?)
+                  (if (logtest? (-> prim prim-core collide-as) (collide-spec pusher hit-by-others-list))
+                      (send-event proc 'ridden f)
+                      )
                   )
                 )
               )
@@ -2593,10 +2836,50 @@
   (blast-bot-scene-in? *active-pool*)
   )
 
+;; Jak is in the gun turret (wascity-gungame): target-turret-stance, -get-on ... Compared by name prefix. The bot spawned while Jak sat in the
+;; turret and the game crashed a moment later (the turret owns Jak's position and camera), so the bot stays away from him there.
+;; st is a state name or #f
+(defun blast-bot-turret-state? ((st object))
+  (let ((name (if st (symbol->string (the-as symbol st)) (the-as string #f)))
+        (pre "target-turret")
+        (i 0)
+        (ok #t)
+        )
+    (if (not name)
+        (set! ok #f)
+        (while (and ok (< i 13))
+          (if (!= (-> name data i) (-> pre data i))
+              (set! ok #f)
+              )
+          (+! i 1)
+          )
+        )
+    ok
+    )
+  )
+
+;; Point the camera at the bot, except while Jak is in a gun turret. cam-turret (target-turret.gc) takes the camera's focus, casts it to
+;; `target` and reads its turret handle: with the bot as focus that is garbage, and the game crashes right after the spawn.
+(defun blast-bot-aim-camera ((bot process))
+  (when (and *camera* bot)
+    (if (and *target*
+             (blast-bot-turret-state? (if (-> *target* next-state) (-> *target* next-state name) #f))
+             )
+        (when (!= (handle->process (-> *camera* focus handle)) *target*)
+          (send-event *camera* 'change-target *target*)
+          )
+        (send-event *camera* 'change-target bot)
+        )
+    )
+  (none)
+  )
+
 (defun blast-bot-jak-busy? ((st object))
   ;; states we must NOT fight: cutscene grabs, death/respawn, and the bot's own ride state
   (or (!= *blast-bot-merge-stage* 0) (= st 'target-grab-ride) (= st 'target-grab) (= st 'target-clone-anim)
       (blast-bot-pilot-state? st)   ;; Jak is in a vehicle (mission / race / scripted ride): never fight for him, blast-bot-merge-update turns it into a ride
+      (< (current-time) (+ *blast-bot-flut-pending* (seconds 2.5)))   ;; Jak was just let go to mount the wild flut (flut-wild.gc)
+      (blast-bot-turret-state? st)   ;; Jak is in a gun turret: do not touch him
       (blast-bot-flut-state? st)   ;; Jak is a flut: blast-bot-flut-update (blastbot-vehicle.gc) holds him in the bot, leave him alone
       (= st 'target-hit) (= st 'target-death) (= st 'target-continue))
   )
@@ -2656,7 +2939,7 @@
 (define-extern blast-bot-elevator-update (function blast-bot-player none))
 
 (define *blast-bot-regrab-fails* 0)    ;; consecutive "put him back" requests that did not end in target-grab-ride
-(define *blast-bot-regrab-debug* #t)   ;; print what Jak answers to the grab-ride request (to see why a regrab keeps failing)
+(define *blast-bot-regrab-debug* #f)   ;; print what Jak answers to the grab-ride request (to see why a regrab keeps failing)
 
 (defun blast-bot-regrab ((this blast-bot-player))
   ;; Cutscenes (and elevators with the grab flag) send Jak a 'grab, which kicks him out of target-grab-ride, and when
@@ -2701,13 +2984,18 @@
       (blast-bot-teleport-to this (-> *target* control trans))
       )
     (let ((st (if (-> *target* next-state) (-> *target* next-state name) #f)))
+      (when (and (blast-bot-turret-state? st) *camera* (= (handle->process (-> *camera* focus handle)) this))
+        (format 0 "Blast Bot: Jak is in a turret, camera back on Jak~%")
+        (send-event *camera* 'change-target *target*)
+        (set! *blast-bot-cam-pending* #t)   ;; the delayed retarget puts it back on the bot once Jak is out
+        )
       (when (= st 'target-grab-ride)
         (set! *blast-bot-regrab-fails* 0)
         (when (and *blast-bot-cam-pending* *camera* (>= (- (current-time) *blast-bot-continue-time*) *blast-bot-cam-delay*)
                    (or (zero? *blast-bot-elev-cam*) (>= (- (current-time) *blast-bot-elev-cam*) (seconds 30))))
           (set! *blast-bot-cam-pending* #f)
           (format 0 "Blast Bot: camera now pointed at the bot (delayed retarget)~%")
-          (send-event *camera* 'change-target this)
+          (blast-bot-aim-camera this)
           )
         )
       ;; log every change so we can see which state Jak lands in after a cutscene
@@ -3173,7 +3461,7 @@
   :enter (behavior ()
     (format 0 "Blast Bot: active enter~%")
     (when *camera*
-      (send-event *camera* 'change-target self)
+      (blast-bot-aim-camera self)
       (format 0 "Blast Bot: camera target request returned~%")
       )
     (let ((angle (* 182.04445 25.0)))
@@ -3792,9 +4080,15 @@
 ;; the bot to the compacting default pool. Two slots so a re-summon can spawn the new bot while the old one still lives.
 (define *blast-bot-pool* (new 'global 'dead-pool 2 #x4000 "blast-bot-pool"))
 
+(define *blast-bot-turret-log-next* (the-as time-frame 0))
+
 (defun spawn-my-bombbot ()
   ;; Spawns a new bot, then removes every previous one. Jak is released from the old bot first so the new bot can take him over.
-  (when *target*
+  (when (and *target* (blast-bot-turret-state? (blast-bot-jak-state)) (>= (current-time) *blast-bot-turret-log-next*))
+    (set! *blast-bot-turret-log-next* (+ (current-time) (seconds 2)))
+    (format 0 "Blast Bot: not spawning, Jak is in a turret (~A)~%" (blast-bot-jak-state))
+    )
+  (when (and *target* (not (blast-bot-turret-state? (blast-bot-jak-state))))
     (format 0 "Blast Bot: spawn requested~%")
     (format 0 "Blast Bot: own pool slot free: ~A, 16k pool slot free: ~A~%"
             (if (-> *blast-bot-pool* child) #t #f) (if (-> *16k-dead-pool* child) #t #f))
