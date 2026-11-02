@@ -32,6 +32,19 @@
 (define-extern prebot-light-pulse-off (function none :behavior prebot))
 (define-extern prebot-go-next-stage (function object :behavior prebot))
 
+;; ---- prebot rework (blast bot mod) ----
+;; the player's bot lives in the mod files; this is only resolved at run time
+(define-extern blast-bot-find (function process))
+
+(define *prebot-max-health* 1000.0)       ;; his health bar
+(define *prebot-health* -1.0)             ;; current health, kept here so it survives the respawn after every minecart movie (-1 = not set yet)
+(define *prebot-health-done* -1)          ;; how many minecarts had hit him when *prebot-health* was last set
+(define *prebot-cart-fraction* 0.15)      ;; a minecart explosion costs this fraction of max health (was 1/3)
+(define *prebot-damage-mult* 10.0)        ;; everything he hits you with does this much more damage
+(define *prebot-speed* 1.5)               ;; attack animation / movement speed (1.0 = stock)
+(define *prebot-combo-count* 3)           ;; slam + sweep rounds before the minions and pillars
+(define *prebot-debug* #t)                ;; print every 'attack he receives (and why it was ignored)
+
 
 ;; DECOMP BEGINS
 
@@ -254,7 +267,7 @@
 
 
 (deftype prebot-shockwave (process-drawable)
-  ()
+  ((hit-id  uint32))
   (:state-methods
     idle
     )
@@ -327,6 +340,7 @@
    (flags                prebot-flag)
    (pillar-hint-timer    time-frame)
    (minecar-hint-timer   time-frame)
+   (combo                int8)
    (ammo                 prebot-ammo-tracker  20 :inline)
    )
   (:state-methods
@@ -354,6 +368,51 @@
     )
   )
 
+
+(defun prebot-hit-bot ((dmg float) (hit-id uint))
+  "Hit the player's blast bot the way the prebot hits Jak. Returns #t when a bot exists."
+  (let ((bot (blast-bot-find)))
+    (cond
+      (bot
+       (send-event bot 'attack #f
+                   (static-attack-info :mask (vehicle-impulse-factor) ((id hit-id)
+                                                                       (damage dmg)
+                                                                       (vehicle-damage-factor 1.0)
+                                                                       (vehicle-impulse-factor 1.0)
+                                                                       (shove-up (meters 1))
+                                                                       (shove-back (meters 3))
+                                                                       )
+                                       )
+                   )
+       #t
+       )
+      (else
+        #f
+        )
+      )
+    )
+  )
+
+(defun prebot-seg-near? ((start vector) (dir vector) (pt vector) (radius float) (height float))
+  "#t when pt is within radius (on the ground plane) of the segment start..start+dir and within height of it vertically."
+  (let* ((dx (- (-> pt x) (-> start x)))
+         (dz (- (-> pt z) (-> start z)))
+         (len2 (+ (* (-> dir x) (-> dir x)) (* (-> dir z) (-> dir z))))
+         (proj (if (< 1.0 len2)
+                   (/ (+ (* dx (-> dir x)) (* dz (-> dir z))) len2)
+                   0.0
+                   )
+               )
+         (tt (fmax 0.0 (fmin 1.0 proj)))
+         (cx (- dx (* tt (-> dir x))))
+         (cz (- dz (* tt (-> dir z))))
+         (dy (- (-> pt y) (+ (-> start y) (* tt (-> dir y)))))
+         )
+    (and (< (+ (* cx cx) (* cz cz)) (* radius radius))
+         (< (fabs dy) height)
+         )
+    )
+  )
 
 (defbehavior prebot-eco-pillar-init-by-other prebot-eco-pillar ((arg0 vector) (arg1 prebot-eco-pillar-launch-spec))
   (let ((v1-0 (-> arg1 style)))
@@ -753,6 +812,7 @@
     (the-as pair 0)
     )
   (set! (-> self event-hook) (-> (method-of-object self idle) event))
+  (set! (-> self hit-id) (new-attack-id))
   (go-virtual idle)
   )
 
@@ -1047,7 +1107,7 @@
   (logior! (-> this mask) (process-mask enemy))
   (vector-copy! (-> this original-position) (-> this root trans))
   ;; og:preserve-this changed for high fps
-  (init (-> this position) (-> this original-position) 0.004096 (* DISPLAY_FPS_RATIO 2048.0) 0.125)
+  (init (-> this position) (-> this original-position) 0.004096 (* *prebot-speed* DISPLAY_FPS_RATIO 2048.0) 0.125)
   (set! (-> this draw light-index) (the-as uint 10))
   (dotimes (v1-64 28)
     (set! (-> this critters v1-64) (the-as handle #f))
@@ -1064,6 +1124,7 @@
     (set! (-> this pillars v1-73) (the-as handle #f))
     )
   (set! (-> this last-attack-id) (the-as uint 0))
+  (set! (-> this combo) 0)
   (let ((a0-133 (nav-mesh-from-res-tag (-> this entity) 'nav-mesh-actor 0)))
     (if a0-133
         (change-to a0-133 this)

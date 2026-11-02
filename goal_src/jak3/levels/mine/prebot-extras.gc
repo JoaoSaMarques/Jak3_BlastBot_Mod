@@ -395,7 +395,7 @@
          (set! (-> a1-3 param 0) (the-as uint #f))
          (set! (-> a1-3 param 1)
                (the-as uint (static-attack-info :mask (vehicle-impulse-factor) ((id (new-attack-id))
-                                                                                (damage 2.0)
+                                                                                (damage (* 2.0 *prebot-damage-mult*))
                                                                                 (vehicle-damage-factor 1.0)
                                                                                 (vehicle-impulse-factor 1.0)
                                                                                 (shove-up (meters 1))
@@ -562,21 +562,27 @@
   :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
     (case message
       (('touch 'bonk)
-       (if (= proc *target*)
-           (send-event
-             *target*
-             'attack
-             #f
-             (static-attack-info :mask (vehicle-impulse-factor) ((id (new-attack-id))
-                                                                 (damage 2.0)
-                                                                 (vehicle-damage-factor 1.0)
-                                                                 (vehicle-impulse-factor 1.0)
-                                                                 (shove-up (meters 1))
-                                                                 (shove-back (meters 3))
-                                                                 )
-                                 )
-             )
-           )
+       (cond
+         ((= proc *target*)
+          (send-event
+            *target*
+            'attack
+            #f
+            (static-attack-info :mask (vehicle-impulse-factor) ((id (new-attack-id))
+                                                                (damage (* 2.0 *prebot-damage-mult*))
+                                                                (vehicle-damage-factor 1.0)
+                                                                (vehicle-impulse-factor 1.0)
+                                                                (shove-up (meters 1))
+                                                                (shove-back (meters 3))
+                                                                )
+                                )
+            )
+          )
+         ;; the player's bot is its own process: the stock code only ever hit *target* (Jak)
+         ((and proc (= proc (blast-bot-find)))
+          (prebot-hit-bot (* 2.0 *prebot-damage-mult*) (-> self hit-id))
+          )
+         )
        )
       )
     )
@@ -641,21 +647,31 @@
                 )
           (set! (-> v1-52 action-mask) (collide-action solid))
           )
-        (if (>= (probe-using-line-sphere *collide-cache* gp-0) 0.0)
-            (send-event
-              *target*
-              'attack
-              #f
-              (static-attack-info :mask (vehicle-impulse-factor) ((id (new-attack-id))
-                                                                  (damage 2.0)
-                                                                  (vehicle-damage-factor 1.0)
-                                                                  (vehicle-impulse-factor 1.0)
-                                                                  (shove-up (meters 1))
-                                                                  (shove-back (meters 3))
-                                                                  )
-                                  )
-              )
+        (let ((bot (blast-bot-find)))
+          (cond
+            (bot
+             ;; Jak is parked inside the bot: test the bot itself against this piece of the ring (5 m wide, jump it at 6 m)
+             (if (prebot-seg-near? (-> gp-0 start-pos) (-> gp-0 move-dist) (-> (the-as process-drawable bot) root trans) 20480.0 24576.0)
+                 (prebot-hit-bot (* 2.0 *prebot-damage-mult*) (-> self hit-id))
+                 )
+             )
+            ((>= (probe-using-line-sphere *collide-cache* gp-0) 0.0)
+             (send-event
+               *target*
+               'attack
+               #f
+               (static-attack-info :mask (vehicle-impulse-factor) ((id (new-attack-id))
+                                                                   (damage (* 2.0 *prebot-damage-mult*))
+                                                                   (vehicle-damage-factor 1.0)
+                                                                   (vehicle-impulse-factor 1.0)
+                                                                   (shove-up (meters 1))
+                                                                   (shove-back (meters 3))
+                                                                   )
+                                   )
+               )
+             )
             )
+          )
         )
       )
     )
@@ -725,6 +741,7 @@
   (set! (-> this part) (create-launch-control group-prebot-gun-shot-trail this))
   (set! (-> this sound-id) (new-sound-id))
   ((method-of-type projectile init-proj-settings!) this)
+  (set! (-> this damage) (* *prebot-damage-mult* (-> this damage)))
   0
   (none)
   )
@@ -806,7 +823,7 @@
       (set! (-> gp-0 collide-with)
             (collide-spec backgnd jak crate enemy obstacle vehicle-sphere hit-by-others-list player-list pusher shield)
             )
-      (set! (-> gp-0 damage) 2.0)
+      (set! (-> gp-0 damage) (* 2.0 *prebot-damage-mult*))
       (set! (-> gp-0 damage-scale) 1.0)
       (set! (-> gp-0 vehicle-damage-factor) 1.0)
       (set! (-> gp-0 vehicle-impulse-factor) 1.0)
@@ -1016,7 +1033,7 @@
              'attack-or-shove
              #f
              (static-attack-info :mask (vehicle-impulse-factor) ((id (new-attack-id))
-                                                                 (damage 2.0)
+                                                                 (damage (* 2.0 *prebot-damage-mult*))
                                                                  (vehicle-damage-factor 1.0)
                                                                  (vehicle-impulse-factor 1.0)
                                                                  (shove-up (meters 1))
@@ -1026,6 +1043,9 @@
              )
            (send-event (ppointer->process (-> self parent)) 'touched-hot-pillar)
            )
+       )
+     (when (and (-> self hot) arg0 (!= arg0 *target*) (= arg0 (blast-bot-find)))
+       (prebot-hit-bot (* 2.0 *prebot-damage-mult*) (new-attack-id))
        )
      #t
      )
