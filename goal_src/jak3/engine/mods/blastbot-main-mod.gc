@@ -143,6 +143,14 @@
 ;; L2 spy-bot (blastbot-spybot.gc). While *blast-bot-spy-active* the bot stands idle: no steering, jumping, dash, hover,
 ;; shield or shooting, and the camera zooms in (*blast-bot-spy-cam-zoom*, 1.0 = the normal distance) on the droid.
 (define *blast-bot-spy-active* #f)
+;; Triangle near a turret mounts the bot without changing Jak's native turret state.
+(define *blast-bot-turret* (the-as (pointer process) #f))
+(define *blast-bot-turret-depth* 8192.0)
+(define-extern blast-bot-turret-update (function blast-bot-player none))
+(define-extern blast-bot-turret-fire (function blast-bot-player process none))
+(defun blast-bot-turret-rider? ((rider process))
+  (and *blast-bot-turret* (type? rider blast-bot-player))
+  )
 (define *blast-bot-spy-cam-zoom* 0.4)
 (define *blast-bot-spy-turret-speed* 5461.33)   ;; while spying, the turret spins this fast, in angle units per second (65536 = 360 degrees: 5461 = 30 degrees/s, one turn in 12 s)
 (define *blast-bot-spy-turret-angle* 0.0)
@@ -659,7 +667,7 @@
              (f0 (- phase (the float (the int phase))))
              ;; while crouching / recovering from a jump every foot stays planted
              (f (if (or (= (-> this jump-mode) 1) (= (-> this jump-mode) 3)
-                        (and *blast-bot-spy-active* (= (-> this jump-mode) 0))   ;; bunkered down while the spy droid is out
+                        (and (or *blast-bot-spy-active* *blast-bot-turret*) (= (-> this jump-mode) 0))
                         )
                     0.9
                     f0
@@ -1715,7 +1723,12 @@
       (set! (-> q collide-with)
             (the-as collide-spec (logior (the-as int (blast-bot-wall-spec)) (if *blast-bot-wall-bouncers* (the-as int (collide-spec crate hit-by-player-list)) 0))))
       (set! (-> q ignore-process0) this)
-      (set! (-> q ignore-process1) (the-as process (blast-bot-merge-vehicle)))   ;; the car the bot is merged with is not a wall
+      (set! (-> q ignore-process1)
+            (if *blast-bot-turret*
+                (ppointer->process *blast-bot-turret*)
+                (the-as process (blast-bot-merge-vehicle))
+                )
+            )   ;; ignore the mounted turret while sliding onto it, or the merged car
       (set! (-> q ignore-pat)
             (if (>= *blast-bot-wall-mode* 2)
                 (new 'static 'pat-surface :probe #x1 :noendlessfall #x1 :board #x1)
@@ -2155,13 +2168,19 @@
             )
         )
       )
-    ;; bunker down while the spy droid is out: the same dip as the jump crouch (body down, feet planted, head nods
-    ;; forward), held until the droid is gone, then it stands back up
+    ;; bunker down while the spy droid is out or mounted on a turret
     (when (= (-> this jump-mode) 0)
-      (if *blast-bot-spy-active*
-          (seek! (-> this crouch-depth) *blast-bot-bunker-depth* (* *blast-bot-bunker-speed* dt))
+      (cond
+        (*blast-bot-spy-active*
+         (seek! (-> this crouch-depth) *blast-bot-bunker-depth* (* *blast-bot-bunker-speed* dt))
+         )
+        (*blast-bot-turret*
+         (seek! (-> this crouch-depth) *blast-bot-turret-depth* (* *blast-bot-bunker-speed* dt))
+         )
+        (else
           (seek! (-> this crouch-depth) 0.0 (* 14336.0 dt))
           )
+        )
       )
     (case (-> this jump-mode)
       ((0)
@@ -2188,6 +2207,7 @@
          ((and *blast-bot-super-jump*
                (cpad-hold? 0 l1)
                (not *blast-bot-spy-active*)
+               (not *blast-bot-turret*)
                (not (-> this hover-on))
                (not (blast-bot-ride?))
                (zero? *blast-bot-merge-stage*)
@@ -2197,7 +2217,7 @@
           (set! (-> this jump-timer) (current-time))
           )
          ;; X alone: the normal jump
-         ((and (cpad-pressed? 0 x) (not *blast-bot-spy-active*))
+         ((and (cpad-pressed? 0 x) (not *blast-bot-spy-active*) (not *blast-bot-turret*))
           (set! *blast-bot-super* #f)
           (set! (-> this jump-mode) 1)
           (set! (-> this jump-timer) (current-time))
@@ -3952,6 +3972,10 @@
            #f
            )
        )
+      (('fire)
+       (blast-bot-turret-fire self proc)
+       #t
+       )
       (else
         #f
         )
@@ -4027,7 +4051,7 @@
           (set! (-> self input-yaw) (vector-y-angle move))
           (set! (-> self input-active) #t)
           ;; only the ground mode walks; while crouching / airborne / recovering the stick just aims the head
-          (when (and (= (-> self jump-mode) 0) (not dashing) (not (-> self hover-on)))
+          (when (and (= (-> self jump-mode) 0) (not dashing) (not (-> self hover-on)) (not *blast-bot-turret*))
             (let* ((amount (* 49152.0 speed (-> self ramp) dt))
                    (frac (blast-bot-move-xz self (* (-> move x) amount) (* (-> move z) amount)))
                    )
@@ -4103,7 +4127,7 @@
           (seek! (-> self ramp) 1.0 (* dt (if (-> self hover-on) 0.25 2.0)))
           )
       ;; Square: charge forward in the stick direction (or where the head already points)
-      (when (and (cpad-pressed? 0 square) (not *blast-bot-spy-active*) (not (blast-bot-ride?))
+      (when (and (cpad-pressed? 0 square) (not *blast-bot-spy-active*) (not *blast-bot-turret*) (not (blast-bot-ride?))
                  (= (-> self jump-mode) 0)
                  (not dashing)
                  (>= (current-time) (-> self dash-ready))
@@ -4143,7 +4167,7 @@
       (blast-bot-scan-update self)
       ;; R2 (held): hover. Legs sweep back and the body floats up.
       ;; R2 (press): toggle hover on/off. Only switchable from the ground or while airborne.
-      (when (and (cpad-pressed? 0 r2) (not *blast-bot-spy-active*) (not (blast-bot-ride?)) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2)))
+      (when (and (cpad-pressed? 0 r2) (not *blast-bot-spy-active*) (not *blast-bot-turret*) (not (blast-bot-ride?)) (or (= (-> self jump-mode) 0) (= (-> self jump-mode) 2)))
         (set! (-> self hover-on) (not (-> self hover-on)))
         )
       (seek! (-> self hover-blend)
@@ -4186,7 +4210,8 @@
                               (else 0.0)
                               ))
       )
-    (if (not *blast-bot-spy-active*)
+    (blast-bot-turret-update self)
+    (if (and (not *blast-bot-spy-active*) (not *blast-bot-turret*))
         (blast-bot-fire-input self)   ;; R1 for every weapon: see blastbot_guns.gc
         )
     ;; our own shots start inside the shield: its hit sphere is off for a moment after each shot so they fly out
