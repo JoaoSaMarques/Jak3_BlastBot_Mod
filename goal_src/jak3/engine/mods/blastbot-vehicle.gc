@@ -29,6 +29,7 @@
 (define *blast-bot-merge-invisible* #t)      ;; #t: the merged vehicle (and its wheels / child parts) is not drawn
 (define *blast-bot-merge-cam-time* 0)        ;; last time the camera was re-pointed at the bot while merged
 (define *blast-bot-merge-ride* #f)            ;; the current merge is a ride (set when the merge starts)
+(define *blast-bot-ride-air* #f)
 (define *blast-bot-merge-box* (new 'global 'vector))
 (define *blast-bot-merge-hits* (new 'global 'array 'collide-shape 32))
 
@@ -164,6 +165,10 @@
   (let ((angle (* 182.04445 25.0))
         (z (-> self cam-zoom))
         )
+    (remove-setting! 'extra-follow-height)
+    (when (and (blast-bot-ride?) *blast-bot-ride-air*)
+      (set-setting! 'extra-follow-height 'abs 4096.0 0)
+      )
     (remove-setting! 'string-min-height)
     (remove-setting! 'string-max-height)
     (remove-setting! 'string-min-length)
@@ -416,6 +421,7 @@
 (define *blast-bot-ride-in-missions* #t)      ;; #t: during a vehicle mission the merge becomes a ride (#f: merge is refused instead)
 (define *blast-bot-ride-always* #t)           ;; #t: every merge is a ride, even outside missions
 (define *blast-bot-ride-y-offset* -4096.0)    ;; bot origin relative to the car origin (4096 = 1 m): tune if it floats / sinks
+(define *blast-bot-ride-air-y-offset* 4096.0)
 (define *blast-bot-ride-height-adjust* 0.0) ;; smoothed offset relative to the car
 (define *blast-bot-ride-hover-was* #f)
 (define *blast-bot-ride-cam-restore* #f)      ;; set when the ride ends: the state's :trans gives the bot's camera settings back
@@ -424,7 +430,17 @@
   (and *blast-bot-merge-ride* (!= *blast-bot-merge-stage* 0))
   )
 
+(define-extern blast-bot-city-destroy-grid-in? (function process-tree symbol))
+(define-extern blast-bot-flying-vehicle? (function process symbol))
+
 (defun blast-bot-ride-start ((this blast-bot-player) (v rigid-body-object))
+  (set! *blast-bot-ride-air*
+        (if (or (and *active-pool* (blast-bot-city-destroy-grid-in? *active-pool*))
+                (blast-bot-flying-vehicle? (the-as process v)))
+            #t
+            #f
+            )
+        )
   (set! *blast-bot-ride-hover-was* (-> this hover-on))
   (set! *blast-bot-ride-height-adjust* 0.0)
   (dotimes (i 4) (set! (-> this ride-foot-offset i) 0.0))
@@ -440,6 +456,18 @@
   )
 
 (defun blast-bot-ride-end ((this blast-bot-player))
+  (when *blast-bot-ride-air*
+    (let ((gy (blast-bot-ground-y this 12288.0)))
+      (when (and (> gy -900000000.0) (< (-> this root trans y) (+ gy 4096.0)))
+        (set! (-> this root trans y) (+ gy 4096.0))
+        (set! (-> this ground-y) (-> this root trans y))
+        (vector-copy! (-> this last-trans) (-> this root trans))
+        (vector-copy! (-> this ext-pos) (-> this root trans))
+        (update-transforms (-> this root))
+        )
+      )
+    )
+  (set! *blast-bot-ride-air* #f)
   (set! (-> this hover-on) *blast-bot-ride-hover-was*)
   (set! (-> this jump-mode) 0)
   (set! (-> this hover-vx) 0.0)
@@ -456,11 +484,14 @@
 
 (defun blast-bot-ride-follow ((this blast-bot-player) (v rigid-body-object))
   ;; the bot sits on the car: same position, same heading (yaw only), legs in the hover pose
+  (when (blast-bot-flying-vehicle? (the-as process v))
+    (set! *blast-bot-ride-air* #t)
+    )
   (let ((fwd (new 'stack-no-clear 'vector)))
     (vector-copy! (-> this root trans) (-> v root trans))
-    (+! (-> this root trans y) *blast-bot-ride-y-offset*)
+    (+! (-> this root trans y) (if *blast-bot-ride-air* *blast-bot-ride-air-y-offset* *blast-bot-ride-y-offset*))
     (let ((want 0.0))
-      (when *blast-bot-ride-terrain*
+      (when (and *blast-bot-ride-terrain* (not *blast-bot-ride-air*))
         (let* ((car-y (-> this root trans y))
                (gy (blast-bot-ground-y this 12288.0)))
           (when (and (< -900000000.0 gy) (< (fabs (- gy car-y)) 20480.0))
@@ -595,6 +626,40 @@
       (set! ty (if ty (-> ty parent) (the-as type #f)))
       )
     found
+    )
+  )
+
+(defun blast-bot-city-destroy-grid-in? ((tree process-tree))
+  (let ((p (-> tree child))
+        (found #f)
+        )
+    (while (and p (not found))
+      (let ((proc (-> p 0))
+            (next (-> p 0 brother))
+            )
+        (if (or (= (-> proc type symbol) 'task-manager-city-destroy-grid)
+                (and (type? proc process-tree)
+                     (blast-bot-city-destroy-grid-in? (the-as process-tree proc)))
+                )
+            (set! found #t)
+            )
+        (set! p next)
+        )
+      )
+    found
+    )
+  )
+
+(defun blast-bot-flying-vehicle? ((v process))
+  (let ((flags (-> (the-as rigid-body-object v) flags)))
+    (if (or (blast-bot-vehicle-type? v 'h-glider)
+            (blast-bot-vehicle-type? v 'htorpedo)
+            (and (blast-bot-vehicle-type? v 'hvehicle)
+                 (logtest? flags (the-as uint64 (shl 1 13))))
+            )
+        #t
+        #f
+        )
     )
   )
 
@@ -929,7 +994,8 @@
                (when (and *blast-bot-remount-on* (not (blast-bot-vehicle-mission?))
                           (< *blast-bot-remount-tries* 3)
                           ;; a hang glider has no get-off (sidekick-clone art error) and it flies: getting out drops Jak into the void
-                          (not (blast-bot-vehicle-type? (the-as process pv) 'h-glider))
+                          (not (or (blast-bot-vehicle-type? (the-as process pv) 'h-glider)
+                                   (blast-bot-vehicle-type? (the-as process pv) 'htorpedo)))
                           ;; not after Jak got in by himself (the bot was removed at pilot-start a moment ago and Jak lands in pilot-stance)
                           (not (and (= st 'target-pilot-stance)
                                     (< (- (current-time) *blast-bot-manual-enter-time*) (seconds 15)))))
