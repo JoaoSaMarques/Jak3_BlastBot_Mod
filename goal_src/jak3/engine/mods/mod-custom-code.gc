@@ -31,6 +31,7 @@
     (define *blast-bot-spawn-tries* 0)         ;; auto-spawn attempts for the current Jak
     (define *blast-bot-spawn-check* 0)         ;; time of the last auto-spawn, 0 = nothing to verify
     (define *blast-bot-wait-log* 0)
+    (define *blast-bot-mech-resume* #f)
 
     (define *blast-bot-auto-default-pool* #t)  ;; #t = the 16k slot is permanently busy here, so auto-spawn uses the default pool like L1 + R3 does
     (define *blast-bot-holder-logs* 0)
@@ -63,7 +64,7 @@
       )
 
     (defun blast-bot-spawn-watch ()
-      (when (and *blast-bot-always* *target*)
+      (when (and (or *blast-bot-always* *blast-bot-mech-resume*) *target*)
         ;; every spawn is a new target process, so a new handle means Jak just (re)spawned
         ;; compare the 32-bit process id: a handle is 64-bit and a global symbol only keeps 32 bits, so it never matched
         (let ((h (the-as int (-> *target* pid))))
@@ -126,6 +127,7 @@
           (cond
             ((blast-bot-find)
              (format 0 "Blast Bot: auto-spawn ok~%")
+             (set! *blast-bot-mech-resume* #f)
              )
             ((< *blast-bot-spawn-tries* 5)
              (format 0 "Blast Bot: bot is gone after auto-spawn, retrying~%")
@@ -133,9 +135,35 @@
              )
             (else
               (format 0 "Blast Bot: auto-spawn gave up~%")
+              (set! *blast-bot-mech-resume* #f)
               )
             )
           )
+        )
+      0
+      )
+
+    (defun blast-bot-mech-watch ()
+      (when (and *target* (focus-test? *target* mech))
+        (set! *blast-bot-spawn-pending* #f)
+        (when (and (zero? *blast-bot-despawn-step*) (blast-bot-find))
+          (set! *blast-bot-mech-resume* #t)
+          (when (!= (blast-bot-jak-state) 'target-grab-ride)
+            (despawn-my-bombbot)
+            )
+          )
+        )
+      (when (and *target*
+                 (not (focus-test? *target* mech))
+                 *blast-bot-mech-resume*
+                 (zero? *blast-bot-despawn-step*)
+                 )
+        (if (blast-bot-find)
+            (set! *blast-bot-mech-resume* #f)
+            (when (not *blast-bot-spawn-pending*)
+              (blast-bot-spawn-pending!)
+              )
+            )
         )
       0
       )
@@ -166,6 +194,7 @@
         )
       (blast-bot-despawn-update)
 
+      (blast-bot-mech-watch)
       (blast-bot-spawn-watch)
 
       (when *debug-segment*

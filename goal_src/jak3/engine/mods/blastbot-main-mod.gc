@@ -149,7 +149,7 @@
 (define-extern blast-bot-turret-update (function blast-bot-player none))
 (define-extern blast-bot-turret-fire (function blast-bot-player process none))
 (defun blast-bot-turret-rider? ((rider process))
-  (and *blast-bot-turret* (type? rider blast-bot-player))
+  (if (and *blast-bot-turret* (type? rider blast-bot-player)) #t #f)
   )
 (define *blast-bot-spy-cam-zoom* 0.4)
 (define *blast-bot-spy-turret-speed* 5461.33)   ;; while spying, the turret spins this fast, in angle units per second (65536 = 360 degrees: 5461 = 30 degrees/s, one turn in 12 s)
@@ -3396,6 +3396,7 @@
   ;; states we must NOT fight: cutscene grabs, death/respawn, and the bot's own ride state
   (or (!= *blast-bot-merge-stage* 0) (= st 'target-grab-ride) (= st 'target-grab) (= st 'target-clone-anim)
       (blast-bot-pilot-state? st)   ;; Jak is in a vehicle (mission / race / scripted ride): never fight for him, blast-bot-merge-update turns it into a ride
+      (and *target* (focus-test? *target* mech))
       (< (current-time) (+ *blast-bot-flut-pending* (seconds 2.5)))   ;; Jak was just let go to mount the wild flut (flut-wild.gc)
       (blast-bot-turret-state? st)   ;; Jak is in a gun turret: do not touch him
       (blast-bot-flut-state? st)   ;; Jak is a flut: blast-bot-flut-update (blastbot-vehicle.gc) holds him in the bot, leave him alone

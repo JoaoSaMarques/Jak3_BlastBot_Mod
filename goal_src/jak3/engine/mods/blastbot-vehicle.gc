@@ -548,6 +548,28 @@
   (and *blast-bot-merge-block-missions* (blast-bot-vehicle-mission-in? *active-pool*))
   )
 
+(define-extern blast-bot-comb-wild-ride-in? (function process-tree symbol))
+(defun blast-bot-comb-wild-ride-in? ((tree process-tree))
+  (let ((p (-> tree child))
+        (found #f)
+        )
+    (while (and p (not found))
+      (let ((next (-> p 0 brother))
+            (proc (-> p 0))
+            )
+        (if (or (= (-> proc type symbol) 'task-manager-comb-wild-ride)
+                (and (type? proc process-tree)
+                     (blast-bot-comb-wild-ride-in? (the-as process-tree proc)))
+                )
+            (set! found #t)
+            )
+        (set! p next)
+        )
+      )
+    found
+    )
+  )
+
 ;; ---- Vehicle health bonus ----
 ;; While the bot is merged with / riding a vehicle (merge stage 3) its max health and health go up by an amount that depends on
 ;; the vehicle type; when the vehicle is left the bonus is taken away again (health is capped to the normal max, never below 1,
@@ -1148,7 +1170,8 @@
 (define *blast-bot-wall-hits* (new 'global 'array 'collide-shape 32))
 
 (defun blast-bot-vehicle-wall ((this blast-bot-player))
-  (when *blast-bot-vehicle-wall*
+  (when (and *blast-bot-vehicle-wall*
+             (not (blast-bot-comb-wild-ride-in? *active-pool*)))
     (let ((box *blast-bot-wall-box*)
           (hits *blast-bot-wall-hits*)
           )
