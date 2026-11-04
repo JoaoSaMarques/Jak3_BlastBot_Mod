@@ -8,6 +8,8 @@
 (declare-type assault-squad-control structure)
 (define-extern *assault-squad* assault-squad-control)
 (define-extern *port-assault-blur-curve* curve2d-piecewise)
+(define-extern blast-bot-find (function process))
+(define-extern blast-bot-teleport-to (function blast-bot-player vector none))
 
 ;; DECOMP BEGINS
 
@@ -379,6 +381,12 @@
         (let ((a1-5 (new 'stack-no-clear 'vector)))
           (vector-copy! a1-5 (-> self current-room node-positions gp-0))
           (move-to-point! (-> *target* control) a1-5)
+          (let ((bot (as-type (blast-bot-find) blast-bot-player)))
+            (when bot
+              (format 0 "Blast Bot: following City Port Assault sector transition~%")
+              (blast-bot-teleport-to bot a1-5)
+              )
+            )
           )
         )
       )

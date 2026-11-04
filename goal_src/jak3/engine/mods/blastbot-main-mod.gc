@@ -3472,7 +3472,8 @@
     ;; When it is set and Jak is no longer next to the bot, the bot goes with him right away (the distance check below is only
     ;; the fallback for moves without the flag).
     (when (and (focus-test? *target* teleporting)
-               (not (blast-bot-pilot-state? (if (-> *target* next-state) (-> *target* next-state name) #f)))
+               (or (not (blast-bot-pilot-state? (if (-> *target* next-state) (-> *target* next-state name) #f)))
+                   (not (blast-bot-ride?)))
                (< 0.0 *blast-bot-follow-dist*)
                (zero? *blast-bot-despawn-step*)
                (< 40960.0 (vector-vector-distance (-> this root trans) (-> *target* control trans)))
@@ -3499,7 +3500,8 @@
       )
     ;; Distance fallback runs every frame, not only on the 0.25-second regrab retry.
     (when (and (< 0.0 *blast-bot-follow-dist*)
-               (not (blast-bot-pilot-state? (if (-> *target* next-state) (-> *target* next-state name) #f)))
+               (or (not (blast-bot-pilot-state? (if (-> *target* next-state) (-> *target* next-state name) #f)))
+                   (not (blast-bot-ride?)))
                (zero? *blast-bot-despawn-step*)
                (< *blast-bot-follow-dist* (vector-vector-distance (-> this root trans) (-> *target* control trans))))
       (blast-bot-teleport-to this (-> *target* control trans))
