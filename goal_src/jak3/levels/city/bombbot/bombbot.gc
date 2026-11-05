@@ -1693,6 +1693,8 @@
     )
   )
 
+(define *bombbot-target-blast-bot* #t)   ;; #f = enemy bombbots ignore the blast bot again
+
 (defmethod bombbot-method-196 ((this bombbot) (arg0 vector))
   (let ((gp-0 (the-as process-drawable #f)))
     (let ((f30-0 (the-as float #x7f800000))
@@ -1728,6 +1730,24 @@
     (if (and *target* (< (vector-vector-distance (target-pos 0) arg0) (-> arg0 w)))
         (set! gp-0 *target*)
         )
+    ;; the blast bot is a target too (it is neither a vehicle nor Jak, so this search never looked at it); preferred when in range
+    (when *bombbot-target-blast-bot*
+      (let ((bb (as-type (blast-bot-find) process-focusable)))
+        (format 0 "Bombbot: retarget, blast bot ~A, ~f m away (range ~f m), Jak/vehicle pick ~A~%"
+                (if bb #t #f)
+                (if bb (/ (vector-vector-distance (-> bb root trans) arg0) 4096.0) -1.0)
+                (/ (-> arg0 w) 4096.0)
+                (if gp-0 (-> gp-0 type) #f)
+                )
+        (when (and bb
+                   (not (logtest? (-> bb focus-status) (focus-status disable dead)))
+                   (< (vector-vector-distance (-> bb root trans) arg0) (-> arg0 w))
+                   )
+          (set! gp-0 bb)
+          )
+        )
+      )
+    (format 0 "Bombbot: target is ~A~%" (if gp-0 (-> gp-0 type) #f))
     (cond
       (gp-0
         (vector-copy! (-> this target-pos) (get-trans (the-as process-focusable gp-0) 3))
@@ -3435,6 +3455,13 @@
   (go (method-of-object this hostile))
   )
 
+;; ---- Blast bot (blastbot-main-mod.gc, GAME): the Blow Barricade mission below uses it instead of the stock bombbot-player ----
+(define-extern blast-bot-find (function process))
+(define-extern spawn-my-bombbot (function none))
+(define-extern *blast-bot-barricade* symbol)
+(define-extern *blast-bot-barricade-phase* int)
+(define-extern *blast-bot-barricade-exploded* symbol)
+
 (deftype bombbot-player (bombbot)
   ((camera-x-angle  float)
    (hold-fire       symbol)
@@ -3936,6 +3963,14 @@
   )
 
 
+;; handle->process on a handle that was never set (no bot yet) reads a null pointer, so every lookup goes through here
+(defun barricade-bot ((tm task-manager-blow-barricade))
+  (if (nonzero? (-> tm bombbot-h))
+      (handle->process (-> tm bombbot-h))
+      (the-as process #f)
+      )
+  )
+
 (defstate active (task-manager-blow-barricade)
   :virtual #t
   :parent (task-manager-blow-barricade active)
@@ -3950,12 +3985,16 @@
       )
     )
   :enter (behavior ()
+    (format 0 "Barricade: active state enter~%")
     (set-time! (-> self state-time))
     )
   :exit (behavior ()
     (remove-setting! 'entity-name)
     )
   :trans (behavior ()
+    (if (not (time-elapsed? (-> self state-time) (seconds 0.3)))
+        (format 0 "Barricade: trans 1 (wall)~%")
+        )
     (let ((gp-0 (entity-by-name "krimson-wall-6")))
       (when gp-0
         (if (not (-> self wall-h))
@@ -3967,7 +4006,29 @@
             )
         )
       )
-    (if (and (zero? (-> self done?)) (not (handle->process (-> self bombbot-h))))
+    (if (not (time-elapsed? (-> self state-time) (seconds 0.3)))
+        (format 0 "Barricade: trans 2 (bot lookup)~%")
+        )
+    (when (and *blast-bot-barricade* (zero? (-> self done?)) (not (barricade-bot self)))
+      (let ((bot (blast-bot-find)))
+        (cond
+          (bot
+            (format 0 "Blast Bot: barricade mission found the bot~%")
+            (set! (-> self bombbot-h) (process->handle bot))
+            )
+          ((time-elapsed? (-> self state-time) (seconds 1.5))
+           ;; a normal frame, well after the mission started: same spawn as L1 + R3 / the auto-spawn
+           (format 0 "Blast Bot: barricade mission spawns the bot~%")
+           (spawn-my-bombbot)
+           (set-time! (-> self state-time))
+           )
+          )
+        )
+      )
+    (if (and (zero? (-> self done?))
+             (not (barricade-bot self))
+             (or (not *blast-bot-barricade*) (time-elapsed? (-> self state-time) (seconds 5)))
+             )
         (send-event self 'fail)
         )
     (let ((s3-0 (new 'static 'vector :x 4199997.5 :y 30146.56 :z 1763819.5 :w 1.0))
@@ -3975,7 +4036,16 @@
           (gp-1 (new 'stack-no-clear 'vector))
           (s5-1 (new 'stack-no-clear 'vector))
           )
-      (vector-copy! s5-1 (target-pos 0))
+      (if (not (time-elapsed? (-> self state-time) (seconds 0.3)))
+          (format 0 "Barricade: trans 3 (position)~%")
+          )
+      ;; the blast bot's position (Jak is parked inside it); Jak's / the stock bot's when there is no blast bot
+      (let ((bp (as-type (barricade-bot self) process-drawable)))
+        (if (and bp (!= (-> bp type) bombbot-player))
+            (vector-copy! s5-1 (-> bp root trans))
+            (vector-copy! s5-1 (target-pos 0))
+            )
+        )
       (if (and (< 4096000.0 (vector-vector-distance s5-1 s3-0))
                (< 819200.0 (vector-vector-distance s5-1 (-> self start-point)))
                )
@@ -3991,12 +4061,14 @@
                  )
         (set! (-> self done?) 1)
         (set-setting! 'entity-name "camera-305" 0.0 0)
-        (send-event (handle->process (-> self bombbot-h)) 'blow-wall)
+        (send-event (barricade-bot self) 'blow-wall)
         )
       )
     (when (= (-> self done?) 1)
-      (let ((v1-48 (handle->process (-> self bombbot-h))))
-        (when (and v1-48 (-> v1-48 next-state) (= (-> v1-48 next-state name) 'explode))
+      (let ((v1-48 (barricade-bot self)))
+        (when (or *blast-bot-barricade-exploded*
+                  (and v1-48 (-> v1-48 next-state) (= (-> v1-48 next-state name) 'explode))
+                  )
           (set! (-> self done?) 2)
           (let ((v1-55 (entity-by-name "krimson-wall-6")))
             (if v1-55
@@ -4081,15 +4153,34 @@
       )
     )
   (set-vector! (-> this start-point) 2538700.8 31539.2 6048399.5 1.0)
+  (set! *blast-bot-barricade-phase* 0)
+  (set! *blast-bot-barricade-exploded* #f)
   (when (or (zero? (-> this bombbot-h)) (not (handle->process (-> this bombbot-h))))
-    (let ((s5-1 (new 'stack 'bombbot-spawn-params)))
-      (set! (-> s5-1 nav-mesh) (get-nav-mesh (the-as actor-id #x48e9)))
-      (vector-copy! (-> s5-1 position) (-> this start-point))
-      (vector-copy! (-> s5-1 position) (target-pos 0))
-      (quaternion-copy! (-> s5-1 quat) (new 'static 'quaternion :y 0.841 :w 0.5409))
-      (set! (-> this bombbot-h)
-            (ppointer->handle (process-spawn bombbot-player s5-1 :name "bombbot-player" :to this))
+    ;; the blast bot does the mission. An existing bot is taken over here; when there is none the active state spawns it a
+    ;; moment later (spawning it in here, while the mission is still starting up, crashed the game). The stock bombbot-player is
+    ;; only used when *blast-bot-barricade* is #f.
+    (let ((bot (if *blast-bot-barricade* (blast-bot-find) (the-as process #f))))
+      (cond
+        (bot
+          (format 0 "Blast Bot: barricade mission uses the blast bot~%")
+          (set! (-> this bombbot-h) (process->handle bot))
+          )
+        (*blast-bot-barricade*
+          (format 0 "Blast Bot: barricade mission waits to spawn the bot~%")
+          )
+        (else
+          (format 0 "Blast Bot: barricade mission uses the stock bombbot-player~%")
+          (let ((s5-1 (new 'stack 'bombbot-spawn-params)))
+            (set! (-> s5-1 nav-mesh) (get-nav-mesh (the-as actor-id #x48e9)))
+            (vector-copy! (-> s5-1 position) (-> this start-point))
+            (vector-copy! (-> s5-1 position) (target-pos 0))
+            (quaternion-copy! (-> s5-1 quat) (new 'static 'quaternion :y 0.841 :w 0.5409))
+            (set! (-> this bombbot-h)
+                  (ppointer->handle (process-spawn bombbot-player s5-1 :name "bombbot-player" :to this))
+                  )
             )
+          )
+        )
       )
     )
   (set! (-> this done?) 0)

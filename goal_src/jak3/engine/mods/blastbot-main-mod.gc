@@ -528,6 +528,233 @@
   (none)
   )
 
+;; ---- Green eco (jetboard style) ------------------------------------------------------------------------------------
+;; The bot owns its own green eco (Jak never gets it while he sits in the bot): a green eco vent fills it (the 'get-pickup handler
+;; in the active state routes eco-green here), and while it is above 0 the four feet spread it: every *blast-bot-green-pulse-time*
+;; seconds each foot sends 'green-eco-attack to everything within *blast-bot-green-radius* (the same event the jetboard's circle
+;; zap sends, it kills the dark eco plants, mh-plant.gc) and shows the board's green zap particles. One round of pulses costs
+;; *blast-bot-green-pulse-cost* of the *blast-bot-green-max* units, like the jetboard's 5 of 100.
+(define *blast-bot-green-eco* 0.0)
+(define *blast-bot-green-max* 100.0)
+(define *blast-bot-green-pulse-time* 2.0)      ;; seconds between two pulses
+(define *blast-bot-green-pulse-cost* 5.0)      ;; eco used per pulse round (all four feet)
+(define *blast-bot-green-radius* 24576.0)      ;; reach of one foot (6 m); the jetboard zap uses 12 m around Jak
+(define *blast-bot-green-next* (the-as time-frame 0))
+(define *blast-bot-green-particles* #t)   ;; the board's green zap ring around the bot (#f = no ring)
+(define *blast-bot-green-sparks* #t)      ;; one-shot sparks at the 4 feet (same launch-particles path the beam uses)
+(define *blast-bot-green-kill* #t)        ;; #f = do not send 'green-eco-attack (crash isolation)
+(define *blast-bot-green-log* #t)         ;; prints one line per step of a pulse
+
+;; The board's zap particles (parts 678/679, :func 'board-zap-track, :userdata 37.0) snap every particle to joint 37 of the process that
+;; spawned the tracker. The bot has no joint 37 (that read crashed the game), so for the bot the particle goes to the bot's position
+;; instead. Anything else (Jak's own zap) takes the original path unchanged.
+(defun board-zap-track ((arg0 sparticle-system) (arg1 sparticle-cpuinfo) (arg2 vector))
+  (let ((proc (ppointer->process (-> arg1 key proc parent))))
+    (if (type? proc blast-bot-player)
+        (let ((bot-pos (-> (the-as blast-bot-player proc) root trans)))
+          (set! (-> arg2 x) (-> bot-pos x))
+          (set! (-> arg2 y) (+ 2048.0 (-> bot-pos y)))
+          (set! (-> arg2 z) (-> bot-pos z))
+          )
+        (let* ((a1-1 (the int (-> arg1 user-float)))
+               (v1-5 (vector<-cspace! (new 'stack-no-clear 'vector) (-> (the-as process-drawable proc) node-list data a1-1)))
+               )
+          (set! (-> arg2 x) (-> v1-5 x))
+          (set! (-> arg2 y) (-> v1-5 y))
+          (set! (-> arg2 z) (-> v1-5 z))
+          )
+        )
+    )
+  0
+  (none)
+  )
+
+(defun blast-bot-green-eco-add! ((amount float))
+  (set! *blast-bot-green-eco* (fmin *blast-bot-green-max* (+ *blast-bot-green-eco* amount)))
+  (none)
+  )
+
+(defun blast-bot-green-pulse ((this blast-bot-player))
+  ;; one round: particles at every foot + the event to everything near any foot (each thing is sent it once)
+  (if *blast-bot-green-log* (format 0 "Blast Bot: green pulse begin~%"))
+  (when *blast-bot-green-sparks*
+    (dotimes (i 4)
+      (launch-particles (-> *part-id-table* 2062) (-> this foot-pos i))
+      )
+    )
+  (when *blast-bot-green-particles*
+    ;; the board's world-position spawn (see land-poof in target-board.gc); the ring follows the bot via board-zap-track (redefined above)
+    (matrix-identity! *launch-matrix*)
+    (vector-copy! (-> *launch-matrix* trans) (-> this root trans))
+    (if (logtest? (-> group-board-green-eco-zap-attack flags) (sp-group-flag sp13))
+        (part-tracker-spawn part-tracker-subsampler :to this :group group-board-green-eco-zap-attack)
+        (part-tracker-spawn part-tracker :to this :group group-board-green-eco-zap-attack)
+        )
+    )
+  (if *blast-bot-green-log* (format 0 "Blast Bot: green pulse particles done~%"))
+  (when *blast-bot-green-kill*
+  (let ((box (new 'stack-no-clear 'vector))
+        (hits (new 'stack-no-clear 'array 'collide-shape 128))
+        )
+    (vector-copy! box (-> this root trans))
+    (set! (-> box w) (+ 49152.0 *blast-bot-green-radius*))   ;; feet are at most ~12 m from the body centre
+    (countdown (n (fill-actor-list-for-box *actor-hash* box hits 128))
+      (let ((cs (as-type (-> hits n) collide-shape)))
+        (when cs
+          (let ((p (as-type (-> cs process) process-focusable)))
+            (when (and p
+                       (!= p this)
+                       (!= p *target*)
+                       (not (blast-bot-ally? p))
+                       ;; a plant that is already dying must not get 'green-eco-attack again (die would restart and
+                       ;; its exit would report another plant death to the task every pulse)
+                       (not (and (-> p next-state) (= (-> p next-state name) 'die)))
+                       )
+              (let ((near #f))
+                (dotimes (i 4)
+                  (if (< (vector-vector-distance (-> p root trans) (-> this foot-pos i)) *blast-bot-green-radius*)
+                      (set! near #t)
+                      )
+                  )
+                (if near
+                    (send-event p 'green-eco-attack)
+                    )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+  (if *blast-bot-green-log* (format 0 "Blast Bot: green pulse end~%"))
+  (none)
+  )
+
+;; The stock green vent (ecovent, vent.gc) hands out eco-green only while Jak rides the jetboard with the board-trail feature
+;; (its touch handler checks (focus-test? *target* board)), so the bot's leg touches never fill it. The bot therefore reads the
+;; vents itself: while a foot is within *blast-bot-green-vent-range* (horizontal) of a waiting ecovent the eco fills at
+;; *blast-bot-green-vent-rate* units per second. The vent is not used up (stock vents do not run dry either).
+(define *blast-bot-green-vent-range* 14336.0)   ;; 3.5 m, the vent's own touch sphere is 3 m
+(define *blast-bot-green-vent-rate* 100.0)      ;; units per second: 100 = full in one second
+(define *blast-bot-green-vent* #t)
+
+(defun blast-bot-green-vent-update ((this blast-bot-player))
+  (when (and *blast-bot-green-vent* (< *blast-bot-green-eco* *blast-bot-green-max*))
+    (let ((p (-> *entity-pool* child))
+          (found #f)
+          )
+      (while (and p (not found))
+        (let ((proc (the-as process (-> p 0))))
+          (when (and (= (-> (-> proc type) symbol) 'ecovent)
+                     (-> proc next-state)
+                     (= (-> proc next-state name) 'vent-wait-for-touch)
+                     )
+            (let ((pd (as-type proc process-drawable)))
+              (when pd
+                (dotimes (i 4)
+                  (if (and (< (vector-vector-xz-distance (-> this foot-pos i) (-> pd root trans)) *blast-bot-green-vent-range*)
+                           (< (fabs (- (-> this foot-pos i y) (-> pd root trans y))) 14336.0)
+                           )
+                      (set! found #t)
+                      )
+                  )
+                )
+              )
+            )
+          )
+        (set! p (-> p 0 brother))
+        )
+      (if found
+          (blast-bot-green-eco-add! (* *blast-bot-green-vent-rate* (seconds-per-frame)))
+          )
+      )
+    )
+  (none)
+  )
+
+;; ---- Green eco trail on the legs ---------------------------------------------------------------------------------------
+;; While the bot has green eco (*blast-bot-green-eco* > 0) every leg leaves a green glowing trail: a few world-space glow particles
+;; are dropped along each leg (hip->knee middle, knee, knee->foot middle, foot) every *blast-bot-green-trail-time* seconds. They stay
+;; where they were dropped and fade out over half a second, so a walking leg draws a ribbon behind it. The knee and the foot are read
+;; from the leg's IK joint the same way blast-bot-ride-leg-callback does (foot = knee + knee uvec * hand-dist), so the trail follows
+;; the real foot while it is stepping, not just the planted position.
+;; (The stock light-trail system is not used: its curve types are not part of the files loaded here, particles are the same path
+;; as the green zap sparks above.)
+(define *blast-bot-green-trail* #t)             ;; #f = no leg trail
+(define *blast-bot-green-trail-time* 0.05)      ;; seconds between two drops (0.05 = every 3rd frame at 60 fps)
+(define *blast-bot-green-trail-next* (the-as time-frame 0))
+
+;; id 2100: pick another number if it clashes with a defpart in another of your files
+(defpart 2100
+  :init-specs ((:texture (glow-hotdot level-default-sprite))
+    (:num 1.0)
+    (:scale-x (meters 0.7) (meters 0.2))
+    (:rot-x (degrees 1.125))
+    (:scale-y :copy scale-x)
+    (:r 40.0 40.0)
+    (:g 255.0)
+    (:b 40.0 40.0)
+    (:a 110.0 30.0)
+    (:scalevel-x (meters -0.012))
+    (:scalevel-y :copy scalevel-x)
+    (:fade-a -0.3)
+    (:timer (seconds 0.5))
+    (:flags (sp-cpuinfo-flag-2 sp-cpuinfo-flag-14 glow))
+    (:userdata 1.0)
+    )
+  )
+
+(defun blast-bot-green-trail ((this blast-bot-player))
+  (when (and *blast-bot-green-trail*
+             (< 0.0 *blast-bot-green-eco*)
+             (>= (current-time) *blast-bot-green-trail-next*)
+             )
+    (set! *blast-bot-green-trail-next*
+          (+ (current-time) (the int (* *blast-bot-green-trail-time* (the float (seconds 1)))))
+          )
+    (let ((hip (new 'stack-no-clear 'vector))
+          (knee (new 'stack-no-clear 'vector))
+          (tip (new 'stack-no-clear 'vector))
+          (mid (new 'stack-no-clear 'vector))
+          )
+      (dotimes (i 4)
+        (let* ((cs (-> this node-list data (-> *blast-bot-elbows* i)))
+               (kmat (-> cs bone transform))
+               )
+          (matrix->trans (-> cs parent bone transform) hip)
+          (matrix->trans kmat knee)
+          (vector-copy! tip knee)
+          (vector+*! tip tip (-> kmat uvec) (-> this joint-ik i hand-dist))
+          ;; upper leg: middle, then the knee
+          (vector-lerp! mid hip knee 0.5)
+          (launch-particles (-> *part-id-table* 2100) mid)
+          (launch-particles (-> *part-id-table* 2100) knee)
+          ;; lower leg: middle, then the foot
+          (vector-lerp! mid knee tip 0.5)
+          (launch-particles (-> *part-id-table* 2100) mid)
+          (launch-particles (-> *part-id-table* 2100) tip)
+          )
+        )
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-green-update ((this blast-bot-player))
+  ;; call every frame from the active state
+  (blast-bot-green-vent-update this)
+  (blast-bot-green-trail this)
+  (when (and (< 0.0 *blast-bot-green-eco*)
+             (>= (current-time) *blast-bot-green-next*)
+             )
+    (set! *blast-bot-green-next* (+ (current-time) (the int (* *blast-bot-green-pulse-time* (the float (seconds 1))))))
+    (blast-bot-green-pulse this)
+    (set! *blast-bot-green-eco* (fmax 0.0 (- *blast-bot-green-eco* *blast-bot-green-pulse-cost*)))
+    )
+  (none)
+  )
+
 (defun blast-bot-foot-landed ((this blast-bot-player) (i int))
   ;; A foot just planted: footstep camera shake (only while walking) + stomp.
   (when (< 0.2 (-> this speed))
@@ -3895,10 +4122,115 @@
   (none)
   )
 
+;; ---- Blow Barricade mission (city-blow-barricade) -----------------------------------------------------------------------
+;; The mission is task-manager-blow-barricade in bombbot.gc. Stock, it spawns its own player bombbot, drives the "reach the wall"
+;; check from it, sends it 'blow-wall (it walks to the wall by itself and explodes) and waits for its state to be 'explode.
+;; Here the mission uses the blast bot instead (the redefinitions of set-time-limit and of the manager's active state are at the
+;; end of this file). The bot side: 'blow-wall starts phase 1 (the bot walks to the wall by itself, the stick is ignored), at the
+;; wall it explodes (phase 2, visual only, Jak is NOT killed) and then Jak is released and the bot removed (phase 3, the same
+;; release as L1 + Triangle). *blast-bot-barricade-exploded* is what the mission waits for.
+(define *blast-bot-barricade* #t)                 ;; #f = the mission spawns the stock bombbot-player again
+(define *blast-bot-barricade-phase* 0)            ;; 0 normal, 1 walking to the wall, 2 exploding, 3 releasing Jak
+(define *blast-bot-barricade-exploded* #f)
+(define *blast-bot-barricade-time* (the-as time-frame 0))
+(define *blast-bot-barricade-target* (new 'static 'vector :x 4290273.5 :y 29286.4 :z 1817763.9 :w 1.0))  ;; same point the stock bombbot walks to
+(define *blast-bot-barricade-speed* 0.7)          ;; fraction of the bot's full walking speed
+(define *blast-bot-barricade-reach* 24576.0)      ;; explodes this close to the wall point (6 m; the bot is ~8 m long)
+(define *blast-bot-barricade-timeout* 10.0)       ;; seconds: explodes anyway if it cannot get there
+(define-extern despawn-my-bombbot (function none))
+
+(defun blast-bot-barricade-boom ((this blast-bot-player))
+  (format 0 "Blast Bot: barricade explosion~%")
+  (set! *blast-bot-barricade-exploded* #t)
+  (let ((prim (-> this root root-prim)))
+    (set! (-> prim prim-core collide-as) (collide-spec))
+    (set! (-> prim prim-core collide-with) (collide-spec))
+    )
+  (let ((a (-> this aggro-shape)))
+    (if (nonzero? a)
+        (set! (-> a root-prim prim-core collide-as) (collide-spec))
+        )
+    )
+  (logior! (-> this draw status) (draw-control-status no-draw))
+  (when (and group-kg-huge-explosion (nonzero? group-kg-huge-explosion))
+    (let ((gp (new 'stack-no-clear 'explosion-init-params)))
+      (vector-copy! (-> gp spawn-point) (-> this root trans))
+      (+! (-> gp spawn-point y) 12288.0)
+      (quaternion-identity! (-> gp spawn-quat))
+      (set! (-> gp radius) 61440.0)
+      (set! (-> gp scale) 1.0)
+      (set! (-> gp group) group-kg-huge-explosion)
+      (set! (-> gp collide-with) (collide-spec))
+      (set! (-> gp damage) 0.0)
+      (set! (-> gp damage-scale) 1.0)
+      (set! (-> gp vehicle-damage-factor) 1.0)
+      (set! (-> gp vehicle-impulse-factor) 1.0)
+      (set! (-> gp ignore-proc) (process->handle #f))
+      (explosion-spawn gp this)
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-barricade-update ((this blast-bot-player))
+  ;; every frame from the active state (before the stick is read)
+  (case *blast-bot-barricade-phase*
+    ((1)
+     (let* ((dx (- (-> *blast-bot-barricade-target* x) (-> this root trans x)))
+            (dz (- (-> *blast-bot-barricade-target* z) (-> this root trans z)))
+            (dist (sqrtf (+ (* dx dx) (* dz dz))))
+            )
+       (cond
+         ((or (< dist *blast-bot-barricade-reach*)
+              (>= (current-time) (+ *blast-bot-barricade-time* (the int (* *blast-bot-barricade-timeout* (the float (seconds 1))))))
+              )
+          (set! *blast-bot-barricade-phase* 2)
+          (set! *blast-bot-barricade-time* (current-time))
+          (blast-bot-barricade-boom this)
+          )
+         (else
+           (let ((move (new 'stack-no-clear 'vector))
+                 (amount (* 49152.0 *blast-bot-barricade-speed* (seconds-per-frame)))
+                 )
+             (set-vector! move (/ dx dist) 0.0 (/ dz dist) 1.0)
+             (set! (-> this input-yaw) (vector-y-angle move))
+             (set! (-> this input-active) #t)
+             (blast-bot-move-xz this (* (-> move x) amount) (* (-> move z) amount))
+             )
+           )
+         )
+       )
+     )
+    ((2)
+     ;; wait for the explosion (our child) to finish, then let Jak go
+     (when (or (not (-> this child))
+               (>= (current-time) (+ *blast-bot-barricade-time* (seconds 4)))
+               )
+       (set! *blast-bot-barricade-phase* 3)
+       )
+     )
+    ((3)
+     (if (zero? *blast-bot-despawn-step*)
+         (despawn-my-bombbot)
+         )
+     )
+    )
+  (none)
+  )
+
 (defstate active (blast-bot-player)
   :virtual #t
   :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
     (case message
+      (('blow-wall)
+       ;; the Blow Barricade mission (task-manager-blow-barricade) asks the bot to go and blow the wall
+       (when (zero? *blast-bot-barricade-phase*)
+         (format 0 "Blast Bot: blow-wall, walking to the barricade~%")
+         (set! *blast-bot-barricade-phase* 1)
+         (set! *blast-bot-barricade-time* (current-time))
+         )
+       #t
+       )
       (('touched)
        ;; A leg/body sphere overlapped something. Like Jak's punch, hit whatever it is and let the other side decide
        ;; (crates, walls, pickups and enemies each have their own 'attack handler).
@@ -3972,11 +4304,20 @@
          )
        )
       (('get-pickup)
-       ;; orbs/cells are collected by touching them; Jak is the one who actually owns the inventory
-       (if *target*
+       ;; orbs/cells are collected by touching them; Jak is the one who actually owns the inventory.
+       ;; Green eco (the vents) belongs to the bot: its feet spread it (blast-bot-green-update)
+       (cond
+         ((= (-> block param 0) (pickup-type eco-green))
+          (blast-bot-green-eco-add! (the-as float (-> block param 1)))
+          #t
+          )
+         (*target*
            (send-event *target* 'get-pickup (-> block param 0) (-> block param 1))
+           )
+         (else
            #f
            )
+         )
        )
       (('fire)
        (blast-bot-turret-fire self proc)
@@ -4048,7 +4389,8 @@
                  )
         (set! (-> self health) (fmin (-> self max-health) (+ (-> self health) (* *blast-bot-regen-rate* dt))))
         )
-      (when (and (< 0.05 speed) (not *blast-bot-spy-active*) (not (blast-bot-ride?)))
+      (blast-bot-barricade-update self)
+      (when (and (< 0.05 speed) (zero? *blast-bot-barricade-phase*) (not *blast-bot-spy-active*) (not (blast-bot-ride?)))
         (let ((move (new 'stack-no-clear 'vector)))
           (vector-copy! move (-> *math-camera* inv-camera-rot fvec))
           (set! (-> move y) 0.0)
@@ -4258,6 +4600,7 @@
       )
     (blast-bot-update-aim self)
     (blast-bot-update-hud self)
+    (blast-bot-green-update self)
     (blast-bot-draw-shield-status self)
     (if *blast-bot-legs-on*
         (blast-bot-update-legs self)
@@ -4436,6 +4779,10 @@
   ;; same as bombbot.gc: give the unused stack back to the process heap BEFORE any (new 'process ...) allocation
   (stack-size-set! (-> self main-thread) 512)
   (format 0 "Blast Bot: init begin~%")
+  (set! *blast-bot-green-eco* 0.0)
+  (set! *blast-bot-green-next* (the-as time-frame 0))
+  (set! *blast-bot-green-trail-next* (the-as time-frame 0))
+  (set! *blast-bot-barricade-phase* 0)
   (format 0 "Blast Bot: leg limbs with spheres: ~D~%" *blast-bot-leg-limbs*)
   ;; same constructor + setup as bombbot.gc. The plain collide-shape + (collide-list-enum player) combo printed
   ;; "Unsupported collide-list-enum" and left the shape half-initialised. Enemies find the bot via the aggro shape below.
