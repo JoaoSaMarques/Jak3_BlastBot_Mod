@@ -1733,12 +1733,6 @@
     ;; the blast bot is a target too (it is neither a vehicle nor Jak, so this search never looked at it); preferred when in range
     (when *bombbot-target-blast-bot*
       (let ((bb (as-type (blast-bot-find) process-focusable)))
-        (format 0 "Bombbot: retarget, blast bot ~A, ~f m away (range ~f m), Jak/vehicle pick ~A~%"
-                (if bb #t #f)
-                (if bb (/ (vector-vector-distance (-> bb root trans) arg0) 4096.0) -1.0)
-                (/ (-> arg0 w) 4096.0)
-                (if gp-0 (-> gp-0 type) #f)
-                )
         (when (and bb
                    (not (logtest? (-> bb focus-status) (focus-status disable dead)))
                    (< (vector-vector-distance (-> bb root trans) arg0) (-> arg0 w))
@@ -1747,7 +1741,6 @@
           )
         )
       )
-    (format 0 "Bombbot: target is ~A~%" (if gp-0 (-> gp-0 type) #f))
     (cond
       (gp-0
         (vector-copy! (-> this target-pos) (get-trans (the-as process-focusable gp-0) 3))
@@ -3337,7 +3330,6 @@
           )
         )
       )
-    (format 0 "Bomb-bot: retarget, picked ~A~%" (if gp-0 (-> gp-0 type) #f))
     (cond
       (gp-0
         (vector-copy! (-> this target-pos) (get-trans gp-0 3))
@@ -3989,16 +3981,12 @@
       )
     )
   :enter (behavior ()
-    (format 0 "Barricade: active state enter~%")
     (set-time! (-> self state-time))
     )
   :exit (behavior ()
     (remove-setting! 'entity-name)
     )
   :trans (behavior ()
-    (if (not (time-elapsed? (-> self state-time) (seconds 0.3)))
-        (format 0 "Barricade: trans 1 (wall)~%")
-        )
     (let ((gp-0 (entity-by-name "krimson-wall-6")))
       (when gp-0
         (if (not (-> self wall-h))
@@ -4010,19 +3998,14 @@
             )
         )
       )
-    (if (not (time-elapsed? (-> self state-time) (seconds 0.3)))
-        (format 0 "Barricade: trans 2 (bot lookup)~%")
-        )
     (when (and *blast-bot-barricade* (zero? (-> self done?)) (not (barricade-bot self)))
       (let ((bot (blast-bot-find)))
         (cond
           (bot
-            (format 0 "Blast Bot: barricade mission found the bot~%")
             (set! (-> self bombbot-h) (process->handle bot))
             )
           ((time-elapsed? (-> self state-time) (seconds 1.5))
            ;; a normal frame, well after the mission started: same spawn as L1 + R3 / the auto-spawn
-           (format 0 "Blast Bot: barricade mission spawns the bot~%")
            (spawn-my-bombbot)
            (set-time! (-> self state-time))
            )
@@ -4039,9 +4022,6 @@
           (s4-0 (new 'stack-no-clear 'vector))
           (gp-1 (new 'stack-no-clear 'vector))
           (s5-1 (new 'stack-no-clear 'vector))
-          )
-      (if (not (time-elapsed? (-> self state-time) (seconds 0.3)))
-          (format 0 "Barricade: trans 3 (position)~%")
           )
       ;; the blast bot's position (Jak is parked inside it); Jak's / the stock bot's when there is no blast bot
       (let ((bp (as-type (barricade-bot self) process-drawable)))
@@ -4166,14 +4146,12 @@
     (let ((bot (if *blast-bot-barricade* (blast-bot-find) (the-as process #f))))
       (cond
         (bot
-          (format 0 "Blast Bot: barricade mission uses the blast bot~%")
           (set! (-> this bombbot-h) (process->handle bot))
           )
         (*blast-bot-barricade*
-          (format 0 "Blast Bot: barricade mission waits to spawn the bot~%")
+          ;; no blast bot yet: the active state spawns it a moment later
           )
         (else
-          (format 0 "Blast Bot: barricade mission uses the stock bombbot-player~%")
           (let ((s5-1 (new 'stack 'bombbot-spawn-params)))
             (set! (-> s5-1 nav-mesh) (get-nav-mesh (the-as actor-id #x48e9)))
             (vector-copy! (-> s5-1 position) (-> this start-point))

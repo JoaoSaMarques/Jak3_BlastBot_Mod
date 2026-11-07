@@ -348,7 +348,7 @@
 (define *blast-bot-leg-limbs* 4)  ;; how many legs get collision spheres (0..4)
 (define *blast-bot-reach-hack* #t)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
 
-(define *blast-bot-attack-debug* #f)   ;; TEMPORARY while checking the enemy bombbot: prints every attack that reaches the bot
+(define *blast-bot-attack-debug* #f)
 ;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
 ;; #f = he just walks away from the wreck
 (define *blast-bot-death-kills-jak* #t)
@@ -465,6 +465,25 @@
       ;; the L2 spy droid you steer (blastbot-spybot.gc loads after this file, so it is matched by type name)
       (= (-> p type symbol) 'spy-bot-player)
       )
+  )
+
+;; The forest bridge boards (for-break-bridge-board and its a-d variants, forest-bridges.gc, FRSTA level, so matched by type name).
+;; They only break from a hoverboard 'attack ('board / 'flop / 'uppercut) or a 'trigger. The legs' generic 'explode attack was ignored,
+;; so the bot walked over them and nothing happened: touching one now sends the 'trigger.
+(define *blast-bot-break-bridges* #t)
+
+(defun blast-bot-bridge? ((p process))
+  (let ((found #f)
+        (ty (-> p type))
+        )
+    (while (and (not found) ty)
+      (if (= (-> ty symbol) 'for-break-bridge-board)
+          (set! found #t)
+          )
+      (set! ty (if (= ty (-> ty parent)) (the-as type #f) (-> ty parent)))
+      )
+    found
+    )
   )
 
 ;; The volcano stone lid (vol-stone-lid, volcano-obs2.gc) is spared too: touching it with the bot's legs crashed the game, its
@@ -2319,10 +2338,10 @@
 (define *blast-bot-super-jump* #t)          ;; #f: no super jump
 (define *blast-bot-super* #f)               ;; the crouch that is going on is a super charge
 (define *blast-bot-super-shake* 0.0)        ;; the shake offset currently added to crouch-depth (taken back out every frame)
-(define *blast-bot-super-min* 0.8)          ;; seconds of holding L1 before the launch speed starts to ramp up (below that it is the minimum super jump)
-(define *blast-bot-super-full* 1.8)         ;; seconds of holding L1 for a full charge
+(define *blast-bot-super-min* 0.2)          ;; seconds of holding L1 before the launch speed starts to ramp up (below that it is the minimum super jump)
+(define *blast-bot-super-full* 1.5)         ;; seconds of holding L1 for a full charge
 (define *blast-bot-super-depth* 12288.0)    ;; how deep the bot bunkers (normal jump crouch: 10240)
-(define *blast-bot-super-vy-min* 163840.0)  ;; launch speed at the minimum charge (a normal jump is 141000)
+(define *blast-bot-super-vy-min* 61440.0)  ;; launch speed at the minimum charge (a normal jump is 141000)
 (define *blast-bot-super-vy-max* 184320.0)  ;; launch speed at full charge (about 40 m high)
 (define *blast-bot-super-fuel-min* 0.25)    ;; thruster fuel the launch uses at the minimum charge (25%)
 (define *blast-bot-super-fuel-max* 0.5)     ;; thruster fuel the launch uses at full charge (50%)
@@ -2939,7 +2958,6 @@
 ;; same event Jak's punch sends, so the charge sends exactly that and nothing else. Matched by type name (volcano types are not
 ;; loaded with this file).
 (define *blast-bot-push-lid* #t)                       ;; #f = the charge ignores the lid
-(define *blast-bot-lid-log-id* (the-as uint 0))
 
 (defun blast-bot-stone-lid? ((p process))
   (let ((found #f)
@@ -2980,11 +2998,6 @@
             )
           (let ((d (-> cs process)))
             (when (and d *blast-bot-push-lid* (blast-bot-stone-lid? d))
-              ;; printed once per charge: when the game dies right after this line, the lid's 'attack handler is the culprit
-              (when (!= *blast-bot-lid-log-id* (-> this dash-id))
-                (set! *blast-bot-lid-log-id* (-> this dash-id))
-                (format 0 "Blast Bot: charge hits the stone lid ~A, sending 'attack~%" d)
-                )
               (send-event d 'attack #f
                           (blast-bot-credit-jak!
                             (static-attack-info ((id (-> this dash-id)) (damage 6.0) (mode 'explode)))))
@@ -4173,7 +4186,6 @@
 (define-extern despawn-my-bombbot (function none))
 
 (defun blast-bot-barricade-boom ((this blast-bot-player))
-  (format 0 "Blast Bot: barricade explosion~%")
   (set! *blast-bot-barricade-exploded* #t)
   (let ((prim (-> this root root-prim)))
     (set! (-> prim prim-core collide-as) (collide-spec))
@@ -4258,7 +4270,6 @@
       (('blow-wall)
        ;; the Blow Barricade mission (task-manager-blow-barricade) asks the bot to go and blow the wall
        (when (zero? *blast-bot-barricade-phase*)
-         (format 0 "Blast Bot: blow-wall, walking to the barricade~%")
          (set! *blast-bot-barricade-phase* 1)
          (set! *blast-bot-barricade-time* (current-time))
          )
@@ -4289,14 +4300,17 @@
                (blast-lifesteal-dealt 2.0 #f)   ;; Mass Inverter lifesteal: once per leg attack id (0.4 s), enemies only
                )
            )
-         (send-event proc 'attack (-> block param 0)
-                     (blast-bot-credit-melee!
-                       (static-attack-info :mask (penetrate-using)
-                                           ((id (-> self leg-id))
-                                            (damage 2.0)
-                                            (mode 'explode)
-                                            (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
-                                            )) proc))
+         (if (and *blast-bot-break-bridges* (blast-bot-bridge? proc))
+             (send-event proc 'trigger)
+             (send-event proc 'attack (-> block param 0)
+                         (blast-bot-credit-melee!
+                           (static-attack-info :mask (penetrate-using)
+                                               ((id (-> self leg-id))
+                                                (damage 2.0)
+                                                (mode 'explode)
+                                                (penetrate-using (penetrate generic-attack punch spin flop mech-punch explode))
+                                                )) proc))
+             )
          )
        #t
        )
@@ -4317,11 +4331,10 @@
                (let* ((b (new 'stack-no-clear 'event-message-block))
                       (e (as-type proc enemy))
                       (swing-id (if e (-> e attack-id) (the-as uint 0)))
-                    (damage (if e (the float (-> e enemy-info attack-damage)) 1.0))
-                    )
+                      )
                  ;; one swing = one hit: hand over the attacker's own attack id, same as shots do
                  (set! (-> b param 1)
-                     (the-as uint (static-attack-info ((id swing-id) (damage damage)))))
+                       (the-as uint (static-attack-info ((id swing-id) (damage 1.0)))))
                  (!= (blast-bot-attack-result self proc b) 0)
                  )
                )

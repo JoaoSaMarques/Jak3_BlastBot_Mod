@@ -63,8 +63,69 @@
       0
       )
 
+    ;; ---- Mission failed while the bot is carrying Jak -------------------------------------------------------------------------------
+    ;; task-control.gc: the manager's fail state spawns a resetter, and the resetter loops (every frame) sending Jak 'attack-invinc
+    ;; until Jak accepts it or is dead, before it shows "Mission Failed" and restarts at the checkpoint. A Jak parked in the bot's
+    ;; grab-ride never accepts it, so the fail speech played and nothing else happened (the statues never reset either).
+    ;; So while a task manager is in its fail state, or a resetter exists, the bot lets Jak go (the same release as L1 + Triangle)
+    ;; and the auto-spawn waits; once the failure sequence is over the bot comes back on its own.
+    (define *blast-bot-fail-count* 0)                       ;; task managers currently in their fail state
+    (define *blast-bot-fail-watch-next* (the-as time-frame 0))
+    (define *blast-bot-release-on-fail* #t)                 ;; #f = the bot stays on Jak when a mission fails (old behaviour)
+    (define-extern blast-bot-fail-walk (function process-tree int))
+
+    (defun blast-bot-has-type? ((p process) (name symbol))
+      (let ((found #f)
+            (ty (-> p type))
+            )
+        (while (and (not found) ty)
+          (if (= (-> ty symbol) name)
+              (set! found #t)
+              )
+          (set! ty (if (= ty (-> ty parent)) (the-as type #f) (-> ty parent)))
+          )
+        found
+        )
+      )
+
+    ;; counts the task managers in their fail state and every live resetter (the process the fail state spawns for the
+    ;; "Mission Failed" screen and the checkpoint restart)
+    (defun blast-bot-fail-walk ((tree process-tree))
+      (let ((count 0)
+            (p (-> tree child))
+            )
+        (while p
+          (let ((next (-> p 0 brother))
+                (proc (the-as process (-> p 0)))
+                )
+            (when (or (and (blast-bot-has-type? proc 'task-manager) (-> proc next-state) (= (-> proc next-state name) 'fail))
+                      (blast-bot-has-type? proc 'resetter)
+                      )
+              (set! count (+ count 1))
+              )
+            (set! count (+ count (blast-bot-fail-walk (-> p 0))))
+            (set! p next)
+            )
+          )
+        count
+        )
+      )
+
+    (defun blast-bot-fail-watch ()
+      (when (>= (current-time) *blast-bot-fail-watch-next*)
+        (set! *blast-bot-fail-watch-next* (+ (current-time) (seconds 0.25)))
+        (let ((n (blast-bot-fail-walk *active-pool*)))
+          (set! *blast-bot-fail-count* n)
+          (when (and *blast-bot-release-on-fail* (> n 0) (blast-bot-find) (zero? *blast-bot-despawn-step*))
+            (despawn-my-bombbot)
+            )
+          )
+        )
+      0
+      )
+
     (defun blast-bot-spawn-watch ()
-      (when (and (or *blast-bot-always* *blast-bot-mech-resume*) *target* (not *blast-bot-dismissed*))
+      (when (and (or *blast-bot-always* *blast-bot-mech-resume*) *target* (not *blast-bot-dismissed*) (zero? *blast-bot-fail-count*))
         ;; every spawn is a new target process, so a new handle means Jak just (re)spawned
         ;; compare the 32-bit process id: a handle is 64-bit and a global symbol only keeps 32 bits, so it never matched
         (let ((h (the-as int (-> *target* pid))))
@@ -168,6 +229,124 @@
       0
       )
 
+    ;; ---- Debug commands (type them in the REPL) ----------------------------------------------------------------------------
+    ;; (find-process "lid")   every live process whose name contains the text: name, type, position
+    ;; (find-lid)             the same for "lid", plus the vol-stone-lid-1 entity (position, level, whether it has a process)
+    ;; (find-entity "name")   an entity by its exact name (the names the debug entity labels show): position, level, process
+    ;; (goto-entity "name")   moves the blast bot (or Jak when there is no bot) 10 m above that entity
+    (define-extern find-process-walk (function process-tree string int))
+
+    (defun cmd-name-has? ((name string) (pat string))
+      (let ((nl (length name))
+            (pl (length pat))
+            (found #f)
+            )
+        (dotimes (i (max 0 (+ (- nl pl) 1)))
+          (when (not found)
+            (let ((ok #t))
+              (dotimes (j pl)
+                (if (!= (-> name data (+ i j)) (-> pat data j))
+                    (set! ok #f)
+                    )
+                )
+              (if ok
+                  (set! found #t)
+                  )
+              )
+            )
+          )
+        found
+        )
+      )
+
+    (defun find-process-walk ((tree process-tree) (pat string))
+      (let ((count 0)
+            (p (-> tree child))
+            )
+        (while p
+          (let ((next (-> p 0 brother))
+                (proc (the-as process (-> p 0)))
+                )
+            (when (and (type? proc process) (-> proc name) (cmd-name-has? (-> proc name) pat))
+              (set! count (+ count 1))
+              (let ((pd (as-type proc process-drawable)))
+                (if (and pd (nonzero? (-> pd root)))
+                    (format 0 "  ~A  [~A]  at ~M ~M ~M~%" (-> proc name) (-> proc type)
+                            (-> pd root trans x) (-> pd root trans y) (-> pd root trans z))
+                    (format 0 "  ~A  [~A]~%" (-> proc name) (-> proc type))
+                    )
+                )
+              )
+            (set! count (+ count (find-process-walk (-> p 0) pat)))
+            (set! p next)
+            )
+          )
+        count
+        )
+      )
+
+    (defun find-process ((pat string))
+      (format 0 "find-process \"~S\":~%" pat)
+      (let ((n (find-process-walk *active-pool* pat)))
+        (format 0 "  ~D match(es)~%" n)
+        n
+        )
+      )
+
+    (defun find-entity ((name string))
+      (let ((e (entity-by-name name)))
+        (cond
+          (e
+            (format 0 "entity ~S: at ~M ~M ~M, level ~A, process ~A~%" name
+                    (-> e trans x) (-> e trans y) (-> e trans z)
+                    (if (-> e extra level) (-> e extra level name) #f)
+                    (if (-> e extra process) (-> (-> e extra process) type) #f)
+                    )
+            )
+          (else
+            (format 0 "entity ~S: not found (its level is probably not loaded)~%" name)
+            )
+          )
+        e
+        )
+      )
+
+    (defun find-lid ()
+      (find-process "lid")
+      (find-entity "vol-stone-lid-1")
+      0
+      )
+
+    (defun goto-entity ((name string))
+      (let ((e (entity-by-name name)))
+        (cond
+          (e
+            (let ((bot (as-type (blast-bot-find) process-drawable)))
+              (cond
+                (bot
+                  (vector-copy! (-> bot root trans) (-> e trans))
+                  (+! (-> bot root trans y) 40960.0)
+                  (format 0 "goto-entity: moved the blast bot to ~S~%" name)
+                  )
+                (*target*
+                  (let ((pos (new 'stack-no-clear 'vector)))
+                    (vector-copy! pos (-> e trans))
+                    (+! (-> pos y) 40960.0)
+                    (move-to-point! (-> *target* control) pos)
+                    )
+                  (format 0 "goto-entity: moved Jak to ~S~%" name)
+                  )
+                )
+              )
+            )
+          (else
+            (format 0 "goto-entity: ~S not found~%" name)
+            )
+          )
+        0
+        )
+      )
+
     (defun runs-every-frame ()
       ;; (increase-power-cell-by-one) This is a call to increase-power-cell-by-one defined in mod-common-functions.gc
 
@@ -198,6 +377,7 @@
         (despawn-my-bombbot)
         )
       (blast-bot-despawn-update)
+      (blast-bot-fail-watch)
 
       (blast-bot-mech-watch)
       (blast-bot-spawn-watch)

@@ -7,6 +7,8 @@
 
 ;; DECOMP BEGINS
 
+(define-extern blast-bot-follow-continue (function continue-point none))
+
 (defbehavior target-shoved target ((arg0 meters) (arg1 meters) (arg2 process) (arg3 (state object object target)))
   (let ((s5-0 (new 'static 'attack-info)))
     (set! (-> s5-0 attacker) (process->handle arg2))
@@ -807,6 +809,8 @@
      )
     (('continue)
      (when (not (focus-test? self dead))
+       ;; blast bot (blastbot-main-mod.gc): the bot goes to the continue point together with Jak
+       (blast-bot-follow-continue (the-as continue-point (-> arg3 param 0)))
        (logior! (-> self focus-status) (focus-status teleporting))
        (go target-continue (the-as continue-point (-> arg3 param 0)))
        )

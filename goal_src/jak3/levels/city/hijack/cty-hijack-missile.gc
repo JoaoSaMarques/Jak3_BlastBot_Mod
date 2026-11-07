@@ -510,6 +510,8 @@
   :virtual #t
   :enter (behavior ()
     (sound-play "hj-explode")
+    (format 0 "Hijack: missile explodes, target ~A~%"
+            (if (nonzero? (-> self track-obj)) (let ((tp (handle->process (-> self track-obj)))) (if tp (-> tp type) #f)) #f))
     (logior! (-> self draw status) (draw-control-status no-draw))
     (cond
       ((logtest? (-> group-hijack-kgpickup-explode flags) (sp-group-flag sp13))
@@ -704,6 +706,10 @@
   )
 
 ;; WARN: Return type mismatch symbol vs object.
+;; DIAGNOSTIC (remove when the missiles work): what the missiles track and why a lure does or does not catch them
+(define *hijack-log-next* (the-as time-frame 0))
+(define *hijack-log-next2* (the-as time-frame 0))
+
 (defmethod event-handler ((this cty-hijack-missile) (arg0 process) (arg1 int) (arg2 symbol) (arg3 event-message-block))
   (case arg2
     (('die)
@@ -733,6 +739,12 @@
            (let ((a0-17 (new 'stack-no-clear 'vector)))
              (vector-! a0-17 s4-0 s3-1)
              (let ((f0-3 (vector-normalize-ret-len! a0-17 1.0)))
+               (when (>= (current-time) *hijack-log-next*)
+                 (set! *hijack-log-next* (+ (current-time) (seconds 1)))
+                 (format 0 "Hijack: lure check: lure is ~M m from the tracked object ~A (it must be 47 to 70 m)~%"
+                         f0-3
+                         (if (nonzero? (-> this track-obj)) (let ((tp (handle->process (-> this track-obj)))) (if tp (-> tp type) #f)) #f))
+                 )
                (when (and (< 192512.0 f0-3) (< f0-3 286720.0))
                  (format 0 "Player dist ~m~%" f0-3)
                  (when (as-type (handle->process (-> this track-obj)) process-focusable)
@@ -1177,6 +1189,13 @@
       )
     (cty-hijack-missile-method-49 self)
     (get-tracked-obj-pos self (-> self target-pos))
+    (when (and (-> self is-leader?) (>= (current-time) *hijack-log-next2*))
+      (set! *hijack-log-next2* (+ (current-time) (seconds 1)))
+      (format 0 "Hijack: leader chases ~A, ~M m away (xz), speed ~M~%"
+              (if (nonzero? (-> self track-obj)) (let ((tp (handle->process (-> self track-obj)))) (if tp (-> tp type) #f)) #f)
+              (vector-vector-xz-distance (-> self basetrans) (-> self target-pos))
+              (-> self current-speed))
+      )
     (cty-hijack-missile-method-51 self)
     (if (or (not (handle->process (-> self track-obj)))
             (focus-test?
