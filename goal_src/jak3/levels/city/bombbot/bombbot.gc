@@ -3316,7 +3316,10 @@
                               (not (focus-test? this inactive))
                               (not (focus-test? this disable))
                               (not (focus-test? this dead))
-                              (and (as-type (the-as process-focusable s2-1) bombbot)
+                              (and (or (as-type (the-as process-focusable s2-1) bombbot)
+                                       ;; the blast bot is not a bombbot, so this search never saw it
+                                       (and *bombbot-target-blast-bot* (= (the-as process s2-1) (blast-bot-find)))
+                                       )
                                    (the-as process-focusable s2-1)
                                    (not (logtest? (-> (the-as process-focusable s2-1) focus-status) (focus-status disable dead ignore grabbed)))
                                    )

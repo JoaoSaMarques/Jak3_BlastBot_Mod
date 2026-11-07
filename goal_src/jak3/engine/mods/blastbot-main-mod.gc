@@ -348,7 +348,7 @@
 (define *blast-bot-leg-limbs* 4)  ;; how many legs get collision spheres (0..4)
 (define *blast-bot-reach-hack* #t)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
 
-(define *blast-bot-attack-debug* #f)
+(define *blast-bot-attack-debug* #t)   ;; TEMPORARY while checking the enemy bombbot: prints every attack that reaches the bot
 ;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
 ;; #f = he just walks away from the wreck
 (define *blast-bot-death-kills-jak* #t)
@@ -467,6 +467,8 @@
       )
   )
 
+;; The volcano stone lid (vol-stone-lid, volcano-obs2.gc) is spared too: touching it with the bot's legs crashed the game, its
+;; 'attack handler was written for Jak's punches. Matched by type name because the volcano types are not loaded with this file.
 ;; Desert rescue (wland-passenger.gc / desert-rescue.gc): the wastelanders waiting for the transport and the transport itself are
 ;; never hit by the legs, stomps or the dash. Those types live in the DESRESC level DGO and are not visible from the mods folder,
 ;; so they are matched by type name (children included).
@@ -475,7 +477,7 @@
         (ty (-> p type))
         )
     (while (and (not found) ty)
-      (if (or (= (-> ty symbol) 'wland-passenger) (= (-> ty symbol) 'desert-rescue-transport))
+      (if (or (= (-> ty symbol) 'wland-passenger) (= (-> ty symbol) 'desert-rescue-transport) (= (-> ty symbol) 'vol-stone-lid))
           (set! found #t)
           )
       (set! ty (if (= ty (-> ty parent)) (the-as type #f) (-> ty parent)))
@@ -2932,6 +2934,27 @@
     )
   )
 
+;; The volcano stone lid (vol-stone-lid, volcano-obs2.gc). Only the charge pushes it: the legs' touch never does (that crashed the game,
+;; see blast-bot-spared?). The lid answers 'attack by shoving itself toward its hole when the attacker is on the far side of it, the
+;; same event Jak's punch sends, so the charge sends exactly that and nothing else. Matched by type name (volcano types are not
+;; loaded with this file).
+(define *blast-bot-push-lid* #t)                       ;; #f = the charge ignores the lid
+(define *blast-bot-lid-log-id* (the-as uint 0))
+
+(defun blast-bot-stone-lid? ((p process))
+  (let ((found #f)
+        (ty (-> p type))
+        )
+    (while (and (not found) ty)
+      (if (= (-> ty symbol) 'vol-stone-lid)
+          (set! found #t)
+          )
+      (set! ty (if (= ty (-> ty parent)) (the-as type #f) (-> ty parent)))
+      )
+    found
+    )
+  )
+
 (defun blast-bot-dash-attack ((this blast-bot-player))
   ;; While charging: hurt every valid enemy in front of the bot (once per charge, the attack id is shared).
   (let ((fwd (new 'stack-no-clear 'vector))
@@ -2956,6 +2979,16 @@
               )
             )
           (let ((d (-> cs process)))
+            (when (and d *blast-bot-push-lid* (blast-bot-stone-lid? d))
+              ;; printed once per charge: when the game dies right after this line, the lid's 'attack handler is the culprit
+              (when (!= *blast-bot-lid-log-id* (-> this dash-id))
+                (set! *blast-bot-lid-log-id* (-> this dash-id))
+                (format 0 "Blast Bot: charge hits the stone lid ~A, sending 'attack~%" d)
+                )
+              (send-event d 'attack #f
+                          (blast-bot-credit-jak!
+                            (static-attack-info ((id (-> this dash-id)) (damage 6.0) (mode 'explode)))))
+              )
             (when (and d *blast-bot-dash-break-doors* (blast-bot-dark-door? d))
               (send-event d 'attack #f
                           (blast-bot-credit-jak!
@@ -4284,10 +4317,11 @@
                (let* ((b (new 'stack-no-clear 'event-message-block))
                       (e (as-type proc enemy))
                       (swing-id (if e (-> e attack-id) (the-as uint 0)))
-                      )
+                    (damage (if e (the float (-> e enemy-info attack-damage)) 1.0))
+                    )
                  ;; one swing = one hit: hand over the attacker's own attack id, same as shots do
                  (set! (-> b param 1)
-                       (the-as uint (static-attack-info ((id swing-id) (damage 1.0)))))
+                     (the-as uint (static-attack-info ((id swing-id) (damage damage)))))
                  (!= (blast-bot-attack-result self proc b) 0)
                  )
                )
@@ -4965,8 +4999,13 @@
 
 (define *blast-bot-turret-log-next* (the-as time-frame 0))
 
+;; #t after L1 + Triangle: the bot was dismissed on purpose, so the auto-spawn (mod-custom-code.gc) leaves it alone until you
+;; summon it again (L1 + R3, or the Blow Barricade mission, which needs it). Cleared by every spawn-my-bombbot.
+(define *blast-bot-dismissed* #f)
+
 (defun spawn-my-bombbot ()
   ;; Spawns a new bot, then removes every previous one. Jak is released from the old bot first so the new bot can take him over.
+  (set! *blast-bot-dismissed* #f)
   (when (and *target* (blast-bot-turret-state? (blast-bot-jak-state)) (>= (current-time) *blast-bot-turret-log-next*))
     (set! *blast-bot-turret-log-next* (+ (current-time) (seconds 2)))
     (format 0 "Blast Bot: not spawning, Jak is in a turret (~A)~%" (blast-bot-jak-state))

@@ -22,7 +22,7 @@
     ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
     ;; Always-bot: the blast bot comes back every time Jak spawns (new game, loading a file, death) and waits until Jak is free
-    ;; (no cutscene / death) plus a short delay. L1 + Triangle still removes it until the next spawn.
+    ;; (no cutscene / death) plus a short delay. L1 + Triangle removes it and it stays away until you summon it again (L1 + R3).
     (define *blast-bot-always* #t)             ;; #f = back to manual (L1 + R3 only)
     (define *blast-bot-spawn-delay* 1.5)       ;; seconds after Jak appears before the bot is spawned
     (define *blast-bot-seen-target* 0)         ;; pid of the Jak (target process) seen last
@@ -64,7 +64,7 @@
       )
 
     (defun blast-bot-spawn-watch ()
-      (when (and (or *blast-bot-always* *blast-bot-mech-resume*) *target*)
+      (when (and (or *blast-bot-always* *blast-bot-mech-resume*) *target* (not *blast-bot-dismissed*))
         ;; every spawn is a new target process, so a new handle means Jak just (re)spawned
         ;; compare the 32-bit process id: a handle is 64-bit and a global symbol only keeps 32 bits, so it never matched
         (let ((h (the-as int (-> *target* pid))))
@@ -190,6 +190,11 @@
 
       ;; L1 + Triangle: remove the bot and put Jak back to normal (blast-bot-despawn-update finishes it over a few frames)
       (when (and *target* (cpad-hold? 0 l1) (cpad-pressed? 0 triangle))
+        ;; dismissed on purpose: no auto-spawn (new Jak, mech exit, retries) until L1 + R3 summons the bot again
+        (set! *blast-bot-dismissed* #t)
+        (set! *blast-bot-spawn-pending* #f)
+        (set! *blast-bot-spawn-check* 0)
+        (set! *blast-bot-mech-resume* #f)
         (despawn-my-bombbot)
         )
       (blast-bot-despawn-update)
