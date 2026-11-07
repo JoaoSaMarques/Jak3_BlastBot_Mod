@@ -348,7 +348,7 @@
 (define *blast-bot-leg-limbs* 4)  ;; how many legs get collision spheres (0..4)
 (define *blast-bot-reach-hack* #t)     ;; get-trans override that hands enemies the nearest point of the bot's footprint
 
-(define *blast-bot-attack-debug* #t)   ;; TEMPORARY while checking the enemy bombbot: prints every attack that reaches the bot
+(define *blast-bot-attack-debug* #f)   ;; TEMPORARY while checking the enemy bombbot: prints every attack that reaches the bot
 ;; when the bot is destroyed Jak is thrown out of it; #t = he is killed too (normal death / checkpoint reload),
 ;; #f = he just walks away from the wreck
 (define *blast-bot-death-kills-jak* #t)

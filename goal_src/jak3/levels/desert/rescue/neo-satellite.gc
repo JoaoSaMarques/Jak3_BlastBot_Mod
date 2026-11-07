@@ -1259,7 +1259,7 @@
     :attack-shove-back (meters 3.5)
     :attack-shove-up (meters 2)
     :attack-mode 'generic
-    :attack-damage 2
+    :attack-damage 10
     :recover-gnd-collide-with (collide-spec backgnd crate obstacle hit-by-others-list pusher)
     :knocked-can-land-timeout (seconds 0.1)
     :knocked-recover-timeout (seconds 2)
@@ -2738,9 +2738,7 @@
           )
       (let ((v1-98 (as-type (handle->process (-> this focus handle)) process-focusable)))
         (when v1-98
-          (let ((v1-99 (-> v1-98 root)))
-            (set! s4-2 (and v1-99 (logtest? (-> (the-as collide-shape-moving v1-99) status) (collide-status on-surface))))
-            )
+          (set! s4-2 v1-98)
           )
         )
       (when s4-2
@@ -2753,7 +2751,7 @@
                   #f
                   (static-attack-info
                     :mask (vehicle-impulse-factor)
-                    ((id (new-attack-id)) (damage 1.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'generic))
+                    ((id (new-attack-id)) (damage 10.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'generic))
                     )
                   )
                 )
@@ -3497,9 +3495,7 @@
                  )
              (let ((v1-29 (as-type s2-2 process-focusable)))
                (when v1-29
-                 (let ((v1-30 (-> v1-29 root)))
-                   (set! s1-0 (and v1-30 (logtest? (-> (the-as collide-shape-moving v1-30) status) (collide-status on-surface))))
-                   )
+                 (set! s1-0 v1-29)
                  )
                )
              (when s1-0
@@ -3509,7 +3505,7 @@
                  #f
                  (static-attack-info
                    :mask (vehicle-impulse-factor)
-                   ((id (new-attack-id)) (damage 1.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'generic))
+                   ((id (new-attack-id)) (damage 10.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'generic))
                    )
                  )
                (send-event this 'notify 'attack s2-2)
@@ -3583,7 +3579,7 @@
              #f
              (static-attack-info
                :mask (vehicle-impulse-factor)
-               ((id (new-attack-id)) (damage 1.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'shock))
+               ((id (new-attack-id)) (damage 10.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'shock))
                )
              )
            (send-event this 'notify 'attack s2-4)
@@ -3815,7 +3811,7 @@
           #f
           (static-attack-info
             :mask (vehicle-impulse-factor)
-            ((id (new-attack-id)) (damage 1.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'shock))
+            ((id (new-attack-id)) (damage 10.0) (vehicle-damage-factor 1.0) (vehicle-impulse-factor 1.0) (mode 'shock))
             )
           )
         (send-event this 'notify 'attack (handle->process (-> this focus handle)))

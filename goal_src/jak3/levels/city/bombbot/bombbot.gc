@@ -3337,6 +3337,7 @@
           )
         )
       )
+    (format 0 "Bomb-bot: retarget, picked ~A~%" (if gp-0 (-> gp-0 type) #f))
     (cond
       (gp-0
         (vector-copy! (-> this target-pos) (get-trans gp-0 3))
