@@ -4176,6 +4176,9 @@
 ;; wall it explodes (phase 2, visual only, Jak is NOT killed) and then Jak is released and the bot removed (phase 3, the same
 ;; release as L1 + Triangle). *blast-bot-barricade-exploded* is what the mission waits for.
 (define *blast-bot-barricade* #t)                 ;; #f = the mission spawns the stock bombbot-player again
+(define *blast-bot-walk-active* #f)
+(define *blast-bot-walk-target* (new 'static 'vector))
+(define *blast-bot-walk-speed* 0.7)
 (define *blast-bot-barricade-phase* 0)            ;; 0 normal, 1 walking to the wall, 2 exploding, 3 releasing Jak
 (define *blast-bot-barricade-exploded* #f)
 (define *blast-bot-barricade-time* (the-as time-frame 0))
@@ -4219,6 +4222,23 @@
 
 (defun blast-bot-barricade-update ((this blast-bot-player))
   ;; every frame from the active state (before the stick is read)
+  (when *blast-bot-walk-active*
+    (let* ((dx (- (-> *blast-bot-walk-target* x) (-> this root trans x)))
+           (dz (- (-> *blast-bot-walk-target* z) (-> this root trans z)))
+           (dist (sqrtf (+ (* dx dx) (* dz dz))))
+           )
+      (when (< 4096.0 dist)
+        (let ((move (new 'stack-no-clear 'vector))
+              (amount (* 49152.0 *blast-bot-walk-speed* (seconds-per-frame)))
+              )
+          (set-vector! move (/ dx dist) 0.0 (/ dz dist) 1.0)
+          (set! (-> this input-yaw) (vector-y-angle move))
+          (set! (-> this input-active) #t)
+          (blast-bot-move-xz this (* (-> move x) amount) (* (-> move z) amount))
+          )
+        )
+      )
+    )
   (case *blast-bot-barricade-phase*
     ((1)
      (let* ((dx (- (-> *blast-bot-barricade-target* x) (-> this root trans x)))
@@ -4438,7 +4458,7 @@
         (set! (-> self health) (fmin (-> self max-health) (+ (-> self health) (* *blast-bot-regen-rate* dt))))
         )
       (blast-bot-barricade-update self)
-      (when (and (< 0.05 speed) (zero? *blast-bot-barricade-phase*) (not *blast-bot-spy-active*) (not (blast-bot-ride?)))
+      (when (and (< 0.05 speed) (zero? *blast-bot-barricade-phase*) (not *blast-bot-walk-active*) (not *blast-bot-spy-active*) (not (blast-bot-ride?)))
         (let ((move (new 'stack-no-clear 'vector)))
           (vector-copy! move (-> *math-camera* inv-camera-rot fvec))
           (set! (-> move y) 0.0)

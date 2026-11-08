@@ -8,6 +8,7 @@
 ;; DECOMP BEGINS
 
 (defmethod init! ((this mission-squad-control) (arg0 int) (arg1 int) (arg2 int))
+  (set! arg0 (* arg0 5))
   (set! (-> this attackers) (new 'loading-level 'city-attacker-array arg0))
   (set! (-> this attacker-cache) (new 'loading-level 'city-attacker-cache-array arg0))
   (set! (-> this unused-list) (new 'loading-level 'boxed-array int16 arg0))
@@ -113,7 +114,7 @@
   (logior! (-> this flags) (city-attacker-info-flag cai0))
   (set! (-> this next-update-target-time) 0)
   (set! (-> this num-current-attackers) (the-as uint 0))
-  (set! (-> this max-num-attackers) (the-as uint 127))
+  (set! (-> this max-num-attackers) (the-as uint 255))
   (set! (-> this enemy-index) -1)
   (set! (-> this callback) #f)
   (none)
