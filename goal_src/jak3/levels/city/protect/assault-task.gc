@@ -325,6 +325,11 @@
     (when *target*
       (move-to-point! (-> *target* control) (-> self current-room center-pos))
       (process-drawable-reset-all-cloth *target*)
+      (let ((bot (as-type (blast-bot-find) blast-bot-player)))
+        (if bot
+            (blast-bot-teleport-to bot (-> self current-room center-pos))
+            )
+        )
       )
     (suspend)
     (if *target*
@@ -1403,8 +1408,10 @@
 
 (defmethod assault-player-controller-method-36 ((this assault-player-controller))
   (let ((s4-0 (matrix-transpose! (new 'stack-no-clear 'matrix) (-> this collision cam-matrix)))
-        (s5-1 (vector-! (new 'stack-no-clear 'vector) (target-pos 0) (-> this collision cam-pos)))
+        (bot (as-type (blast-bot-find) blast-bot-player))
+        (s5-1 (new 'stack-no-clear 'vector))
         )
+    (vector-! s5-1 (if bot (-> bot root trans) (target-pos 0)) (-> this collision cam-pos))
     (set! (-> s5-1 w) 0.0)
     (vector-matrix*! s5-1 s5-1 s4-0)
     (set! (-> s5-1 y)
@@ -1419,7 +1426,7 @@
     (vector+! s5-1 s5-1 (-> this collision cam-pos))
     (let ((gp-1 (new 'stack-no-clear 'vector)))
       (set! (-> gp-1 x) (-> s5-1 x))
-      (set! (-> gp-1 y) (-> (target-pos 0) y))
+      (set! (-> gp-1 y) (if bot (-> bot root trans y) (-> (target-pos 0) y)))
       (set! (-> gp-1 z) (-> s5-1 z))
       (set! (-> gp-1 w) 1.0)
       (let ((s5-2 (new 'stack-no-clear 'collide-query)))
@@ -1442,7 +1449,20 @@
               )
           )
         )
-      (move-to-point! (-> *target* control) gp-1)
+      (cond
+        (bot
+          (logclear! (-> *target* focus-status) (focus-status grabbed ignore))
+          (if *kg-squad-control*
+              (set-alert-level1 *kg-squad-control* 1)
+              )
+          (set! (-> bot root trans x) (-> gp-1 x))
+          (set! (-> bot root trans z) (-> gp-1 z))
+          (move-to-point! (-> *target* control) (-> bot root trans))
+          )
+        (else
+          (move-to-point! (-> *target* control) gp-1)
+          )
+        )
       )
     )
   (none)

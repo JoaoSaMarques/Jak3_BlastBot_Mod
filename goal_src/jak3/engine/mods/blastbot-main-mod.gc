@@ -4331,10 +4331,11 @@
                (let* ((b (new 'stack-no-clear 'event-message-block))
                       (e (as-type proc enemy))
                       (swing-id (if e (-> e attack-id) (the-as uint 0)))
-                      )
+                      (damage (if e (the float (-> e enemy-info attack-damage)) 1.0))
+                    )
                  ;; one swing = one hit: hand over the attacker's own attack id, same as shots do
                  (set! (-> b param 1)
-                       (the-as uint (static-attack-info ((id swing-id) (damage 1.0)))))
+                       (the-as uint (static-attack-info ((id swing-id) (damage damage)))))
                  (!= (blast-bot-attack-result self proc b) 0)
                  )
                )

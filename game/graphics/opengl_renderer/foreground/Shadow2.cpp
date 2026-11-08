@@ -3,9 +3,9 @@
 #include "third-party/imgui/imgui.h"
 
 Shadow2::Shadow2(const std::string& name, int my_id) : BucketRenderer(name, my_id) {
-  m_vertex_buffer.resize(kMaxVerts);
-  m_front_index_buffer.resize(kMaxInds);
-  m_back_index_buffer.resize(kMaxInds);
+  m_vertex_buffer.resize(kMaxVerts * 8);
+  m_front_index_buffer.resize(kMaxInds * 8);
+  m_back_index_buffer.resize(kMaxInds * 8);
   // a
 
   glGenBuffers(1, &m_ogl.vertex_buffer);
@@ -14,10 +14,10 @@ Shadow2::Shadow2(const std::string& name, int my_id) : BucketRenderer(name, my_i
   glBindVertexArray(m_ogl.vao);
   for (int i = 0; i < 2; i++) {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_ogl.index_buffer[i]);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, kMaxInds * sizeof(u32), nullptr, GL_STREAM_DRAW);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, kMaxInds * 8 * sizeof(u32), nullptr, GL_STREAM_DRAW);
   }
   glBindBuffer(GL_ARRAY_BUFFER, m_ogl.vertex_buffer);
-  glBufferData(GL_ARRAY_BUFFER, kMaxVerts * sizeof(ShadowVertex), nullptr, GL_STREAM_DRAW);
+  glBufferData(GL_ARRAY_BUFFER, kMaxVerts * 8 * sizeof(ShadowVertex), nullptr, GL_STREAM_DRAW);
 
   // xyz
   glEnableVertexAttribArray(0);
@@ -288,6 +288,11 @@ const u8* Shadow2::add_cap_tris(const u8* byte_data, const u8* vertex_data, bool
     }
 
     // load vertices (to vf17, vf18, vf19)
+    if (m_vertex_buffer_used + 16 > m_vertex_buffer.size() ||
+        m_front_index_buffer_used + 16 > m_front_index_buffer.size() ||
+        m_back_index_buffer_used + 16 > m_back_index_buffer.size()) {
+      return byte_data;
+    }
     const int opengl_vertex_idx = m_vertex_buffer_used;
     auto* vertex_rt_camera = alloc_verts(3);
     if (flip) {
@@ -333,6 +338,11 @@ const u8* Shadow2::add_flippable_tris(const u8* byte_data, const u8* vertex_data
     }
 
     // load vertices (to vf17, vf18, vf19)
+    if (m_vertex_buffer_used + 16 > m_vertex_buffer.size() ||
+        m_front_index_buffer_used + 16 > m_front_index_buffer.size() ||
+        m_back_index_buffer_used + 16 > m_back_index_buffer.size()) {
+      return byte_data;
+    }
     const int opengl_vertex_idx = m_vertex_buffer_used;
     auto* vertex_rt_camera = alloc_verts(3);
     if ((flip ^ flip_flag) == 0) {
@@ -383,6 +393,11 @@ const u8* Shadow2::add_wall_quads(const u8* byte_data,
       continue;
     }
 
+    if (m_vertex_buffer_used + 16 > m_vertex_buffer.size() ||
+        m_front_index_buffer_used + 16 > m_front_index_buffer.size() ||
+        m_back_index_buffer_used + 16 > m_back_index_buffer.size()) {
+      return byte_data;
+    }
     const int opengl_vertex_idx = m_vertex_buffer_used;
     auto* vertex_rt_camera = alloc_verts(4);
 

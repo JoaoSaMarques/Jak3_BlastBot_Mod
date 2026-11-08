@@ -7,6 +7,8 @@
 
 ;; DECOMP BEGINS
 
+(define-extern blast-bot-find (function process))
+
 (defmethod squad-control-method-10 ((this squad-control-city))
   (init! (-> this alert-state))
   (set! (-> this city-mode) (squad-city-mode zero))
@@ -119,6 +121,17 @@
             )
           (when (!= (-> s4-1 faction-mode) 1)
             (set! s3-0 (get-focus-in-range this s4-1))
+            (let ((bot (as-type (blast-bot-find) process-focusable)))
+              (when (and bot
+                         (not (focus-test? bot disable dead inactive))
+                         (if s3-0
+                             (and *target* (= s3-0 *target*))
+                             (< (vector-vector-xz-distance-squared (-> s4-1 root trans) (-> bot root trans)) (square 409600.0))
+                             )
+                         )
+                (set! s3-0 bot)
+                )
+              )
             (goto cfg-121)
             )
           (let ((f30-0 0.0)

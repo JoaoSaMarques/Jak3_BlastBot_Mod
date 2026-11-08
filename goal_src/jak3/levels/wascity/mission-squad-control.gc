@@ -287,8 +287,18 @@
   #f
   )
 
+(define-extern blast-bot-find (function process))
+
 (defmethod update-attack-target ((this mission-squad-control))
   (cond
+    ((let ((bot (as-type (blast-bot-find) process-focusable)))
+       (and bot (not (focus-test? bot disable dead inactive)))
+       )
+     (logior! (-> this target-attacker flags) (city-attacker-info-flag cai0 cai1 cai4))
+     (logclear! (-> this target-attacker flags) (city-attacker-info-flag cai5))
+     (set! (-> this target-attacker self-type) 0)
+     (set! (-> this target-attacker proc) (process->handle (as-type (blast-bot-find) process-focusable)))
+     )
     ((or (not *target*) (focus-test? *target* disable dead inactive))
      (logclear! (-> this target-attacker flags) (city-attacker-info-flag cai0))
      (logclear! (-> this target-attacker flags) (city-attacker-info-flag cai5))
