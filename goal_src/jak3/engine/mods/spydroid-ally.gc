@@ -108,6 +108,8 @@
     )
   )
 
+(define-extern blast-minion-tint-apply (function process-drawable int none))   ;; blastbot-colors.gc
+
 (deftype spydroid-ally (spydroid-orig)
   ((owner-handle  handle)
    (spawn-time    time-frame)
@@ -587,6 +589,7 @@
 
 (defun spydroid-ally-update ((this spydroid-ally))
   ;; runs once per frame at the end of enemy-common-post
+  (blast-minion-tint-apply this 1)
   (spydroid-ally-emerge this)
   (if (not (spydroid-ally-expire? this))
       (begin

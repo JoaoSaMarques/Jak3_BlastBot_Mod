@@ -1633,6 +1633,9 @@
   (previous-page #x100003)
   (progress-secrets-bot-colorwheel #x20000)
   (progress-secrets-bot-naked #x20003)
+  (progress-secrets-bot-color-spy #x20004)
+  (progress-secrets-bot-color-robo #x20005)
+  (progress-secrets-bot-color-sentinel #x20006)
 
   )
 ;; ---text-id

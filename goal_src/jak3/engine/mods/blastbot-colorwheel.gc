@@ -6,27 +6,26 @@
 ;; dgos: GAME
 
 ;; The Bot Color Wheel picker. Turning the "Bot Color Wheel" secret ON opens it on screen; then
-;;   left stick   = the colour: its direction is the hue, how far you push it is the saturation (let go and the colour stays)
+;;   left stick   = moves the cursor over the wheel like a mouse (direction on the wheel = hue, distance from the centre = saturation); let go and the cursor stays
 ;;   right stick  = black <-> white: up makes it lighter, down darker (HSL lightness; the middle is the pure colour)
 ;;   X            = confirm: the wheel closes and the colour stays on the plates (secret stays ON; switching it OFF and ON again reopens the wheel)
 ;; While it is open the sticks and X are swallowed (blast-bot-wheel-capture is the first thing the bot's :trans does), so the bot
 ;; does not move, aim or jump.
 ;;
-;; The wheel is drawn with the 15 hud sprites 15..29 of blast-bot-hud that nothing uses any more (the ally boxes have their own hud now):
-;; 1 panel, 8 hue cells in a ring, 2 for the cursor, 2 for the preview swatch, 2 for the lightness bar. A coarse wheel, but no new hud
-;; process and no new gui channel are needed.
+;; The wheel is drawn as Gouraud-shaded GS triangles and quads directly into the HUD DMA buffer; it needs no wheel sprites.
 ;;
-;; Needs, in game.gd:  blastbot-colorwheel.o  after blastbot-colors.o (and so after blastbot-main-mod.o and blastbot-allyhud.o,
-;; which defines the ahud-rect! macro used here).
+;; The same wheel also edits the colours of the spy droids, roboguards and sentinels: each has its own secret (Spy Droid / Roboguard /
+;; Sentinel Color Wheel) that opens the wheel for that colour (*blast-wheel-target*); the tint itself is applied in blastbot-colors.gc.
+;;
+;; Needs, in game.gd: blastbot-colorwheel.o after blastbot-colors.o (and so after blastbot-main-mod.o).
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Knobs (set from the REPL)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(define *blast-wheel-dir-sign* -1.0)     ;; 1.0 if the cursor moves the opposite way to the left stick (it did with 1.0, so the default is -1.0)
+(define *blast-wheel-move-rate* 1.2)       ;; cursor speed at full left-stick push, in wheel radii per second (the cursor stays where you leave it)
 (define *blast-wheel-light-sign* -1.0)   ;; 1.0 if right stick UP makes it darker instead of lighter
 (define *blast-wheel-light-rate* 0.6)    ;; lightness change per second at full right-stick push
-(define *blast-wheel-deadzone* 0.1)      ;; left stick pushed less than this = the colour stays as it is
 (define *blast-wheel-confirm-delay* 0.5) ;; seconds after opening in which X is ignored (so the X that switched the secret on does not confirm)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -37,13 +36,46 @@
 (define *blast-wheel-prev-on* #f)
 (define *blast-wheel-seen* #f)
 (define *blast-wheel-open-time* (the-as time-frame 0))
+(define *blast-wheel-target* 0)          ;; whose colour the wheel edits: 0 = bot, 1 = spy droids, 2 = roboguards, 3 = sentinels
+(define *blast-wheel-prev* (new 'global 'boxed-array int32 4))   ;; per target: was its secret on last frame
+(define *blast-wheel-state* (new 'global 'boxed-array float 12)) ;; per target: hue, saturation, lightness
 (define *blast-wheel-hue* 228.0)         ;; degrees 0..360 (0 = stick up, clockwise)
 (define *blast-wheel-sat* 1.0)           ;; 0..1
 (define *blast-wheel-light* 0.5)         ;; 0 = black, 0.5 = the pure colour, 1 = white
+(define *blast-wheel-curx* 0.0)          ;; cursor on the wheel, -1..1 (right = +), set when the wheel opens
+(define *blast-wheel-cury* 0.0)          ;; -1..1 (down = +)
 ;; scratch result of blast-wheel-hsl!
 (define *blast-wheel-tr* 0.0)
 (define *blast-wheel-tg* 0.0)
 (define *blast-wheel-tb* 0.0)
+
+(defun blast-wheel-init-state ()
+  (when (zero? (-> *blast-wheel-state* 1))
+    (dotimes (ti 4)
+      (set! (-> *blast-wheel-state* (* ti 3)) 228.0)
+      (set! (-> *blast-wheel-state* (+ (* ti 3) 1)) 1.0)
+      (set! (-> *blast-wheel-state* (+ (* ti 3) 2)) 0.5)
+      )
+    )
+  0
+  )
+(blast-wheel-init-state)
+
+(defun blast-wheel-load-state ((ti int))
+  (set! *blast-wheel-hue* (-> *blast-wheel-state* (* ti 3)))
+  (set! *blast-wheel-sat* (-> *blast-wheel-state* (+ (* ti 3) 1)))
+  (set! *blast-wheel-light* (-> *blast-wheel-state* (+ (* ti 3) 2)))
+  (set! *blast-wheel-curx* (* *blast-wheel-sat* (sin (* *blast-wheel-hue* 182.04445))))
+  (set! *blast-wheel-cury* (- 0.0 (* *blast-wheel-sat* (cos (* *blast-wheel-hue* 182.04445)))))
+  0
+  )
+
+(defun blast-wheel-save-state ((ti int))
+  (set! (-> *blast-wheel-state* (* ti 3)) *blast-wheel-hue*)
+  (set! (-> *blast-wheel-state* (+ (* ti 3) 1)) *blast-wheel-sat*)
+  (set! (-> *blast-wheel-state* (+ (* ti 3) 2)) *blast-wheel-light*)
+  0
+  )
 
 (defun blast-wheel-hsl! ((h float) (s float) (l float))
   ;; HSL -> RGB (all 0..1, h in degrees 0..360) into *blast-wheel-tr/tg/tb*
@@ -76,20 +108,27 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defun blast-wheel-update ()
-  (let ((on (= *blast-bot-color-mode* 1)))
-    ;; the very first call only learns the state, so a bot spawned with the secret already on does not pop the wheel up
-    (when (not *blast-wheel-seen*)
-      (set! *blast-wheel-seen* #t)
-      (set! *blast-wheel-prev-on* on)
-      )
-    (when (and on (not *blast-wheel-prev-on*) (not *blast-wheel-open*))
-      (set! *blast-wheel-open* #t)
-      (set! *blast-wheel-open-time* (current-time))
-      )
-    (if (not on)
-        (set! *blast-wheel-open* #f)
+  ;; Each colour secret (bot / spy droids / roboguards / sentinels) opens the wheel for its own colour when it is switched on.
+  ;; The very first call only learns the states, so a bot spawned with a secret already on does not pop the wheel up.
+  (let ((learning (not *blast-wheel-seen*)))
+    (set! *blast-wheel-seen* #t)
+    (dotimes (ti 4)
+      (let ((on (blast-col-secret-on? ti)))
+        (when (and on (not learning) (zero? (-> *blast-wheel-prev* ti)))
+          (if *blast-wheel-open*
+              (blast-wheel-save-state *blast-wheel-target*)
+              )
+          (set! *blast-wheel-target* ti)
+          (blast-wheel-load-state ti)
+          (set! *blast-wheel-open* #t)
+          (set! *blast-wheel-open-time* (current-time))
+          )
+        (if (and (not on) *blast-wheel-open* (= *blast-wheel-target* ti))
+            (set! *blast-wheel-open* #f)
+            )
+        (set! (-> *blast-wheel-prev* ti) (if on 1 0))
         )
-    (set! *blast-wheel-prev-on* on)
+      )
     )
   (none)
   )
@@ -101,24 +140,38 @@
 (defun blast-bot-wheel-capture ()
   (when *blast-wheel-open*
     (let* ((pad (-> *cpad-list* cpads 0))
-           (speed (-> pad stick0-speed))
            (dt (seconds-per-frame))
+           (lx (blast-bot-stick-axis (the-as int (-> pad leftx))))
+           (ly (blast-bot-stick-axis (the-as int (-> pad lefty))))
            (ry (blast-bot-stick-axis (the-as int (-> pad righty))))
            (confirm (and (cpad-pressed? 0 x)
                          (>= (current-time) (+ *blast-wheel-open-time* (the int (* 300.0 *blast-wheel-confirm-delay*))))
                          ))
+           (nx (+ *blast-wheel-curx* (* lx *blast-wheel-move-rate* dt)))
+           (ny (+ *blast-wheel-cury* (* ly *blast-wheel-move-rate* dt)))
+           (len (sqrtf (+ (* nx nx) (* ny ny))))
            )
-      ;; left stick: hue = direction, saturation = how far it is pushed
-      (when (< *blast-wheel-deadzone* speed)
-        (let ((deg (* *blast-wheel-dir-sign* (/ (-> pad stick0-dir) 182.04445))))
-          (while (< deg 0.0)
-            (set! deg (+ deg 360.0))
+      ;; left stick moves the cursor (relative), so letting go leaves it where it is
+      (when (< 1.0 len)
+        (set! nx (/ nx len))
+        (set! ny (/ ny len))
+        (set! len 1.0)
+        )
+      (set! *blast-wheel-curx* nx)
+      (set! *blast-wheel-cury* ny)
+      (set! *blast-wheel-sat* len)
+      (when (< 0.03 len)
+        (let ((v (new 'stack-no-clear 'vector)))
+          (set-vector! v nx 0.0 (- 0.0 ny) 1.0)
+          (let ((deg (/ (vector-y-angle v) 182.04445)))
+            (while (< deg 0.0)
+              (set! deg (+ deg 360.0))
+              )
+            (while (>= deg 360.0)
+              (set! deg (- deg 360.0))
+              )
+            (set! *blast-wheel-hue* deg)
             )
-          (while (>= deg 360.0)
-            (set! deg (- deg 360.0))
-            )
-          (set! *blast-wheel-hue* deg)
-          (set! *blast-wheel-sat* (fmin 1.0 speed))
           )
         )
       ;; right stick: lightness
@@ -126,11 +179,13 @@
             (fmax 0.0 (fmin 1.0 (+ *blast-wheel-light* (* ry *blast-wheel-light-sign* *blast-wheel-light-rate* dt))))
             )
       (blast-wheel-hsl! *blast-wheel-hue* *blast-wheel-sat* *blast-wheel-light*)
-      (set! *blast-bot-color-r* *blast-wheel-tr*)
-      (set! *blast-bot-color-g* *blast-wheel-tg*)
-      (set! *blast-bot-color-b* *blast-wheel-tb*)
+      (blast-col-set! *blast-wheel-target* *blast-wheel-tr* *blast-wheel-tg* *blast-wheel-tb*)
+      (blast-wheel-save-state *blast-wheel-target*)
       ;; swallow the input so the bot does not also move / aim / jump
       (set! (-> pad stick0-speed) 0.0)
+      (set! (-> pad stick0-dir) 0.0)
+      (set! (-> pad leftx) 128)
+      (set! (-> pad lefty) 128)
       (set! (-> pad rightx) 128)
       (set! (-> pad righty) 128)
       (logclear! (-> pad button0-abs 0) (pad-buttons x))
@@ -144,54 +199,175 @@
   )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Drawing (called from blast-bot-hud's draw method, with FIRST = 15)
+;; Drawing
 ;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defun blast-wheel-draw ((this hud) (first int))
-  (cond
-    (*blast-wheel-open*
-      (let* ((cx 256)
-             (cy 208)
-             (ring 64.0)
-             (cr (the int (* 255.0 *blast-bot-color-r*)))
-             (cg (the int (* 255.0 *blast-bot-color-g*)))
-             (cb (the int (* 255.0 *blast-bot-color-b*)))
-             (ang (* *blast-wheel-hue* 182.04445))
-             (px (+ cx (the int (* ring (sin ang)))))
-             (py (- cy (the int (* ring (cos ang)))))
-             (lp (the int (* 120.0 *blast-wheel-light*)))
-             )
-        ;; panel
-        (ahud-rect! (-> this sprites first) (- cx 110) (- cy 100) 250 200 24 24 28)
-        ;; the hue ring: 8 cells, always full colour
-        (dotimes (i 8)
-          (let ((a (* (the float i) 8192.0)))
-            (blast-wheel-hsl! (* 45.0 (the float i)) 1.0 0.5)
-            (ahud-rect! (-> this sprites (+ first 1 i))
-                        (- (+ cx (the int (* ring (sin a)))) 13)
-                        (- (- cy (the int (* ring (cos a)))) 13)
-                        26 26
-                        (the int (* 255.0 *blast-wheel-tr*))
-                        (the int (* 255.0 *blast-wheel-tg*))
-                        (the int (* 255.0 *blast-wheel-tb*))
-                        )
+(defun blast-wheel-write-vertex ((base object) (index int) (x int) (y int) (r int) (g int) (b int) (a int))
+  (set! (-> (the-as (pointer gs-rgbaq) base) (* index 2))
+        (new 'static 'gs-rgbaq :r r :g g :b b :a a)
+        )
+  (set! (-> (the-as (pointer gs-xyzf) base) (+ (* index 2) 1))
+        (new 'static 'gs-xyzf :x (* (+ x 1792) 16) :y (* (+ y 1840) 16) :z #x3fffff)
+        )
+  0
+  )
+
+(defun blast-wheel-begin ((buf dma-buffer) (count int))
+  ;; Starts a packet of COUNT triangle-list vertices and returns where the vertices go. The renderer ignores the PRE/PRIM of a
+  ;; reg-list GIF tag, so the PRIM register is written as data by a first tag (two PRIM writes = one full qword), then the vertices follow.
+  (let* ((start (-> buf base))
+         (qwc (+ count 3))
+         )
+    (set! (-> (the-as dma-packet start) dma) (new 'static 'dma-tag :id (dma-tag-id cnt) :qwc qwc))
+    (set! (-> (the-as dma-packet start) vif0) (new 'static 'vif-tag))
+    (set! (-> (the-as dma-packet start) vif1)
+          (new 'static 'vif-tag :cmd (vif-cmd direct) :msk #x1 :imm qwc))
+    (let ((tag-a (&+ (the-as pointer start) 16)))
+      (set! (-> (the-as gs-gif-tag tag-a) tag)
+            (new 'static 'gif-tag64 :nloop #x1 :flg (gif-flag reg-list) :nreg #x2)
+            )
+      (set! (-> (the-as gs-gif-tag tag-a) regs) (new 'static 'gif-tag-regs))
+      )
+    (let ((prim-data (&+ (the-as pointer start) 32)))
+      (set! (-> (the-as (pointer gs-prim) prim-data) 0)
+            (new 'static 'gs-prim :prim (gs-prim-type tri) :iip #x1 :abe #x1))
+      (set! (-> (the-as (pointer gs-prim) prim-data) 1)
+            (new 'static 'gs-prim :prim (gs-prim-type tri) :iip #x1 :abe #x1))
+      )
+    (let ((tag-b (&+ (the-as pointer start) 48)))
+      (set! (-> (the-as gs-gif-tag tag-b) tag)
+            (new 'static 'gif-tag64 :nloop count :eop #x1 :flg (gif-flag reg-list) :nreg #x2)
+            )
+      (set! (-> (the-as gs-gif-tag tag-b) regs)
+            (new 'static 'gif-tag-regs :regs0 (gif-reg-id rgbaq) :regs1 (gif-reg-id xyzf2))
+            )
+      )
+    (&+ (the-as pointer start) 64)
+    )
+  )
+
+(defun blast-wheel-draw-fan ((buf dma-buffer)
+                             (cx int) (cy int) (radius int) (segments int)
+                             (wheel symbol) (light float) (color rgba))
+  (let* ((vertex-count (* segments 3))
+         (vertices (blast-wheel-begin buf vertex-count))
+         )
+    
+      (dotimes (i segments)
+        (let* ((fraction0 (/ (the float i) (the float segments)))
+               (fraction1 (/ (the float (+ i 1)) (the float segments)))
+               (angle0 (* fraction0 65536.0))
+               (angle1 (* fraction1 65536.0))
+               (idx (* i 3))
+               (center-r (the int (-> color r)))
+               (center-g (the int (-> color g)))
+               (center-b (the int (-> color b)))
+               (edge0-r center-r)
+               (edge0-g center-g)
+               (edge0-b center-b)
+               (edge1-r center-r)
+               (edge1-g center-g)
+               (edge1-b center-b)
+               )
+          (when wheel
+            (blast-wheel-hsl! 0.0 0.0 light)
+            (set! center-r (the int (* 255.0 *blast-wheel-tr*)))
+            (set! center-g (the int (* 255.0 *blast-wheel-tg*)))
+            (set! center-b (the int (* 255.0 *blast-wheel-tb*)))
+            (blast-wheel-hsl! (* fraction0 360.0) 1.0 light)
+            (set! edge0-r (the int (* 255.0 *blast-wheel-tr*)))
+            (set! edge0-g (the int (* 255.0 *blast-wheel-tg*)))
+            (set! edge0-b (the int (* 255.0 *blast-wheel-tb*)))
+            (blast-wheel-hsl! (* fraction1 360.0) 1.0 light)
+            (set! edge1-r (the int (* 255.0 *blast-wheel-tr*)))
+            (set! edge1-g (the int (* 255.0 *blast-wheel-tg*)))
+            (set! edge1-b (the int (* 255.0 *blast-wheel-tb*)))
+            )
+          (blast-wheel-write-vertex vertices idx cx cy center-r center-g center-b 255)
+          (blast-wheel-write-vertex
+            vertices (+ idx 1)
+            (+ cx (the int (* (the float radius) (sin angle0))))
+            (- cy (the int (* (the float radius) (cos angle0))))
+            edge0-r edge0-g edge0-b 255
+            )
+          (blast-wheel-write-vertex
+            vertices (+ idx 2)
+            (+ cx (the int (* (the float radius) (sin angle1))))
+            (- cy (the int (* (the float radius) (cos angle1))))
+            edge1-r edge1-g edge1-b 255
             )
           )
-        ;; cursor on the ring at the chosen hue: white outline, the chosen colour inside
-        (ahud-rect! (-> this sprites (+ first 9)) (- px 11) (- py 11) 22 22 255 255 255)
-        (ahud-rect! (-> this sprites (+ first 10)) (- px 7) (- py 7) 14 14 cr cg cb)
-        ;; preview swatch in the middle
-        (ahud-rect! (-> this sprites (+ first 11)) (- cx 28) (- cy 28) 56 56 255 255 255)
-        (ahud-rect! (-> this sprites (+ first 12)) (- cx 24) (- cy 24) 48 48 cr cg cb)
-        ;; lightness bar (top = white, bottom = black) and its marker
-        (ahud-rect! (-> this sprites (+ first 13)) (+ cx 114) (- cy 60) 14 120 110 110 110)
-        (ahud-rect! (-> this sprites (+ first 14)) (+ cx 108) (- (+ cy 58) lp) 26 5 255 255 255)
         )
+      (set! (-> buf base) (&+ (the-as pointer vertices) (* vertex-count 16)))
       )
-    (else
-      (dotimes (i 15)
-        (set! (-> this sprites (+ first i) scale-x) 0.0)
-        (set! (-> this sprites (+ first i) scale-y) 0.0)
+  0
+  )
+
+(defmacro blast-wheel-pack (r g b a)
+  `(logior ,r (shl ,g 8) (shl ,b 16) (shl ,a 24))
+  )
+
+(defun blast-wheel-draw-quad ((buf dma-buffer) (x int) (y int) (w int) (h int) (c-top int) (c-bottom int))
+  ;; one rectangle as two Gouraud triangles
+  (let ((v (blast-wheel-begin buf 6))
+        (tr (logand c-top 255))
+        (tg (logand (shr c-top 8) 255))
+        (tb (logand (shr c-top 16) 255))
+        (ta (logand (shr c-top 24) 255))
+        (br (logand c-bottom 255))
+        (bg (logand (shr c-bottom 8) 255))
+        (bb (logand (shr c-bottom 16) 255))
+        (ba (logand (shr c-bottom 24) 255))
+        (x1 (+ x w))
+        (y1 (+ y h))
+        )
+    (blast-wheel-write-vertex v 0 x y tr tg tb ta)
+    (blast-wheel-write-vertex v 1 x1 y tr tg tb ta)
+    (blast-wheel-write-vertex v 2 x y1 br bg bb ba)
+    (blast-wheel-write-vertex v 3 x1 y tr tg tb ta)
+    (blast-wheel-write-vertex v 4 x1 y1 br bg bb ba)
+    (blast-wheel-write-vertex v 5 x y1 br bg bb ba)
+    (set! (-> buf base) (&+ (the-as pointer v) 96))
+    )
+  0
+  )
+
+(defun blast-wheel-draw-rect ((buf dma-buffer) (x int) (y int) (w int) (h int) (c int))
+  (blast-wheel-draw-quad buf x y w h c c)
+  )
+
+(defun blast-wheel-draw-lightness-bar ((buf dma-buffer) (x int) (y int) (w int) (h int))
+  (blast-wheel-draw-quad buf x y w h (blast-wheel-pack 255 255 255 255) (blast-wheel-pack 0 0 0 255))
+  )
+
+(defun blast-wheel-draw ((this hud) (first int))
+  (when *blast-wheel-open*
+    (with-dma-buffer-add-bucket ((buf (-> *display* frames (-> *display* on-screen) global-buf))
+                                 (bucket-id hud-draw-hud-alpha)
+                                 )
+      (let* ((cx 256)
+             (cy 208)
+             (radius 70)
+             (px (+ cx (the int (* (the float radius) *blast-wheel-curx*))))
+             (py (+ cy (the int (* (the float radius) *blast-wheel-cury*))))
+             (cr (the int (* 255.0 (blast-col-get *blast-wheel-target* 0))))
+             (cg (the int (* 255.0 (blast-col-get *blast-wheel-target* 1))))
+             (cb (the int (* 255.0 (blast-col-get *blast-wheel-target* 2))))
+             (light-y (- (+ cy 60) (the int (* 120.0 *blast-wheel-light*))))
+             (black (static-rgba 0 0 0 255))
+             (white (static-rgba 255 255 255 255))
+             (preview (the-as rgba (logior cr (shl cg 8) (shl cb 16) (shl 255 24))))
+             )
+        (blast-wheel-draw-rect buf (- cx 110) (- cy 100) 250 200 (blast-wheel-pack 20 20 24 200))
+        (blast-wheel-draw-fan buf cx cy (+ radius 3) 96 #f 0.5 black)
+        (blast-wheel-draw-fan buf cx cy radius 96 #t *blast-wheel-light* black)
+        (blast-wheel-draw-fan buf px py 9 24 #f 0.5 white)
+        (blast-wheel-draw-fan buf px py 5 24 #f 0.5 preview)
+        (blast-wheel-draw-lightness-bar buf (+ cx 112) (- cy 60) 14 120)
+        (blast-wheel-draw-rect buf (+ cx 108) (- light-y 3) 22 6 (blast-wheel-pack 24 24 28 255))
+        (blast-wheel-draw-rect buf (+ cx 109) (- light-y 1) 20 2 (blast-wheel-pack 255 255 255 255))
+        (blast-wheel-draw-rect buf (+ cx 80) (- cy 12) 26 26 (blast-wheel-pack 255 255 255 255))
+        (blast-wheel-draw-rect buf (+ cx 82) (- cy 10) 22 22 (blast-wheel-pack cr cg cb 255))
         )
       )
     )

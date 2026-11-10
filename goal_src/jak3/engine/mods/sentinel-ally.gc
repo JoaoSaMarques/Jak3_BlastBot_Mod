@@ -66,6 +66,8 @@
               :texture-level 10
               )
 
+(define-extern blast-minion-tint-apply (function process-drawable int none))   ;; blastbot-colors.gc
+
 (deftype sentinel-ally (process-drawable)
   ((owner-handle   handle)      ;; the bot that launched it
    (target-handle  handle)      ;; the enemy it is shooting at
@@ -315,6 +317,7 @@
 
 (defun sentinel-ally-update ((this sentinel-ally))
   ;; once per frame from the active state's :trans
+  (blast-minion-tint-apply this 3)
   (let ((owner (as-type (handle->process (-> this owner-handle)) process-drawable)))
     (cond
       ((or (not owner)

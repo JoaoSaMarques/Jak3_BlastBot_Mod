@@ -93,7 +93,251 @@
        (logtest? (-> *game-info* secrets) (game-secrets bot-naked)))
   )
 
+(defun blast-col-secret-on? ((ti int))
+  ;; ti: 0 = the bot, 1 = spy droids, 2 = roboguards, 3 = sentinels. On = bought and switched on in the secrets menu.
+  (case ti
+    ((0) (blast-bot-wheel-secret?))
+    ((1) (and (logtest? (-> *game-info* purchase-secrets) (game-secrets bot-color-spy))
+              (logtest? (-> *game-info* secrets) (game-secrets bot-color-spy))))
+    ((2) (and (logtest? (-> *game-info* purchase-secrets) (game-secrets bot-color-robo))
+              (logtest? (-> *game-info* secrets) (game-secrets bot-color-robo))))
+    ((3) (and (logtest? (-> *game-info* purchase-secrets) (game-secrets bot-color-sentinel))
+              (logtest? (-> *game-info* secrets) (game-secrets bot-color-sentinel))))
+    (else #f)
+    )
+  )
+
+;; Colours of the minions: r g b per target (index ti * 3 + channel). Target 0 (the bot) keeps using *blast-bot-color-r/g/b* above.
+(define *blast-col-rgb* (new 'global 'boxed-array float 12))
+(defun blast-col-init ()
+  (when (and (zero? (-> *blast-col-rgb* 5)) (zero? (-> *blast-col-rgb* 8)))
+    (dotimes (ti 4)
+      (set! (-> *blast-col-rgb* (* ti 3)) 0.0)
+      (set! (-> *blast-col-rgb* (+ (* ti 3) 1)) 0.2)
+      (set! (-> *blast-col-rgb* (+ (* ti 3) 2)) 1.0)
+      )
+    )
+  0
+  )
+(blast-col-init)
+
+(defun blast-col-get ((ti int) (ci int))
+  (if (zero? ti)
+      (case ci
+        ((0) *blast-bot-color-r*)
+        ((1) *blast-bot-color-g*)
+        (else *blast-bot-color-b*)
+        )
+      (-> *blast-col-rgb* (+ (* ti 3) ci))
+      )
+  )
+
+(defun blast-col-set! ((ti int) (r float) (g float) (b float))
+  (if (zero? ti)
+      (begin
+        (set! *blast-bot-color-r* r)
+        (set! *blast-bot-color-g* g)
+        (set! *blast-bot-color-b* b)
+        )
+      (begin
+        (set! (-> *blast-col-rgb* (* ti 3)) r)
+        (set! (-> *blast-col-rgb* (+ (* ti 3) 1)) g)
+        (set! (-> *blast-col-rgb* (+ (* ti 3) 2)) b)
+        )
+      )
+  0
+  )
+
+;; Minion tint. The minions' models keep their texture; the picked colour multiplies it (and adds a little light), on top of whatever
+;; the enemy code already put in the draw-control (hit flashes). *blast-minion-strength*: 0 = no tint, 1 = full.
+;; *blast-minion-strength*: 0 = no tint, 1 = full.
+(define *blast-minion-strength* 0.85)
+;; Which parts (merc effects) get the colour, one bit per effect: 2 = effect 1, 6 = effects 1 and 2 ... 0 = the whole model.
+;; Find the numbers with the effect finder below, then put them here (or set them from the REPL).
+(define *blast-minion-mask-spy* 0)
+(define *blast-minion-mask-robo* 0)
+(define *blast-minion-mask-sentinel* 0)
+;; Effect finder: (blast-minion-fx 3 2) makes every roboguard (kind 2) hide ONLY its effect 3, so you see which part disappears.
+;; Kind: 0 = all minions, 1 = spy droids, 2 = roboguards, 3 = sentinels. (blast-minion-fx -1 0) turns it off.
+;; While it is on, L1 + Square steps to the next effect (and prints its number); Square still does its normal dash.
+(define *blast-minion-effect-index* -1)
+;; The roboguard's armour plates are not merc effects: roboguard.gc breaks them off with setup-masks, i.e. the draw-control's seg-mask
+;; (bit 0 = body, bits 1-7 = the plates). A #t here makes that minion type use seg-mask instead of effect-mask for the part mask.
+(define *blast-minion-seg-spy* #f)
+(define *blast-minion-seg-robo* #t)
+(define *blast-minion-seg-sentinel* #f)
+(define *blast-minion-fx-seg* #f)   ;; the effect finder steps seg-mask bits instead of effects
+(define *blast-minion-effect-kind* 0)
+(define *blast-minion-dma-add-orig* (the-as (function process-drawable draw-control symbol object none) #f))
+
+(defun blast-minion-fx ((idx int) (kind int))
+  (set! *blast-minion-effect-index* idx)
+  (set! *blast-minion-effect-kind* kind)
+  (set! *blast-minion-fx-seg* #f)
+  0
+  )
+
+(defun blast-minion-mask-get ((dc draw-control) (seg symbol))
+  (if seg
+      (the-as uint (-> dc seg-mask))
+      (the-as uint (-> dc effect-mask))
+      )
+  )
+
+(defun blast-minion-mask-set! ((dc draw-control) (seg symbol) (v uint))
+  (if seg
+      (set! (-> dc seg-mask) v)
+      (set! (-> dc effect-mask) v)
+      )
+  0
+  )
+
+(defun blast-minion-fx-update ()
+  ;; effect finder is on (index >= 0): L1 + Square steps to the next effect (0..31, then back to 0), once per frame from blast-bot-color-update
+  (when (and (>= *blast-minion-effect-index* 0) (cpad-hold? 0 l1) (cpad-pressed? 0 square))
+    (+! *blast-minion-effect-index* 1)
+    (if (> *blast-minion-effect-index* 31)
+        (set! *blast-minion-effect-index* 0)
+        )
+    (format 0 "minion effect ~D~%" *blast-minion-effect-index*)
+    )
+  0
+  )
+
+(defun blast-minion-fx-seg ((idx int) (kind int))
+  ;; same as blast-minion-fx, but steps the segments (seg-mask) instead of the merc effects: (blast-minion-fx-seg 1 2) for roboguards
+  (set! *blast-minion-effect-index* idx)
+  (set! *blast-minion-effect-kind* kind)
+  (set! *blast-minion-fx-seg* #t)
+  0
+  )
+
+(defun blast-minion-debug? ((ti int))
+  (and (>= *blast-minion-effect-index* 0)
+       (or (zero? *blast-minion-effect-kind*) (= *blast-minion-effect-kind* ti)))
+  )
+
+(defun blast-minion-tint-set ((dc draw-control) (old-mult vector) (old-emis vector) (ti int))
+  (let ((k *blast-minion-strength*)
+        (r (blast-col-get ti 0))
+        (g (blast-col-get ti 1))
+        (b (blast-col-get ti 2))
+        )
+    (set-vector! (-> dc color-mult)
+                 (* (-> old-mult x) (+ (- 1.0 k) (* k r 2.0)))
+                 (* (-> old-mult y) (+ (- 1.0 k) (* k g 2.0)))
+                 (* (-> old-mult z) (+ (- 1.0 k) (* k b 2.0)))
+                 (-> old-mult w)
+                 )
+    (set-vector! (-> dc color-emissive)
+                 (+ (-> old-emis x) (* k r 0.25))
+                 (+ (-> old-emis y) (* k g 0.25))
+                 (+ (-> old-emis z) (* k b 0.25))
+                 (-> old-emis w)
+                 )
+    )
+  0
+  )
+
+(defun blast-minion-draw ((pd process-drawable) (dc draw-control) (flag symbol) (buf object) (ti int))
+  ;; A SET bit in the mask HIDES that part. With a part mask: pass 1 draws everything except the coloured parts, pass 2 draws only them, tinted.
+  (let* ((orig *blast-minion-dma-add-orig*)
+         (old-mult (new 'stack-no-clear 'vector))
+         (old-emis (new 'stack-no-clear 'vector))
+         (debug (blast-minion-debug? ti))
+         (seg (if debug
+                  *blast-minion-fx-seg*
+                  (case ti
+                    ((1) *blast-minion-seg-spy*)
+                    ((2) *blast-minion-seg-robo*)
+                    (else *blast-minion-seg-sentinel*)
+                    )
+                  ))
+         (old-mask (blast-minion-mask-get dc seg))
+         (mask (case ti
+                 ((1) *blast-minion-mask-spy*)
+                 ((2) *blast-minion-mask-robo*)
+                 (else *blast-minion-mask-sentinel*)
+                 ))
+         )
+    (when orig
+      (set! (-> old-mult quad) (-> dc color-mult quad))
+      (set! (-> old-emis quad) (-> dc color-emissive quad))
+      (cond
+        (debug
+         (blast-minion-mask-set! dc seg (logior old-mask (the-as uint (ash 1 *blast-minion-effect-index*))))
+         (orig pd dc flag buf)
+         )
+        ((zero? mask)
+         (blast-minion-tint-set dc old-mult old-emis ti)
+         (orig pd dc flag buf)
+         )
+        (else
+          (blast-minion-mask-set! dc seg (logior old-mask (the-as uint mask)))
+          (orig pd dc flag buf)
+          (blast-minion-mask-set! dc seg (logior old-mask (the-as uint (lognot mask))))
+          (blast-minion-tint-set dc old-mult old-emis ti)
+          (orig pd dc flag buf)
+          )
+        )
+      (blast-minion-mask-set! dc seg old-mask)
+      (set! (-> dc color-mult quad) (-> old-mult quad))
+      (set! (-> dc color-emissive quad) (-> old-emis quad))
+      )
+    )
+  (none)
+  )
+
+(defun blast-minion-dma-add-spy ((pd process-drawable) (dc draw-control) (flag symbol) (buf object))
+  (blast-minion-draw pd dc flag buf 1)
+  (none)
+  )
+
+(defun blast-minion-dma-add-robo ((pd process-drawable) (dc draw-control) (flag symbol) (buf object))
+  (blast-minion-draw pd dc flag buf 2)
+  (none)
+  )
+
+(defun blast-minion-dma-add-sentinel ((pd process-drawable) (dc draw-control) (flag symbol) (buf object))
+  (blast-minion-draw pd dc flag buf 3)
+  (none)
+  )
+
+(defun blast-minion-tint-apply ((pd process-drawable) (ti int))
+  ;; called every frame by each minion (ti 1 = spy droid, 2 = roboguard, 3 = sentinel); hooks / unhooks its draw function
+  (when (-> pd draw)
+    (let* ((cur (the-as int (-> pd draw dma-add-func)))
+           (ours (or (= cur (the-as int blast-minion-dma-add-spy))
+                     (= cur (the-as int blast-minion-dma-add-robo))
+                     (= cur (the-as int blast-minion-dma-add-sentinel))))
+           (want (or (blast-col-secret-on? ti) (blast-minion-debug? ti)))
+           (hook (the-as (function process-drawable draw-control symbol object none)
+                         (case ti
+                           ((1) blast-minion-dma-add-spy)
+                           ((2) blast-minion-dma-add-robo)
+                           (else blast-minion-dma-add-sentinel)
+                           )))
+           )
+      (if want
+          (when (!= cur (the-as int hook))
+            (when (and (not ours) (not *blast-minion-dma-add-orig*))
+              (set! *blast-minion-dma-add-orig* (-> pd draw dma-add-func))
+              )
+            (when (or ours *blast-minion-dma-add-orig*)
+              (set! (-> pd draw dma-add-func) hook)
+              )
+            )
+          (when (and ours *blast-minion-dma-add-orig*)
+            (set! (-> pd draw dma-add-func) *blast-minion-dma-add-orig*)
+            )
+          )
+      )
+    )
+  (none)
+  )
+
 (defun blast-bot-color-update ((this blast-bot-player))
+  (blast-minion-fx-update)
   (set! *blast-bot-color-mode* (if (blast-bot-wheel-secret?) 1 0))
   (set! *blast-bot-naked* (blast-bot-naked-secret?))
   (blast-wheel-update)
