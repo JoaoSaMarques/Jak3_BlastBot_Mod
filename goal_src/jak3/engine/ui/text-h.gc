@@ -1631,6 +1631,8 @@
   (no-menu-data #x100001)
   (next-page #x100002)
   (previous-page #x100003)
+  (progress-secrets-bot-colorwheel #x20000)
+  (progress-secrets-bot-naked #x20003)
 
   )
 ;; ---text-id

@@ -188,6 +188,8 @@
     ((= arg0 (text-id progress-secrets-vehicle-x-ride)) "Vehicle: Bodyguards")
     ((= arg0 (text-id progress-secrets-big-head)) "Bighead: Bot")
     ((= arg0 (text-id progress-secrets-little-head)) "Smallhead Bot")
+    ((= arg0 (text-id progress-secrets-bot-colorwheel)) "Bot Color Wheel")
+    ((= arg0 (text-id progress-secrets-bot-naked)) "Naked Bot")
     (else #f)
     )
   )

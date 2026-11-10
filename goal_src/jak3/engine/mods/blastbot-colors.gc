@@ -1,0 +1,119 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: blastbot-colors.gc
+;; name in dgo: blastbot-colors
+;; dgos: GAME
+
+;; Everything about the Blast Bot's plate colour: the Bot Color Wheel secret, the Naked Bot secret (red plates hidden) and the draw
+;; hook that makes them work. The colour wheel itself (the picker you steer with the sticks) is in blastbot-colorwheel.gc.
+;;
+;; Needs, in game.gd, in this order:
+;;   blastbot-main-mod.o        (the blast-bot-player type, and the define-externs that point at this file and the next one)
+;;   blastbot-colors.o          <- this file
+;;   blastbot-colorwheel.o      (the picker; sets *blast-bot-color-r/g/b* below)
+;;   blastbot_guns.o
+
+;; Bot Color Wheel secret: 0 = off, 1 = on (the plates get the colour *blast-bot-color-r/g/b*). Set every frame by blast-bot-color-update.
+;; The bot's model is split into merc effects: effect 0 = the eye, effect 1 = the red armour plates, effects 2/3 = the body. The colour applies to the plates only.
+(define *blast-bot-color-mode* 0)
+(define *blast-bot-naked* #f)       ;; Naked Bot secret: the red plates are not drawn at all
+;; the picked colour, 0.0 .. 1.0 each (set by the colour wheel). The default is the old blue.
+(define *blast-bot-color-r* 0.0)
+(define *blast-bot-color-g* 0.2)
+(define *blast-bot-color-b* 1.0)
+;; The plate texture is red, so the emissive has to be pushed well past 1.0 in the green / blue channels to come out as a solid colour,
+;; and the red channel is pushed below zero when the colour has no red. These gains are what you tune from the REPL if a colour looks off:
+;; emissive = (R * gain-r - (1 - R) * kill-r, G * gain-g, B * gain-b). The defaults give exactly the old blue and green.
+(define *blast-bot-gain-r* 1.0)
+(define *blast-bot-gain-g* 4.0)   ;; was 2.0: too little green made white come out magenta and yellow brown
+(define *blast-bot-gain-b* 5.0)
+(define *blast-bot-kill-r* 1.0)
+;; The stock draw function of the bot, kept while blast-bot-dma-add is hooked in (only while a colour / naked secret is on).
+(define *blast-bot-dma-add-orig* (the-as (function process-drawable draw-control symbol object none) #f))
+
+;; defined in blastbot-colorwheel.gc (loaded after this file)
+(define-extern blast-wheel-update (function none))
+
+(defun blast-bot-set-tint ((dc draw-control))
+  ;; color-mult scales the texture, color-emissive adds flat light: mult 0 drops the texture and shading completely, so the emissive is the whole colour (solid)
+  (set-vector! (-> dc color-mult) 0.0 0.0 0.0 1.0)
+  (set-vector! (-> dc color-emissive)
+               (- (* *blast-bot-color-r* *blast-bot-gain-r*) (* (- 1.0 *blast-bot-color-r*) *blast-bot-kill-r*))
+               (* *blast-bot-color-g* *blast-bot-gain-g*)
+               (* *blast-bot-color-b* *blast-bot-gain-b*)
+               0.0
+               )
+  (none)
+  )
+
+;; Draws the bot up to two times: everything that keeps its colour, then the armour plates (effect 1) with
+;; their own colour. A SET bit in draw effect-mask HIDES that effect (0 = hide nothing). Naked Bot hides the plates in the
+;; first pass and skips the second one. Only hooked in while a colour / naked secret is on, otherwise the bot draws with its stock function.
+(defun blast-bot-dma-add ((pd process-drawable) (dc draw-control) (flag symbol) (buf object))
+  (let* ((orig *blast-bot-dma-add-orig*)
+         (old-mask (the-as uint (-> dc effect-mask)))
+         (old-mult (new 'stack-no-clear 'vector))
+         (old-emis (new 'stack-no-clear 'vector))
+         (naked *blast-bot-naked*)
+         (body-on (and (not naked) (!= *blast-bot-color-mode* 0)))
+         )
+    (when orig
+      (set! (-> old-mult quad) (-> dc color-mult quad))
+      (set! (-> old-emis quad) (-> dc color-emissive quad))
+      ;; main pass: the plates are hidden (they get their own pass, or none at all when naked)
+      (let ((main-mask old-mask))
+        (if (or naked body-on)
+            (set! main-mask (the-as uint (logior main-mask 2)))
+            )
+        (set! (-> dc effect-mask) main-mask)
+        (orig pd dc flag buf)
+        )
+      ;; plates only: everything except effect 1 is hidden
+      (when (and body-on (zero? (logand old-mask 2)))
+        (set! (-> dc effect-mask) (the-as uint (logior old-mask (lognot 2))))
+        (blast-bot-set-tint dc)
+        (orig pd dc flag buf)
+        )
+      (set! (-> dc effect-mask) old-mask)
+      (set! (-> dc color-mult quad) (-> old-mult quad))
+      (set! (-> dc color-emissive quad) (-> old-emis quad))
+      )
+    )
+  (none)
+  )
+
+(defun blast-bot-wheel-secret? ()
+  (and (logtest? (-> *game-info* purchase-secrets) (game-secrets bot-colorwheel))
+       (logtest? (-> *game-info* secrets) (game-secrets bot-colorwheel)))
+  )
+
+(defun blast-bot-naked-secret? ()
+  (and (logtest? (-> *game-info* purchase-secrets) (game-secrets bot-naked))
+       (logtest? (-> *game-info* secrets) (game-secrets bot-naked)))
+  )
+
+(defun blast-bot-color-update ((this blast-bot-player))
+  (set! *blast-bot-color-mode* (if (blast-bot-wheel-secret?) 1 0))
+  (set! *blast-bot-naked* (blast-bot-naked-secret?))
+  (blast-wheel-update)
+  (let ((hooked (= (the-as int (-> this draw dma-add-func)) (the-as int blast-bot-dma-add)))
+        (disable-envmap (draw-control-global-effect disable-envmap))
+        )
+    ;; the reflection is only turned off while a plate colour is on
+    (if (!= *blast-bot-color-mode* 0)
+        (logior! (-> this draw global-effect) disable-envmap)
+        (logclear! (-> this draw global-effect) disable-envmap)
+        )
+    (if (or (!= *blast-bot-color-mode* 0) *blast-bot-naked*)
+        (when (not hooked)
+          (set! *blast-bot-dma-add-orig* (-> this draw dma-add-func))
+          (set! (-> this draw dma-add-func) blast-bot-dma-add)
+          )
+        (when hooked
+          (set! (-> this draw dma-add-func) *blast-bot-dma-add-orig*)
+          )
+        )
+    )
+  (none)
+  )

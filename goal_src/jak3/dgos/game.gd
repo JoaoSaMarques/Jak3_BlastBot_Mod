@@ -507,6 +507,8 @@
   "blastbot-allyhud.o" ;; added - minion count boxes for the Blast Bot HUD (after the three ally files, before blastbot-main-mod.o)
   "mod-common-functions.o" ;; added
   "blastbot-main-mod.o" ;; added - the Blast Bot itself, its HUD and spawn functions (must be before blastbot_guns.o and mod-custom-code.o)
+  "blastbot-colors.o" ;; added - Blast Bot plate colour + Naked Bot secrets and the draw hook (must be after blastbot-main-mod.o, which it needs for the blast-bot-player type, and before blastbot_guns.o)
+  "blastbot-colorwheel.o" ;; added - Blast Bot colour wheel picker (must be after blastbot-colors.o, blastbot-main-mod.o and blastbot-allyhud.o)
   "blastbot-elevator.o" ;; added - Blast Bot elevator rides: camera sequence, level loads, skip (must be after blastbot-main-mod.o, which it needs for the blast-bot-player type; elevator.o reaches it through define-extern)
   "blastbot-vehicle.o" ;; added - Blast Bot vehicle merge / ride / wall (must be after blastbot-main-mod.o, which it needs for the blast-bot-player type, before blastbot_guns.o)
   "blastbot_guns.o" ;; added - Blast Bot weapons (must be after blastbot-main-mod.o, which it needs for the blast-bot-player type)

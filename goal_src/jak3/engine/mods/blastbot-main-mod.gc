@@ -14,6 +14,8 @@
 ;;   spydroid-ally.o, sentinel-ally.o, roboguard-ally.o, bombbot-ally.o, blastbot-ordnance.o, blastbot-allyhud.o   (all before)
 ;;   mod-common-functions.o
 ;;   blastbot-main-mod.o        <- this file
+;;   blastbot-colors.o          (colour secrets + Naked Bot, needs the blast-bot-player type from here)
+;;   blastbot-colorwheel.o      (the colour picker, needs blast-bot-stick-axis from here and the ahud-rect! macro of blastbot-allyhud.o)
 ;;   blastbot_guns.o            (needs the blast-bot-player type from here)
 ;; and anything that calls spawn-my-bombbot / blast-bot-pad-check (your mod-custom-code.gc) after this file.
 ;; The weapons are in blastbot_guns.gc; this file reaches them through the define-extern lines below.
@@ -289,6 +291,15 @@
 (define *blast-bot-head-scale-turret* #f)   ;; #t: swivel + gun are drawn at the head size too
 (define *blast-bot-head-scale* 1.0)         ;; current, eases towards the goal
 (define *blast-bot-head-scale-goal* 1.0)    ;; 2.0 big, 0.5 small
+;; Colour secrets, Naked Bot and the draw hook live in blastbot-colors.gc (loaded right after this file).
+(define-extern blast-bot-color-update (function blast-bot-player none))
+(define-extern blast-bot-wheel-capture (function none))   ;; blastbot-colorwheel.gc
+(define-extern blast-wheel-draw (function hud int int))   ;; blastbot-colorwheel.gc
+;; Finding the red parts: the model is made of merc effects (separate meshes). (set! *blast-bot-effect-debug* #t) in the REPL: only one
+;; effect is hidden at a time (a set bit in effect-mask hides it), Triangle steps to the next (ignored while L1 is held, that is the despawn) and the index goes to the
+;; console. -1 = nothing hidden. (set! *blast-bot-effect-index* N) picks one by hand. Temporary, to be moved off Triangle.
+(define *blast-bot-effect-debug* #f)
+(define *blast-bot-effect-index* -1)
 ;; Haven awnings (and any other `bouncer`) collide as `crate` in the hit-by-player list, which the bot's wall / ground / foot probes never
 ;; looked at, so it sank through them although Jak walks up them like a ramp. #t: they count as walls and as ground.
 (define *blast-bot-wall-bouncers* #t)
@@ -2764,6 +2775,7 @@
     )
   ;; sprites 15-29 + strings 0-2: the minion boxes, top left (blastbot-allyhud.gc)
   (ahud-draw-boxes this 15)
+  (blast-wheel-draw this 15)
   ((method-of-type hud draw) this)
   0
   (none)
@@ -4283,6 +4295,27 @@
   (none)
   )
 
+(defun blast-bot-effect-debug-update ((this blast-bot-player))
+  (if *blast-bot-effect-debug*
+      (let ((idx *blast-bot-effect-index*))
+        (when (and (cpad-pressed? 0 triangle) (not (cpad-hold? 0 l1)))
+          (+! idx 1)
+          (if (> idx 31)
+              (set! idx -1)
+              )
+          (set! *blast-bot-effect-index* idx)
+          (format 0 "bot effect ~D~%" idx)
+          )
+        (set! (-> this draw effect-mask) (if (< idx 0) (the-as uint 0) (the-as uint (ash 1 idx))))
+        )
+      (when (!= *blast-bot-effect-index* -1)
+        (set! *blast-bot-effect-index* -1)
+        (set! (-> this draw effect-mask) (the-as uint 0))
+        )
+      )
+  (none)
+  )
+
 (defstate active (blast-bot-player)
   :virtual #t
   :event (behavior ((proc process) (argc int) (message symbol) (block event-message-block))
@@ -4417,6 +4450,7 @@
       )
     )
   :trans (behavior ()
+    (blast-bot-wheel-capture)   ;; the colour wheel swallows the sticks and X while it is open (blastbot-colorwheel.gc)
     (when (<= (-> self health) 0.0)
       (go-virtual die)
       )
@@ -4443,6 +4477,8 @@
       (set! (-> self input-active) #f)
       (seek! (-> self hit-flash) 0.0 (* dt 3.0))
       (seek! *blast-bot-head-scale* *blast-bot-head-scale-goal* (* 2.0 dt))
+      (blast-bot-effect-debug-update self)
+      (blast-bot-color-update self)
       (when (and *blast-bot-wall-debug* (>= (current-time) *blast-bot-wall-debug-next*))
         (set! *blast-bot-wall-debug-next* (+ (current-time) (seconds 1.0)))
         (format 0 "wall probes (ahead / up / down):~%")

@@ -1,0 +1,201 @@
+;;-*-Lisp-*-
+(in-package goal)
+
+;; name: blastbot-colorwheel.gc
+;; name in dgo: blastbot-colorwheel
+;; dgos: GAME
+
+;; The Bot Color Wheel picker. Turning the "Bot Color Wheel" secret ON opens it on screen; then
+;;   left stick   = the colour: its direction is the hue, how far you push it is the saturation (let go and the colour stays)
+;;   right stick  = black <-> white: up makes it lighter, down darker (HSL lightness; the middle is the pure colour)
+;;   X            = confirm: the wheel closes and the colour stays on the plates (secret stays ON; switching it OFF and ON again reopens the wheel)
+;; While it is open the sticks and X are swallowed (blast-bot-wheel-capture is the first thing the bot's :trans does), so the bot
+;; does not move, aim or jump.
+;;
+;; The wheel is drawn with the 15 hud sprites 15..29 of blast-bot-hud that nothing uses any more (the ally boxes have their own hud now):
+;; 1 panel, 8 hue cells in a ring, 2 for the cursor, 2 for the preview swatch, 2 for the lightness bar. A coarse wheel, but no new hud
+;; process and no new gui channel are needed.
+;;
+;; Needs, in game.gd:  blastbot-colorwheel.o  after blastbot-colors.o (and so after blastbot-main-mod.o and blastbot-allyhud.o,
+;; which defines the ahud-rect! macro used here).
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Knobs (set from the REPL)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *blast-wheel-dir-sign* -1.0)     ;; 1.0 if the cursor moves the opposite way to the left stick (it did with 1.0, so the default is -1.0)
+(define *blast-wheel-light-sign* -1.0)   ;; 1.0 if right stick UP makes it darker instead of lighter
+(define *blast-wheel-light-rate* 0.6)    ;; lightness change per second at full right-stick push
+(define *blast-wheel-deadzone* 0.1)      ;; left stick pushed less than this = the colour stays as it is
+(define *blast-wheel-confirm-delay* 0.5) ;; seconds after opening in which X is ignored (so the X that switched the secret on does not confirm)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; State
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define *blast-wheel-open* #f)
+(define *blast-wheel-prev-on* #f)
+(define *blast-wheel-seen* #f)
+(define *blast-wheel-open-time* (the-as time-frame 0))
+(define *blast-wheel-hue* 228.0)         ;; degrees 0..360 (0 = stick up, clockwise)
+(define *blast-wheel-sat* 1.0)           ;; 0..1
+(define *blast-wheel-light* 0.5)         ;; 0 = black, 0.5 = the pure colour, 1 = white
+;; scratch result of blast-wheel-hsl!
+(define *blast-wheel-tr* 0.0)
+(define *blast-wheel-tg* 0.0)
+(define *blast-wheel-tb* 0.0)
+
+(defun blast-wheel-hsl! ((h float) (s float) (l float))
+  ;; HSL -> RGB (all 0..1, h in degrees 0..360) into *blast-wheel-tr/tg/tb*
+  (let* ((c (* (- 1.0 (fabs (- (* 2.0 l) 1.0))) s))
+         (hp (/ h 60.0))
+         (hm (- hp (* 2.0 (the float (the int (/ hp 2.0))))))
+         (x (* c (- 1.0 (fabs (- hm 1.0)))))
+         (m (- l (* 0.5 c)))
+         (r 0.0)
+         (g 0.0)
+         (b 0.0)
+         )
+    (case (the int hp)
+      ((0) (set! r c) (set! g x))
+      ((1) (set! r x) (set! g c))
+      ((2) (set! g c) (set! b x))
+      ((3) (set! g x) (set! b c))
+      ((4) (set! r x) (set! b c))
+      (else (set! r c) (set! b x))
+      )
+    (set! *blast-wheel-tr* (+ r m))
+    (set! *blast-wheel-tg* (+ g m))
+    (set! *blast-wheel-tb* (+ b m))
+    )
+  0
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Opening / closing (called every frame by blast-bot-color-update)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun blast-wheel-update ()
+  (let ((on (= *blast-bot-color-mode* 1)))
+    ;; the very first call only learns the state, so a bot spawned with the secret already on does not pop the wheel up
+    (when (not *blast-wheel-seen*)
+      (set! *blast-wheel-seen* #t)
+      (set! *blast-wheel-prev-on* on)
+      )
+    (when (and on (not *blast-wheel-prev-on*) (not *blast-wheel-open*))
+      (set! *blast-wheel-open* #t)
+      (set! *blast-wheel-open-time* (current-time))
+      )
+    (if (not on)
+        (set! *blast-wheel-open* #f)
+        )
+    (set! *blast-wheel-prev-on* on)
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Input (first thing in the bot's :trans)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun blast-bot-wheel-capture ()
+  (when *blast-wheel-open*
+    (let* ((pad (-> *cpad-list* cpads 0))
+           (speed (-> pad stick0-speed))
+           (dt (seconds-per-frame))
+           (ry (blast-bot-stick-axis (the-as int (-> pad righty))))
+           (confirm (and (cpad-pressed? 0 x)
+                         (>= (current-time) (+ *blast-wheel-open-time* (the int (* 300.0 *blast-wheel-confirm-delay*))))
+                         ))
+           )
+      ;; left stick: hue = direction, saturation = how far it is pushed
+      (when (< *blast-wheel-deadzone* speed)
+        (let ((deg (* *blast-wheel-dir-sign* (/ (-> pad stick0-dir) 182.04445))))
+          (while (< deg 0.0)
+            (set! deg (+ deg 360.0))
+            )
+          (while (>= deg 360.0)
+            (set! deg (- deg 360.0))
+            )
+          (set! *blast-wheel-hue* deg)
+          (set! *blast-wheel-sat* (fmin 1.0 speed))
+          )
+        )
+      ;; right stick: lightness
+      (set! *blast-wheel-light*
+            (fmax 0.0 (fmin 1.0 (+ *blast-wheel-light* (* ry *blast-wheel-light-sign* *blast-wheel-light-rate* dt))))
+            )
+      (blast-wheel-hsl! *blast-wheel-hue* *blast-wheel-sat* *blast-wheel-light*)
+      (set! *blast-bot-color-r* *blast-wheel-tr*)
+      (set! *blast-bot-color-g* *blast-wheel-tg*)
+      (set! *blast-bot-color-b* *blast-wheel-tb*)
+      ;; swallow the input so the bot does not also move / aim / jump
+      (set! (-> pad stick0-speed) 0.0)
+      (set! (-> pad rightx) 128)
+      (set! (-> pad righty) 128)
+      (logclear! (-> pad button0-abs 0) (pad-buttons x))
+      (logclear! (-> pad button0-rel 0) (pad-buttons x))
+      (when confirm
+        (set! *blast-wheel-open* #f)
+        )
+      )
+    )
+  (none)
+  )
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Drawing (called from blast-bot-hud's draw method, with FIRST = 15)
+;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defun blast-wheel-draw ((this hud) (first int))
+  (cond
+    (*blast-wheel-open*
+      (let* ((cx 256)
+             (cy 208)
+             (ring 64.0)
+             (cr (the int (* 255.0 *blast-bot-color-r*)))
+             (cg (the int (* 255.0 *blast-bot-color-g*)))
+             (cb (the int (* 255.0 *blast-bot-color-b*)))
+             (ang (* *blast-wheel-hue* 182.04445))
+             (px (+ cx (the int (* ring (sin ang)))))
+             (py (- cy (the int (* ring (cos ang)))))
+             (lp (the int (* 120.0 *blast-wheel-light*)))
+             )
+        ;; panel
+        (ahud-rect! (-> this sprites first) (- cx 110) (- cy 100) 250 200 24 24 28)
+        ;; the hue ring: 8 cells, always full colour
+        (dotimes (i 8)
+          (let ((a (* (the float i) 8192.0)))
+            (blast-wheel-hsl! (* 45.0 (the float i)) 1.0 0.5)
+            (ahud-rect! (-> this sprites (+ first 1 i))
+                        (- (+ cx (the int (* ring (sin a)))) 13)
+                        (- (- cy (the int (* ring (cos a)))) 13)
+                        26 26
+                        (the int (* 255.0 *blast-wheel-tr*))
+                        (the int (* 255.0 *blast-wheel-tg*))
+                        (the int (* 255.0 *blast-wheel-tb*))
+                        )
+            )
+          )
+        ;; cursor on the ring at the chosen hue: white outline, the chosen colour inside
+        (ahud-rect! (-> this sprites (+ first 9)) (- px 11) (- py 11) 22 22 255 255 255)
+        (ahud-rect! (-> this sprites (+ first 10)) (- px 7) (- py 7) 14 14 cr cg cb)
+        ;; preview swatch in the middle
+        (ahud-rect! (-> this sprites (+ first 11)) (- cx 28) (- cy 28) 56 56 255 255 255)
+        (ahud-rect! (-> this sprites (+ first 12)) (- cx 24) (- cy 24) 48 48 cr cg cb)
+        ;; lightness bar (top = white, bottom = black) and its marker
+        (ahud-rect! (-> this sprites (+ first 13)) (+ cx 114) (- cy 60) 14 120 110 110 110)
+        (ahud-rect! (-> this sprites (+ first 14)) (+ cx 108) (- (+ cy 58) lp) 26 5 255 255 255)
+        )
+      )
+    (else
+      (dotimes (i 15)
+        (set! (-> this sprites (+ first i) scale-x) 0.0)
+        (set! (-> this sprites (+ first i) scale-y) 0.0)
+        )
+      )
+    )
+  0
+  )
+
+;; load check
