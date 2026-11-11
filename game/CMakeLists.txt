@@ -369,3 +369,8 @@ target_link_libraries(gk runtime)
 if(WIN32)
     set_target_properties(gk PROPERTIES VS_DPI_AWARE "PerMonitor")
 endif()
+
+# write a linker map so a crash address can be turned into a function name
+if(WIN32)
+    target_link_options(gk PRIVATE "LINKER:/MAP:${CMAKE_BINARY_DIR}/gk.map")
+endif()

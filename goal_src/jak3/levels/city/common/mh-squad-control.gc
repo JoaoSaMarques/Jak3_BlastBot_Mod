@@ -126,7 +126,7 @@
           )
         (set! (-> this traffic object-type-info-array 0 target-counts (+ v1-0 (* (-> a3-2 grunt-settings object-type) 32)))
               (max
-                (min (-> a3-2 grunt-settings target-count) (-> a3-2 grunt-settings max-target-count))
+                (min (squad-scale-count (the-as int (-> a3-2 grunt-settings target-count))) (-> a3-2 grunt-settings max-target-count))
                 (-> a3-2 grunt-settings min-target-count)
                 )
               )

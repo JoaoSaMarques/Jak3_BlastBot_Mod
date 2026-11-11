@@ -21,7 +21,7 @@
 (defglobalconstant PC_PROFILER_ENABLE #t)
 
 ;; pointers larger than this are invalid by valid?
-(defconstant END_OF_MEMORY #x8000000)
+(defconstant END_OF_MEMORY #x10000000)
 
 (define-extern valid? (function object type string symbol object symbol))
 

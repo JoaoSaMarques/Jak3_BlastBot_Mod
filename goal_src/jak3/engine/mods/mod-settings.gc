@@ -45,6 +45,142 @@ if the result of rand-vu-int-range is 1, then DANCE! if it is not 1, then Don't 
 ;; Change #f to #t here to show the input display by default
 (define *show-input-display* #f)
 
+;; copies of level-owned launchers (bombbot 2060-2062, skeet 2100) so mod effects never depend on a level that can unload
+(defpart 5200
+  :init-specs ((:texture (glow level-default-sprite))
+    (:num 1.0)
+    (:scale-x (meters 0.2) (meters 0.05))
+    (:rot-x (degrees 1.125))
+    (:scale-y :copy scale-x)
+    (:r 128.0)
+    (:g 128.0 128.0)
+    (:b 255.0)
+    (:a 100.0 28.0)
+    (:rotvel-z (degrees 0.3))
+    (:timer (seconds 0.017))
+    (:flags (sp-cpuinfo-flag-2 sp-cpuinfo-flag-14 glow))
+    (:userdata 1.0)
+    )
+  )
+
+(defpart 5201
+  :init-specs ((:texture (glow-hotdot level-default-sprite))
+    (:num 1.0)
+    (:scale-x (meters 1.2) (meters 0.1))
+    (:rot-x (degrees 1.125))
+    (:scale-y :copy scale-x)
+    (:r 0.0 32.0)
+    (:g :copy r)
+    (:b 32.0 32.0)
+    (:a 32.0 32.0)
+    (:rotvel-z (degrees 0.3))
+    (:timer (seconds 0.017))
+    (:flags (sp-cpuinfo-flag-2 sp-cpuinfo-flag-14 glow))
+    (:userdata 1.0)
+    )
+  )
+
+(defpart 5202
+  :init-specs ((:texture (glow-hotdot level-default-sprite))
+    (:num 1.0)
+    (:scale-x (meters 0.4) (meters 0.1))
+    (:rot-x (degrees 1.125))
+    (:scale-y :copy scale-x)
+    (:r 0.0)
+    (:g :copy r)
+    (:b 128.0 64.0)
+    (:a 96.0 32.0)
+    (:rotvel-z (degrees 0.3))
+    (:fade-g -1.0666667)
+    (:fade-b -1.0666667)
+    (:fade-a -8.533334)
+    (:timer (seconds 0.017))
+    (:flags (sp-cpuinfo-flag-2 sp-cpuinfo-flag-14 glow))
+    (:userdata 1.0)
+    )
+  )
+
+(defpart 5203
+  :init-specs ((:texture (explosion-edge level-default-sprite))
+    (:num 5.0)
+    (:scale-x (meters 3) (meters 2))
+    (:rot-y (degrees 0) (degrees 360))
+    (:scale-y :copy scale-x)
+    (:r 128.0)
+    (:g 80.0 20.0)
+    (:b 30.0)
+    (:a 128.0)
+    (:vel-y (meters 0.33333334) (meters 0.13333334))
+    (:scalevel-x (meters 0.033333335))
+    (:scalevel-y :copy scalevel-x)
+    (:fade-g -0.17777778)
+    (:fade-b -0.06666667)
+    (:fade-a -0.28444445 -0.28444445)
+    (:friction 0.7)
+    (:timer (seconds 1.5))
+    (:flags (sp-cpuinfo-flag-0 sp-cpuinfo-flag-3))
+    (:func 'sparticle-2d-spline-align-instant)
+    (:conerot-x (degrees 0) (degrees 360))
+    (:rotate-y (degrees 0) (degrees 3600))
+    )
+  )
+
+;; copy of the bombbot laser-pointer launcher (2059) - blast-bot-draw-laser edits this one's colour every frame, so it must never point into an unloaded level
+(defpart 5204
+  :init-specs ((:texture (lasersmoke-00 level-default-sprite))
+    (:birth-func 'birth-func-laser-pointer)
+    (:num 1.0)
+    (:scale-x (meters 0.15) (meters 0.1))
+    (:scale-y (meters 40))
+    (:r 0.0)
+    (:g 0.0)
+    (:b 255.0)
+    (:a 64.0 32.0)
+    (:fade-a -4.266667)
+    (:timer (seconds 0.05))
+    (:flags (sp-cpuinfo-flag-2 sp-cpuinfo-flag-3 sp-cpuinfo-flag-14 left-multiply-quat))
+    (:userdata :data (new 'static 'boxed-array :type int32
+                       10
+                       1
+                       0
+                       #x401a00
+                       #x401b00
+                       #x401c00
+                       #x401d00
+                       #x401e00
+                       #x401f00
+                       #x402000
+                       #x402100
+                       #x402200
+                       #x402300
+                       #x402400
+                       #x402500
+                       #x402600
+                       #x402700
+                       #x402800
+                       #x402900
+                       #x402a00
+                       #x402b00
+                       #x402c00
+                       #x402d00
+                       #x402e00
+                       #x402f00
+                       #x403000
+                       #x403100
+                       #x403200
+                       #x403300
+                       #x403400
+                       #x403500
+                       #x403600
+                       #x403700
+                       #x403800
+                       #x403900
+                       )
+               )
+    (:func 'sparticle-texture-animate)
+    )
+  )
+
 ;; do NOT change %MODVERSIONPLACEHOLDER% below, otherwise the mod-bundling-tools
 ;;   will be unable to automatically add version info to the speedrun display
 (define *mod-version-text* "%MODVERSIONPLACEHOLDER%")

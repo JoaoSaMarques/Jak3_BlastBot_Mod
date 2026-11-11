@@ -608,6 +608,15 @@ u64 execute(void* ctxt) {
   c->mov64(v1, a3);                                 // or v1, a3, r0
   c->mov64(v1, t0);                                 // or v1, t0, r0
   c->mov64(v1, t1);                                 // or v1, t1, r0
+  // mod: skip the launch if the launcher slot is empty (0 or #f) or the launcher has no init-specs.
+  // this happens with stale *part-id-table* entries after a level unloads; the code below reads the specs unconditionally.
+  if (c->sgpr64(a1) == 0 || c->sgpr64(a1) == c->sgpr64(s7)) {
+    goto end_of_function;
+  }
+  c->lwu(v1, 8, a1);
+  if (c->sgpr64(v1) == 0) {
+    goto end_of_function;
+  }
   // nop                                            // sll r0, r0, 0
   c->daddiu(sp, sp, -304);                          // daddiu sp, sp, -304
   // nop                                            // sll r0, r0, 0

@@ -36,9 +36,9 @@ Potentially also stores the triangle that is involved."
 
 
 (deftype touching-prims-entry-pool (structure)
-  "A pool of up to 64 touching prim records."
+  "A pool of up to 512 touching prim records."
   ((head   touching-prims-entry)
-   (nodes  touching-prims-entry  64 :inline)
+   (nodes  touching-prims-entry  512 :inline)
    )
   (:methods
     (new (symbol type) _type_)
@@ -54,7 +54,7 @@ Potentially also stores the triangle that is involved."
   (let ((prev (the-as touching-prims-entry #f)))
     (let ((current (the-as touching-prims-entry (-> this nodes))))
       (set! (-> this head) current)
-      (countdown (a0-1 64)
+      (countdown (a0-1 512)
         (set! (-> current prev) prev)
         (let ((next (&+ current 240)))
           (set! (-> current next) (the-as touching-prims-entry next))

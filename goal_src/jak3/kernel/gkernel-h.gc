@@ -16,7 +16,7 @@
 (defconstant PROCESS_STACK_SIZE (#if PC_PORT #x8000 #x1c00))
 
 (#if PC_BIG_MEMORY
-  (defconstant PROCESS_HEAP_MULT 4) ;; 4x actors
+  (defconstant PROCESS_HEAP_MULT 16) ;; 16x actors
   (defconstant PROCESS_HEAP_MULT 1)
   )
 (defconstant PROCESS_HEAP_SIZE (* PROCESS_HEAP_MULT 1240 1024))

@@ -6,7 +6,7 @@
 
 class Shadow2 : public BucketRenderer {
  public:
-  static constexpr int kMaxVerts = 8192 * 3 * 2;
+  static constexpr int kMaxVerts = 8192 * 3 * 2 * 4;
   static constexpr int kMaxInds = kMaxVerts;
   Shadow2(const std::string& name, int my_id);
   ~Shadow2();

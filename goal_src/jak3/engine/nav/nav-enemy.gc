@@ -670,6 +670,10 @@
       (set! (-> this draw shadow-ctrl) *nav-enemy-dummy-shadow-control*)
       )
   (get-nav-control this (-> arg0 nav-mesh))
+  ;; mod: the nav-mesh has no free nav-control left (255 users); stop this citizen instead of crashing below
+  (if (or (zero? (-> this nav)) (not (-> this nav)))
+      (go process-drawable-art-error "nav full")
+      )
   (set! (-> this water-max-height) (-> this nav state mesh water-max-height))
   (let ((v1-32 this))
     (set! (-> v1-32 enemy-flags) (the-as enemy-flag (logclear (-> v1-32 enemy-flags) (enemy-flag ef37))))

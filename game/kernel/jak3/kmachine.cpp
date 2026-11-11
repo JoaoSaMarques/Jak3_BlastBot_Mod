@@ -548,8 +548,8 @@ void InitMachineScheme() {
   InitMachine_PCPort();
 
   InitSoundScheme();
-  intern_from_c(-1, 0, "*stack-top*")->value() = 0x7f00000;
-  intern_from_c(-1, 0, "*stack-base*")->value() = 0x7ffffff;
+  intern_from_c(-1, 0, "*stack-top*")->value() = 0xff00000;
+  intern_from_c(-1, 0, "*stack-base*")->value() = 0xfffffff;
   intern_from_c(-1, 0, "*stack-size*")->value() = 0x100000;
   intern_from_c(-1, 0, "*kernel-boot-message*")->value() =
       intern_from_c(-1, 0, DebugBootMessage).offset;

@@ -199,18 +199,30 @@
               )
             )
           )
-        (+! (-> this
-                traffic
-                object-type-info-array
-                0
-                target-counts
-                (+ v1-3 (* (-> a2-12 roboguard-settings object-type) 32))
-                )
-            (max
-              (min (-> a2-12 roboguard-settings target-count) (-> a2-12 roboguard-settings max-target-count))
-              (-> a2-12 roboguard-settings min-target-count)
+        ;; mod: scaled by *traffic-enemy-mult*, and the summed total per type is clamped to 127 (int8)
+        (set! (-> this
+                  traffic
+                  object-type-info-array
+                  0
+                  target-counts
+                  (+ v1-3 (* (-> a2-12 roboguard-settings object-type) 32))
+                  )
+              (min 127
+                   (+ (-> this
+                          traffic
+                          object-type-info-array
+                          0
+                          target-counts
+                          (+ v1-3 (* (-> a2-12 roboguard-settings object-type) 32))
+                          )
+                      (max
+                        (min (squad-scale-count (the-as int (-> a2-12 roboguard-settings target-count)))
+                             (-> a2-12 roboguard-settings max-target-count))
+                        (-> a2-12 roboguard-settings min-target-count)
+                        )
+                      )
+                   )
               )
-            )
         )
       )
     )
@@ -226,7 +238,7 @@
         (let ((t0-13 (the-as kg-squad-settings (+ (+ (* a3-13 16) 860 (* v1-6 64)) (the-as int this)))))
           (set! (-> a2-17 (-> t0-13 roboguard-settings enemy-type))
                 (max
-                  (min (-> t0-13 roboguard-settings target-count) (-> t0-13 roboguard-settings max-target-count))
+                  (min (squad-scale-count (the-as int (-> t0-13 roboguard-settings target-count))) (-> t0-13 roboguard-settings max-target-count))
                   (-> t0-13 roboguard-settings min-target-count)
                   )
                 )

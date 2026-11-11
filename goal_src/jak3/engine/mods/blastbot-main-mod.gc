@@ -611,7 +611,7 @@
   (if *blast-bot-green-log* (format 0 "Blast Bot: green pulse begin~%"))
   (when *blast-bot-green-sparks*
     (dotimes (i 4)
-      (launch-particles (-> *part-id-table* 2062) (-> this foot-pos i))
+      (launch-particles (-> *part-id-table* 5202) (-> this foot-pos i))
       )
     )
   (when *blast-bot-green-particles*
@@ -760,12 +760,12 @@
           (vector+*! tip tip (-> kmat uvec) (-> this joint-ik i hand-dist))
           ;; upper leg: middle, then the knee
           (vector-lerp! mid hip knee 0.5)
-          (launch-particles (-> *part-id-table* 2100) mid)
-          (launch-particles (-> *part-id-table* 2100) knee)
+          (launch-particles (-> *part-id-table* 5203) mid)
+          (launch-particles (-> *part-id-table* 5203) knee)
           ;; lower leg: middle, then the foot
           (vector-lerp! mid knee tip 0.5)
-          (launch-particles (-> *part-id-table* 2100) mid)
-          (launch-particles (-> *part-id-table* 2100) tip)
+          (launch-particles (-> *part-id-table* 5203) mid)
+          (launch-particles (-> *part-id-table* 5203) tip)
           )
         )
       )
@@ -3206,11 +3206,11 @@
             (cond
               ((or prim (< 0.5 red))
                 (set! red 1.0)
-                (launch-particles (-> *part-id-table* 2061) hit-pos)
-                (launch-particles (-> *part-id-table* 2060) hit-pos)
+                (launch-particles (-> *part-id-table* 5201) hit-pos)
+                (launch-particles (-> *part-id-table* 5200) hit-pos)
                 )
               (else
-                (launch-particles (-> *part-id-table* 2062) hit-pos)
+                (launch-particles (-> *part-id-table* 5202) hit-pos)
                 )
               )
             )
@@ -3218,11 +3218,11 @@
         )
       (vector+! (-> this laser-end) start beam)
       ;; colour (r/b) and width, set on the shared particle spec right before drawing, like bombbot does
-      (set! (-> *part-id-table* 2059 init-specs 5 initial-valuef) (* 255.0 red))
-      (set! (-> *part-id-table* 2059 init-specs 7 initial-valuef) (* 255.0 (- 1.0 red)))
-      (set! (-> *part-id-table* 2059 init-specs 3 initial-valuef) *blast-bot-laser-width*)
-      (set! (-> *part-id-table* 2059 init-specs 3 random-rangef) *blast-bot-laser-width-rand*)
-      (draw-beam (-> *part-id-table* 2059) start beam #t)
+      (set! (-> *part-id-table* 5204 init-specs 5 initial-valuef) (* 255.0 red))
+      (set! (-> *part-id-table* 5204 init-specs 7 initial-valuef) (* 255.0 (- 1.0 red)))
+      (set! (-> *part-id-table* 5204 init-specs 3 initial-valuef) *blast-bot-laser-width*)
+      (set! (-> *part-id-table* 5204 init-specs 3 random-rangef) *blast-bot-laser-width-rand*)
+      (draw-beam (-> *part-id-table* 5204) start beam #t)
       )
     )
   (none)
