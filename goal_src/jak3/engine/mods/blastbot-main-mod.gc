@@ -370,7 +370,7 @@
 (define *blast-bot-hand-dist* (new 'static 'boxed-array :type float 14880.768 -14880.768 14880.768 -14880.768))
 
 (define *blast-bot-hatred* 20.0)
-(define *blast-bot-ally-hatred* 5.0)   ;; how much kg / metalhead squad members hate the bot's minions (spydroid, sentinel, roboguard, bombbot, L2 droid); the bot itself is the line above
+(define *blast-bot-ally-hatred* 20.0)   ;; how much kg / metalhead squad members hate the bot's minions (spydroid, sentinel, roboguard, bombbot, L2 droid); the bot itself is the line above
 
 (defun blast-bot-foot-phase ((i int))
   ;; Where in the 0.8s gait cycle foot i steps. Feet 0/2 and 3/1 are diagonal pairs,
