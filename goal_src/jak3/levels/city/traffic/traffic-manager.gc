@@ -40,6 +40,8 @@
 (define *traffic-engine* (the-as traffic-engine #f))
 
 (define *traffic-fast-spawn* #f)
+;; mod: citizens created per frame by spawn-all (stock 1, so a big want-count fills up one citizen per frame)
+(define *traffic-spawn-per-frame* 4)
 
 (deftype traffic-manager (process)
   ((traffic-engine    traffic-engine)
@@ -171,7 +173,7 @@
           )
       )
     )
-  (let ((s5-1 1)
+  (let ((s5-1 *traffic-spawn-per-frame*)
         (s4-1 0)
         (s3-1 #x1fffffff)
         )
@@ -192,7 +194,7 @@
                         (not (logtest? (-> s0-0 flags) (traffic-type-flag ttf4)))
                         (< v1-21 (-> s0-0 want-count))
                         (or (!= (-> s0-0 tracker-index) 1)
-                            (< (the-as int (-> *default-nav-mesh* nav-control-count)) *traffic-nav-limit*)
+                            (< (the-as int (-> (traffic-nav-mesh-for-type s1-0) nav-control-count)) *traffic-nav-limit*)
                             )
                         )
                    )

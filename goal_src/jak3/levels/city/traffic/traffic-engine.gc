@@ -1458,7 +1458,7 @@
         )
     )
   (target-count this 1.0)
-  (set! (-> this inv-density-factor) 5.0)
+  (set! (-> this inv-density-factor) 0.5)
   (let ((v1-6 32))
     (dotimes (a0-2 29)
       (let ((a1-3 (-> this object-type-info-array a0-2)))

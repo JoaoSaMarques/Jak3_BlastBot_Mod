@@ -717,8 +717,9 @@
 (define *blast-bot-green-trail-time* 0.05)      ;; seconds between two drops (0.05 = every 3rd frame at 60 fps)
 (define *blast-bot-green-trail-next* (the-as time-frame 0))
 
-;; id 2100: pick another number if it clashes with a defpart in another of your files
-(defpart 2100
+;; id 5205: your own number, so no level can overwrite it (the old id 2100 was also used by a level's launcher, and when that
+;; level loaded it replaced this green dot with its explosion)
+(defpart 5205
   :init-specs ((:texture (glow-hotdot level-default-sprite))
     (:num 1.0)
     (:scale-x (meters 0.7) (meters 0.2))
@@ -760,12 +761,12 @@
           (vector+*! tip tip (-> kmat uvec) (-> this joint-ik i hand-dist))
           ;; upper leg: middle, then the knee
           (vector-lerp! mid hip knee 0.5)
-          (launch-particles (-> *part-id-table* 5203) mid)
-          (launch-particles (-> *part-id-table* 5203) knee)
+          (launch-particles (-> *part-id-table* 5205) mid)
+          (launch-particles (-> *part-id-table* 5205) knee)
           ;; lower leg: middle, then the foot
           (vector-lerp! mid knee tip 0.5)
-          (launch-particles (-> *part-id-table* 5203) mid)
-          (launch-particles (-> *part-id-table* 5203) tip)
+          (launch-particles (-> *part-id-table* 5205) mid)
+          (launch-particles (-> *part-id-table* 5205) tip)
           )
         )
       )

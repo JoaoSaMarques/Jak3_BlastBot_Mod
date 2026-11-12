@@ -781,7 +781,20 @@
   (if (not (-> this squad))
       (format 0 "citizen::initialize-enemy: error: no squad-control~%")
       )
-  (set! (-> arg0 nav-mesh) *default-nav-mesh*)
+  ;; mod: metalheads and KG bots each have their own nav-mesh (255 nav-controls per mesh), everything else the default one
+  (set! (-> arg0 nav-mesh)
+        (case (-> this type symbol)
+          (('metalhead-flitter 'metalhead-grunt 'metalhead-predator)
+           *nav-mesh-mh*
+           )
+          (('roboguard-city 'spydroid 'flying-turret)
+           *nav-mesh-kg*
+           )
+          (else
+            *default-nav-mesh*
+            )
+          )
+        )
   (let ((t9-2 (method-of-type nav-enemy setup-enemy!)))
     (t9-2 this arg0)
     )

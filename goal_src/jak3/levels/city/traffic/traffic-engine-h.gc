@@ -76,18 +76,57 @@
 ;;   metalhead-grunt/flitter/predator (8-10), roboguard/spydroid/flying-turret (14-16).
 ;; crimson guards (6,7), civilians, wastelanders and vehicles are left alone.
 ;; set to 1 to get the original counts back. Per-type counts are int8, so results are capped at 127.
-(define *traffic-enemy-mult* 10)
+(define *traffic-enemy-mult* 30)
 
 ;; every citizen takes one of the 255 nav-controls of *default-nav-mesh*, so the scaled types are capped per type
-;; (6 types x 16 = 96 at most) and the traffic manager stops spawning citizens at *traffic-nav-limit* used nav-controls
-(define *traffic-enemy-cap* 16)
+;; (6 types x 32 = 192 at most; each group has its own nav-mesh now, the 250 active citizens of the traffic tracker are the real ceiling) and the traffic manager stops spawning citizens at *traffic-nav-limit* used nav-controls
+(define *traffic-enemy-cap* 50)
 (define *traffic-nav-limit* 235)
 
+;; when #t, the ambient civilians (male, female, fat, pilot) are not spawned at all, which frees their nav-controls for enemies
+(define *traffic-no-civilians* #t)
+
+(defun traffic-civilian-type? ((arg0 int))
+  (or (= arg0 (the-as int (traffic-type civilian-male)))
+      (= arg0 (the-as int (traffic-type civilian-female)))
+      (= arg0 (the-as int (traffic-type civilian-fat)))
+      (= arg0 (the-as int (traffic-type civilian-pilot)))
+      )
+  )
+
+;; the nav-mesh the citizens of this traffic type are put on (see setup-enemy! in citizen.gc)
+(defun traffic-nav-mesh-for-type ((arg0 int))
+  (cond
+    ((or (= arg0 (the-as int (traffic-type metalhead-predator)))
+         (= arg0 (the-as int (traffic-type metalhead-grunt)))
+         (= arg0 (the-as int (traffic-type metalhead-flitter)))
+         )
+     *nav-mesh-mh*
+     )
+    ((or (= arg0 (the-as int (traffic-type roboguard)))
+         (= arg0 (the-as int (traffic-type spydroid)))
+         (= arg0 (the-as int (traffic-type flying-turret)))
+         )
+     *nav-mesh-kg*
+     )
+    (else
+      *default-nav-mesh*
+      )
+    )
+  )
+
 (defun traffic-scale-count ((arg0 int) (arg1 int))
-  (if (or (and (>= arg0 8) (<= arg0 10)) (and (>= arg0 14) (<= arg0 16)))
-      (min *traffic-enemy-cap* (* arg1 *traffic-enemy-mult*))
+  (cond
+    ((and *traffic-no-civilians* (traffic-civilian-type? arg0))
+     0
+     )
+    ((or (and (>= arg0 8) (<= arg0 10)) (and (>= arg0 14) (<= arg0 16)))
+     (min *traffic-enemy-cap* (* arg1 *traffic-enemy-mult*))
+     )
+    (else
       arg1
       )
+    )
   )
 
 ;; when #t, KG bots and metalheads (types 8-10, 14-16) spawn without asking the faction manager first,
