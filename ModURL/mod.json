@@ -9,9 +9,9 @@
       "authors": ["Virtus"],
       "tags": ["challenge", "gameplay-mod"],
       "supportedGames": ["jak3"],
-      "websiteUrl": "https://github.com/JoaoSaMarques/Jak3_BlastBot_Mod/blob/Testing-Branch-Rewrite/README.md",
-      "coverArtUrl": "https://raw.githubusercontent.com/JoaoSaMarques/Jak3_BlastBot_Mod/Testing-Branch-Rewrite/ModPageImages/ModImage.png",
-      "thumbnailArtUrl": "https://raw.githubusercontent.com/JoaoSaMarques/Jak3_BlastBot_Mod/Testing-Branch-Rewrite/ModPageImages/BlastBotModIcon.png",
+      "websiteUrl": "https://github.com/JoaoSaMarques/Jak3_BlastBot_Mod/blob/main/README.md",
+      "coverArtUrl": "https://raw.githubusercontent.com/JoaoSaMarques/Jak3_BlastBot_Mod/main/ModPageImages/ModImage.png",
+      "thumbnailArtUrl": "https://raw.githubusercontent.com/JoaoSaMarques/Jak3_BlastBot_Mod/main/ModPageImages/BlastBotModIcon.png",
       "versions": [
         {
           "version": "0.0.11",
