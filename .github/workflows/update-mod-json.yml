@@ -1,0 +1,58 @@
+name: Update mod.json
+
+on:
+  # Runs by itself after your release pipeline finishes.
+  # Replace the text below with the `name:` at the top of
+  # .github/workflows/release-pipeline.yaml (keep the quotes, copy it exactly).
+  workflow_run:
+    workflows: ["Cut Mod Release ⭐"]
+    types: [completed]
+  # Or run it by hand from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to add, e.g. v0.0.12 (empty = newest published release)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Find the release tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=$(gh release list --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')
+          fi
+          if [ -z "$TAG" ]; then echo "No published release found"; exit 1; fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Add the release to mod.json
+        run: python3 .github/scripts/update_mod_json.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ModURL/mod.json
+          if git diff --cached --quiet; then
+            echo "mod.json already up to date"
+            exit 0
+          fi
+          git commit -m "Update mod.json for $TAG"
+          git push origin main
