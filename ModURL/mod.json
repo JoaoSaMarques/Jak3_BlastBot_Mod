@@ -1,0 +1,39 @@
+{
+  "schemaVersion": "1.0.0",
+  "sourceName": "BlastBot",
+  "lastUpdated": "2026-11-13T12:00:00Z",
+  "mods": {
+    "BlastBot": {
+      "displayName": "BlastBot Gameplay Overhaul",
+      "description": "Jak 3 mod that changes Jak into a customized version of the playable BlastBot and rebalances gameplay like including more enemies and different stats.",
+      "authors": ["Virtus"],
+      "tags": ["challenge", "gameplay-mod"],
+      "supportedGames": ["jak3"],
+      "websiteUrl": "https://github.com/JoaoSaMarques/Jak3_BlastBot_Mod/blob/Testing-Branch-Rewrite/README.md",
+      "coverArtUrl": "https://raw.githubusercontent.com/JoaoSaMarques/Jak3_BlastBot_Mod/Testing-Branch-Rewrite/ModPageImages/ModImage.png",
+      "thumbnailArtUrl": "https://raw.githubusercontent.com/JoaoSaMarques/Jak3_BlastBot_Mod/Testing-Branch-Rewrite/ModPageImages/BlastBotModIcon.png",
+      "versions": [
+        {
+          "version": "0.0.11",
+          "publishedDate": "2026-11-12T00:00:00Z",
+          "supportedGames": ["jak3"],
+          "settings": {
+            "decompConfigOverride": "",
+            "shareVanillaSaves": false
+          },
+          "assets": {
+            "windows": "https://github.com/JoaoSaMarques/Jak3_BlastBot_Mod/releases/download/v0.0.11/windows-v0.0.11.zip",
+            "linux": "https://github.com/JoaoSaMarques/Jak3_BlastBot_Mod/releases/download/v0.0.11/linux-v0.0.11.tar.gz",
+            "macos": "https://github.com/JoaoSaMarques/Jak3_BlastBot_Mod/releases/download/v0.0.11/macos-intel-v0.0.11.tar.gz"
+          }
+        }
+      ],
+      "perGameConfig": {
+        "jak3": {
+          "releaseDate": "2026-09-10"
+        }
+      },
+      "externalLink": null
+    }
+  }
+}
