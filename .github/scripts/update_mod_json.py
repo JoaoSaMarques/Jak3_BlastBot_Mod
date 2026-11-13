@@ -76,6 +76,8 @@ entry = {
 
 # replace an existing entry for the same version, otherwise add as newest
 mod["versions"] = [entry] + [v for v in versions if v["version"] != version]
+# newest first, whatever order the releases are added in
+mod["versions"].sort(key=lambda v: v["publishedDate"], reverse=True)
 data["lastUpdated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 with open(MOD_JSON, "w", encoding="utf-8") as f:
